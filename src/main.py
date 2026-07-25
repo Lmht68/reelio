@@ -1,3 +1,5 @@
+import logging
+from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -13,7 +15,31 @@ from src.transcript import (
     TranscriptUnsupportedPlatformError,
 )
 
-app = FastAPI(title="Reelio", version="0.1.0")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(asctime)s:[%(name)s]:%(message)s"
+)
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting Reelio")
+    # Initialization:
+    # - Load ML models
+    # - Connect to a database
+    # - Warm up caches
+    # - Verify external services
+    # - Start background tasks
+
+    yield
+
+    logger.info("Shutting down Reelio")
+    # Cleanup:
+    # - Close database connections
+    # - Stop background workers
+    # - Release resources
+
+app = FastAPI(title="Reelio", version="0.1.0", lifespan=lifespan)
 
 # --- Transcript Service (singleton) ---
 
