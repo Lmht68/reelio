@@ -1,21 +1,20 @@
 from abc import ABC, abstractmethod
 
-from src.transcript.models import TranscriptResult
+from src.transcript.models import Transcript
 
 
 class TranscriptProvider(ABC):
     """Interface that every transcript platform provider must implement."""
 
     @abstractmethod
-    async def extract(self, url: str) -> TranscriptResult:
+    async def extract(self, url: str) -> Transcript:
         """Extract a transcript from the given video URL.
 
         Args:
             url: The full URL of the video/reel.
 
         Returns:
-            A TranscriptResult containing the full text, optional segments,
-            detected language, and platform metadata.
+            A Transcript containing the full text and detected language
 
         Raises:
             TranscriptNotFoundError: No transcript exists for this video.

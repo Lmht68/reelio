@@ -11,11 +11,6 @@ logger = logging.getLogger(__name__)
 
 class TranscriptService:
     """High-level service for extracting transcripts from any supported video URL.
-
-    Usage:
-        service = TranscriptService(whisper_model_size="base")
-        result = await service.extract("https://www.youtube.com/watch?v=...")
-        print(result.full_text)
     """
 
     def __init__(
@@ -54,5 +49,8 @@ class TranscriptService:
             platform.value,
             validated_url,
         )
+        transcript = await provider.extract(validated_url)
 
-        return await provider.extract(validated_url)
+        return TranscriptResult(transcript=transcript,
+                                platform=platform,
+                                source_url=validated_url)

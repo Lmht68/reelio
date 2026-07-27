@@ -1,6 +1,6 @@
 import json
 
-from src.transcript.models import Platform, TranscriptResult, TranscriptSegment
+from src.transcript.models import Platform, Transcript, TranscriptResult, TranscriptSegment
 
 
 class TestPlatform:
@@ -45,53 +45,46 @@ class TestTranscriptSegment:
 
 class TestTranscriptResult:
     def test_create_result(self):
-        segments = [
-            TranscriptSegment(text="Hello", start=0.0, end=1.0),
-            TranscriptSegment(text="world", start=1.0, end=2.0),
-        ]
-        result = TranscriptResult(
+        transcript = Transcript(
             full_text="Hello world",
-            segments=segments,
             language="en",
+        )
+        result = TranscriptResult(
+            transcript=transcript,
             platform=Platform.YOUTUBE,
             source_url="https://youtube.com/watch?v=test",
         )
-        assert result.full_text == "Hello world"
-        assert len(result.segments) == 2
-        assert result.language == "en"
+        assert result.transcript.full_text == "Hello world"
+        assert result.transcript.language == "en"
         assert result.platform == Platform.YOUTUBE
         assert result.source_url == "https://youtube.com/watch?v=test"
 
     def test_result_serialization(self):
-        segments = [
-            TranscriptSegment(text="Hello", start=0.0, end=1.0),
-        ]
-        result = TranscriptResult(
+        transcript = Transcript(
             full_text="Hello",
-            segments=segments,
             language="en",
+        )
+        result = TranscriptResult(
+            transcript=transcript,
             platform=Platform.YOUTUBE,
             source_url="https://youtube.com/watch?v=test",
         )
         data = result.model_dump()
-        assert data["full_text"] == "Hello"
+        assert data["transcript"]["full_text"] == "Hello"
         assert data["platform"] == "youtube"
-        assert len(data["segments"]) == 1
-        assert data["segments"][0]["text"] == "Hello"
 
     def test_result_json_serialization(self):
-        segments = [
-            TranscriptSegment(text="Test", start=0.0, end=1.0),
-        ]
-        result = TranscriptResult(
+        transcript = Transcript(
             full_text="Test",
-            segments=segments,
             language=None,
+        )
+        result = TranscriptResult(
+            transcript=transcript,
             platform=Platform.UNKNOWN,
             source_url="https://example.com/video",
         )
         json_str = result.model_dump_json()
         data = json.loads(json_str)
-        assert data["full_text"] == "Test"
-        assert data["language"] is None
+        assert data["transcript"]["full_text"] == "Test"
+        assert data["transcript"]["language"] is None
         assert data["platform"] == "unknown"

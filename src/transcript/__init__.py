@@ -6,11 +6,12 @@ from src.transcript.exceptions import (
     TranscriptTranscriptionError,
     TranscriptUnsupportedPlatformError,
 )
-from src.transcript.models import Platform, TranscriptResult, TranscriptSegment
+from src.transcript.models import Platform, Transcript, TranscriptResult, TranscriptSegment
 from src.transcript.service import TranscriptService
 
 __all__ = [
     "TranscriptService",
+    "Transcript",
     "TranscriptResult",
     "TranscriptSegment",
     "Platform",

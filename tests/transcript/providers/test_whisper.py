@@ -9,7 +9,7 @@ from src.transcript.exceptions import (
     TranscriptDownloadError,
     TranscriptTranscriptionError,
 )
-from src.transcript.models import Platform, TranscriptResult
+from src.transcript.models import Transcript
 from src.transcript.providers.whisper import WhisperProvider
 
 
@@ -77,14 +77,8 @@ class TestWhisperProviderExtract:
         provider = WhisperProvider()
         result = await provider.extract(sample_instagram_url)
 
-        assert isinstance(result, TranscriptResult)
-        assert result.platform == Platform.INSTAGRAM
+        assert isinstance(result, Transcript)
         assert result.language == "en"
-        assert result.source_url == sample_instagram_url
-        assert len(result.segments) == 2
-        assert result.segments[0].text == "This is a test"
-        assert result.segments[0].start == 0.0
-        assert result.segments[0].end == 2.0
         assert result.full_text == "This is a test transcript of a video."
 
     @pytest.mark.anyio
@@ -165,7 +159,7 @@ class TestWhisperProviderExtract:
     ):
         provider = WhisperProvider()
         result = await provider.extract(sample_facebook_url)
-        assert result.platform == Platform.FACEBOOK
+        assert result.language == "en"
 
     @pytest.mark.anyio
     async def test_extract_tiktok_url(
@@ -173,7 +167,31 @@ class TestWhisperProviderExtract:
     ):
         provider = WhisperProvider()
         result = await provider.extract(sample_tiktok_url)
-        assert result.platform == Platform.TIKTOK
+        assert result.language == "en"
+
+    @pytest.mark.anyio
+    async def test_extract_newlines_are_stripped(
+        self, mock_ytdlp, mocker, sample_instagram_url
+    ):
+        """Verify that newline characters are removed from full_text."""
+        mock_model_cls = mocker.patch(
+            "src.transcript.providers.whisper.WhisperModel"
+        )
+        mock_model = MagicMock()
+        mock_model_cls.return_value = mock_model
+
+        seg = MagicMock()
+        seg.text = "Line one\nLine two"
+        seg.start = 0.0
+        seg.end = 2.0
+
+        mock_info = MagicMock()
+        mock_info.language = "en"
+        mock_model.transcribe.return_value = ([seg], mock_info)
+
+        provider = WhisperProvider()
+        result = await provider.extract(sample_instagram_url)
+        assert "\n" not in result.full_text
 
 
 class TestWhisperProviderLoadModel:

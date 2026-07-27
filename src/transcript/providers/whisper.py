@@ -7,13 +7,12 @@ from pathlib import Path
 import yt_dlp
 from faster_whisper import WhisperModel
 
-from src.transcript.providers.base import TranscriptProvider
 from src.transcript.exceptions import (
     TranscriptDownloadError,
     TranscriptTranscriptionError,
 )
-from src.transcript.factory import detect_platform
-from src.transcript.models import Platform, TranscriptResult, TranscriptSegment
+from src.transcript.models import Transcript
+from src.transcript.providers.base import TranscriptProvider
 
 logger = logging.getLogger(__name__)
 
@@ -62,19 +61,17 @@ class WhisperProvider(TranscriptProvider):
             )
         return self._model
 
-    async def extract(self, url: str) -> TranscriptResult:
-        platform = detect_platform(url)
+    async def extract(self, url: str) -> Transcript:
         audio_path: Path | None = None
 
         try:
             audio_path = await self._download_audio(url)
-            result = await self._transcribe(audio_path, url, platform)
-            return result
+            return await self._transcribe(audio_path)
         finally:
             if audio_path and audio_path.exists():
                 try:
                     audio_path.unlink()
-                    logger.debug("Cleaned up temp file: %s", audio_path)
+                    logger.info("Cleaned up temp file: %s", audio_path)
                 except OSError:
                     logger.warning("Failed to clean up temp file: %s", audio_path)
 
@@ -119,9 +116,7 @@ class WhisperProvider(TranscriptProvider):
     async def _transcribe(
         self,
         audio_path: Path,
-        url: str,
-        platform: Platform,
-    ) -> TranscriptResult:
+    ) -> Transcript:
         """Run faster-whisper transcription on the audio file.
 
         Raises TranscriptTranscriptionError on failure.
@@ -129,35 +124,26 @@ class WhisperProvider(TranscriptProvider):
         try:
             model = self._load_model()
 
-            def _run_transcription() -> tuple[list[TranscriptSegment], str, str]:
+            def _run_transcription() -> tuple[str, str]:
                 segments_raw, info = model.transcribe(
                     str(audio_path),
                     beam_size=5,
                     vad_filter=True,
                 )
-                segments = []
+                texts: list[str] = []
                 for seg in segments_raw:
-                    segments.append(
-                        TranscriptSegment(
-                            text=seg.text.strip(),
-                            start=seg.start,
-                            end=seg.end,
-                        )
-                    )
-                full_text = " ".join(seg.text for seg in segments)
+                    texts.append(seg.text.strip().replace("\n", " "))
+                full_text = " ".join(texts)
                 language = info.language
-                return segments, full_text, language
+                return full_text, language
 
-            segments, full_text, language = await asyncio.to_thread(
+            full_text, language = await asyncio.to_thread(
                 _run_transcription
             )
 
-            return TranscriptResult(
+            return Transcript(
                 full_text=full_text,
-                segments=segments,
                 language=language,
-                platform=platform,
-                source_url=url,
             )
 
         except Exception as exc:

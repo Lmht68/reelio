@@ -11,7 +11,7 @@ from src.transcript.exceptions import (
     TranscriptInvalidURLError,
     TranscriptNotFoundError,
 )
-from src.transcript.models import Platform, TranscriptResult
+from src.transcript.models import Transcript
 from src.transcript.providers.youtube import YouTubeProvider
 
 
@@ -47,14 +47,8 @@ class TestYouTubeProviderExtract:
         provider = YouTubeProvider()
         result = await provider.extract(sample_youtube_url)
 
-        assert isinstance(result, TranscriptResult)
-        assert result.platform == Platform.YOUTUBE
+        assert isinstance(result, Transcript)
         assert result.language == "en"
-        assert result.source_url == sample_youtube_url
-        assert len(result.segments) == 3
-        assert result.segments[0].text == "Hello everyone"
-        assert result.segments[0].start == 0.0
-        assert result.segments[0].end == 2.0
         assert result.full_text == (
             "Hello everyone Today we are going to talk about "
             "my top three book recommendations"
@@ -99,15 +93,21 @@ class TestYouTubeProviderExtract:
             await provider.extract(sample_youtube_url)
 
     @pytest.mark.anyio
-    async def test_extract_preserves_segment_data(
-        self, mock_youtube_api, sample_youtube_url, sample_transcript_snippets
+    async def test_extract_newlines_are_stripped(
+        self, mocker, sample_youtube_url
     ):
+        """Verify that newline characters are removed from full_text."""
+        s1 = MagicMock()
+        s1.text = "Hello\nworld"
+        s1.start = 0.0
+        s1.duration = 2.0
+
+        mocker.patch.object(
+            YouTubeProvider,
+            "_fetch_transcript",
+            return_value=[s1],
+        )
         provider = YouTubeProvider()
         result = await provider.extract(sample_youtube_url)
-
-        for i, seg in enumerate(result.segments):
-            original = sample_transcript_snippets[i]
-            assert seg.text == original.text
-            assert seg.start == original.start
-            assert seg.end == original.start + original.duration
-            assert seg.speaker is None
+        assert "\n" not in result.full_text
+        assert result.full_text == "Hello world"

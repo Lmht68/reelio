@@ -9,12 +9,13 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     VideoUnavailable,
 )
-from src.transcript.providers.base import TranscriptProvider
+
 from src.transcript.exceptions import (
     TranscriptInvalidURLError,
     TranscriptNotFoundError,
 )
-from src.transcript.models import Platform, TranscriptResult, TranscriptSegment
+from src.transcript.models import Transcript
+from src.transcript.providers.base import TranscriptProvider
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ class YouTubeProvider(TranscriptProvider):
             f"Could not extract YouTube video ID from URL: {url}"
         )
 
-    async def extract(self, url: str) -> TranscriptResult:
+    async def extract(self, url: str) -> Transcript:
         video_id = self.extract_video_id(url)
 
         try:
@@ -68,23 +69,13 @@ class YouTubeProvider(TranscriptProvider):
                 f"No transcript available for YouTube video: {video_id}"
             ) from exc
 
-        segments = [
-            TranscriptSegment(
-                text=item.text,
-                start=item.start,
-                end=item.start + item.duration,
-            )
-            for item in transcript_data
-        ]
+        full_text = " ".join(
+            item.text.replace("\n", " ").strip() for item in transcript_data
+        )
 
-        full_text = " ".join(seg.text for seg in segments)
-
-        return TranscriptResult(
+        return Transcript(
             full_text=full_text,
-            segments=segments,
             language="en",
-            platform=Platform.YOUTUBE,
-            source_url=url,
         )
 
     @staticmethod

@@ -5,7 +5,7 @@ from src.transcript.exceptions import (
     TranscriptNotFoundError,
     TranscriptUnsupportedPlatformError,
 )
-from src.transcript.models import Platform, TranscriptResult, TranscriptSegment
+from src.transcript.models import Platform, Transcript
 from src.transcript.providers.whisper import WhisperProvider
 from src.transcript.providers.youtube import YouTubeProvider
 from src.transcript.service import TranscriptService
@@ -53,22 +53,16 @@ class TestTranscriptServiceExtract:
     def mock_extract(self, mocker):
         """Create mock extract methods that return synthetic results."""
 
-        async def youtube_extract(url: str) -> TranscriptResult:
-            return TranscriptResult(
+        async def youtube_extract(url: str) -> Transcript:
+            return Transcript(
                 full_text="YouTube transcript",
-                segments=[TranscriptSegment(text="YouTube transcript", start=0.0, end=2.0)],
                 language="en",
-                platform=Platform.YOUTUBE,
-                source_url=url,
             )
 
-        async def whisper_extract(url: str) -> TranscriptResult:
-            return TranscriptResult(
+        async def whisper_extract(url: str) -> Transcript:
+            return Transcript(
                 full_text="Whisper transcript",
-                segments=[TranscriptSegment(text="Whisper transcript", start=0.0, end=2.0)],
                 language="en",
-                platform=Platform.INSTAGRAM,
-                source_url=url,
             )
 
         return youtube_extract, whisper_extract
@@ -84,7 +78,7 @@ class TestTranscriptServiceExtract:
         result = await service.extract(sample_youtube_url)
 
         assert result.platform == Platform.YOUTUBE
-        assert result.full_text == "YouTube transcript"
+        assert result.transcript.full_text == "YouTube transcript"
 
     @pytest.mark.anyio
     async def test_extract_instagram(self, mocker, mock_extract, sample_instagram_url):
@@ -97,7 +91,7 @@ class TestTranscriptServiceExtract:
         result = await service.extract(sample_instagram_url)
 
         assert result.platform == Platform.INSTAGRAM
-        assert result.full_text == "Whisper transcript"
+        assert result.transcript.full_text == "Whisper transcript"
 
     @pytest.mark.anyio
     async def test_extract_invalid_url(self):
