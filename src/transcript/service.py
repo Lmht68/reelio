@@ -10,8 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class TranscriptService:
-    """High-level service for extracting transcripts from any supported video URL.
-    """
+    """High-level service for extracting transcripts from any supported video URL."""
 
     def __init__(
         self,
@@ -19,6 +18,8 @@ class TranscriptService:
         whisper_device: str = "cpu",
         whisper_compute_type: str = "int8",
         temp_dir: str | None = None,
+        whisper_max_concurrent: int = 2,
+        whisper_max_duration_seconds: int = 600,
     ):
         self._youtube_provider = YouTubeProvider()
         self._whisper_provider = WhisperProvider(
@@ -26,6 +27,8 @@ class TranscriptService:
             device=whisper_device,
             compute_type=whisper_compute_type,
             temp_dir=temp_dir,
+            max_concurrent=whisper_max_concurrent,
+            max_duration_seconds=whisper_max_duration_seconds,
         )
 
     def _get_provider(self, platform: Platform) -> TranscriptProvider:
@@ -51,6 +54,4 @@ class TranscriptService:
         )
         transcript = await provider.extract(validated_url)
 
-        return TranscriptResult(transcript=transcript,
-                                platform=platform,
-                                source_url=validated_url)
+        return TranscriptResult(transcript=transcript, platform=platform, source_url=validated_url)

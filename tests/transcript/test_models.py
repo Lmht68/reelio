@@ -24,9 +24,7 @@ class TestTranscriptSegment:
         assert seg.speaker is None
 
     def test_create_segment_with_speaker(self):
-        seg = TranscriptSegment(
-            text="Hello", start=0.0, end=2.0, speaker="John"
-        )
+        seg = TranscriptSegment(text="Hello", start=0.0, end=2.0, speaker="John")
         assert seg.speaker == "John"
 
     def test_segment_serialization(self):

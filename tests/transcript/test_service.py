@@ -29,6 +29,14 @@ class TestTranscriptServiceInit:
         assert service._whisper_provider._compute_type == "float16"
         assert service._whisper_provider._temp_dir == "/tmp/test"
 
+    def test_passes_whisper_limit_config(self):
+        service = TranscriptService(
+            whisper_max_concurrent=5,
+            whisper_max_duration_seconds=60,
+        )
+        assert service._whisper_provider._max_concurrent == 5
+        assert service._whisper_provider._max_duration_seconds == 60
+
 
 class TestTranscriptServiceGetProvider:
     def test_youtube_routes_to_youtube_provider(self):
@@ -70,9 +78,7 @@ class TestTranscriptServiceExtract:
     @pytest.mark.anyio
     async def test_extract_youtube(self, mocker, mock_extract, sample_youtube_url):
         youtube_extract, whisper_extract = mock_extract
-        mocker.patch.object(
-            YouTubeProvider, "extract", side_effect=youtube_extract
-        )
+        mocker.patch.object(YouTubeProvider, "extract", side_effect=youtube_extract)
 
         service = TranscriptService()
         result = await service.extract(sample_youtube_url)
@@ -83,9 +89,7 @@ class TestTranscriptServiceExtract:
     @pytest.mark.anyio
     async def test_extract_instagram(self, mocker, mock_extract, sample_instagram_url):
         youtube_extract, whisper_extract = mock_extract
-        mocker.patch.object(
-            WhisperProvider, "extract", side_effect=whisper_extract
-        )
+        mocker.patch.object(WhisperProvider, "extract", side_effect=whisper_extract)
 
         service = TranscriptService()
         result = await service.extract(sample_instagram_url)
@@ -112,9 +116,7 @@ class TestTranscriptServiceExtract:
             await service.extract("")
 
     @pytest.mark.anyio
-    async def test_extract_propagates_provider_error(
-        self, mocker, sample_youtube_url
-    ):
+    async def test_extract_propagates_provider_error(self, mocker, sample_youtube_url):
         mocker.patch.object(
             YouTubeProvider,
             "extract",

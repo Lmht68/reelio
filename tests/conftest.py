@@ -2,6 +2,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.transcript.providers.youtube import YouTubeProvider
+
 
 @pytest.fixture
 def sample_youtube_url() -> str:
@@ -51,12 +53,9 @@ def sample_transcript_snippets() -> list:
 
 @pytest.fixture
 def mock_youtube_api(mocker, sample_transcript_snippets):
-    """Pre-configured mock for YouTubeTranscriptApi._fetch_transcript."""
-    mock = mocker.patch.object(
-        __import__(
-            "src.transcript.providers.youtube", fromlist=["YouTubeProvider"]
-        ).YouTubeProvider,
-        "_fetch_transcript",
-        return_value=sample_transcript_snippets,
-    )
-    return mock
+    """Pre-configured mock for YouTubeProvider._fetch_transcript."""
+
+    fetched = MagicMock()
+    fetched.language_code = "en"
+    fetched.__iter__.return_value = sample_transcript_snippets
+    return mocker.patch.object(YouTubeProvider, "_fetch_transcript", return_value=fetched)

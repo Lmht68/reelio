@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +19,8 @@ class Settings(BaseSettings):
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
     transcript_temp_dir: str | None = None
+    whisper_max_concurrent: int = Field(default=2, gt=0)
+    whisper_max_duration_seconds: int = Field(default=600, gt=0)
 
 
 settings = Settings()

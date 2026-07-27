@@ -21,6 +21,10 @@ class TestValidateURL:
         with pytest.raises(TranscriptInvalidURLError):
             validate_url("   ")
 
+    def test_strips_surrounding_whitespace(self):
+        result = validate_url("  https://youtube.com/watch?v=test  ")
+        assert result == "https://youtube.com/watch?v=test"
+
     def test_missing_scheme(self):
         with pytest.raises(TranscriptInvalidURLError):
             validate_url("youtube.com/watch?v=test")
@@ -42,33 +46,46 @@ class TestValidateURL:
 
 
 class TestDetectPlatform:
-    @pytest.mark.parametrize("url,expected", [
-        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", Platform.YOUTUBE),
-        ("https://youtube.com/watch?v=dQw4w9WgXcQ", Platform.YOUTUBE),
-        ("https://youtu.be/dQw4w9WgXcQ", Platform.YOUTUBE),
-        ("https://www.youtube.com/shorts/abc123def45", Platform.YOUTUBE),
-        ("https://youtube.com/embed/dQw4w9WgXcQ", Platform.YOUTUBE),
-        ("http://youtube.com/watch?v=test", Platform.YOUTUBE),
-        ("https://www.instagram.com/reel/CxAbCdEfGhI/", Platform.INSTAGRAM),
-        ("https://instagram.com/p/CxAbCdEfGhI/", Platform.INSTAGRAM),
-        ("https://www.instagram.com/tv/CxAbCdEfGhI/", Platform.INSTAGRAM),
-        ("https://www.facebook.com/reel/123456789/", Platform.FACEBOOK),
-        ("https://facebook.com/watch/123456789/", Platform.FACEBOOK),
-        ("https://www.facebook.com/share/v/abc123/", Platform.FACEBOOK),
-        ("https://fb.watch/abc123/", Platform.FACEBOOK),
-        ("https://www.tiktok.com/@user/video/123456789", Platform.TIKTOK),
-        ("https://tiktok.com/@user/video/123456789", Platform.TIKTOK),
-        ("https://vm.tiktok.com/abc123/", Platform.TIKTOK),
-    ])
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", Platform.YOUTUBE),
+            ("https://youtube.com/watch?v=dQw4w9WgXcQ", Platform.YOUTUBE),
+            ("https://youtu.be/dQw4w9WgXcQ", Platform.YOUTUBE),
+            ("https://www.youtube.com/shorts/abc123def45", Platform.YOUTUBE),
+            ("https://youtube.com/embed/dQw4w9WgXcQ", Platform.YOUTUBE),
+            ("http://youtube.com/watch?v=test", Platform.YOUTUBE),
+            ("https://m.youtube.com/watch?v=dQw4w9WgXcQ", Platform.YOUTUBE),
+            ("https://music.youtube.com/watch?v=dQw4w9WgXcQ", Platform.YOUTUBE),
+            ("https://www.instagram.com/reel/CxAbCdEfGhI/", Platform.INSTAGRAM),
+            ("https://instagram.com/p/CxAbCdEfGhI/", Platform.INSTAGRAM),
+            ("https://www.instagram.com/tv/CxAbCdEfGhI/", Platform.INSTAGRAM),
+            ("https://www.facebook.com/reel/123456789/", Platform.FACEBOOK),
+            ("https://facebook.com/watch/123456789/", Platform.FACEBOOK),
+            ("https://www.facebook.com/share/v/abc123/", Platform.FACEBOOK),
+            ("https://fb.watch/abc123/", Platform.FACEBOOK),
+            ("https://m.facebook.com/reel/123456789/", Platform.FACEBOOK),
+            ("https://www.tiktok.com/@user/video/123456789", Platform.TIKTOK),
+            ("https://tiktok.com/@user/video/123456789", Platform.TIKTOK),
+            ("https://vm.tiktok.com/abc123/", Platform.TIKTOK),
+        ],
+    )
     def test_detect_platform(self, url, expected):
         assert detect_platform(url) == expected
 
-    @pytest.mark.parametrize("url", [
-        "https://vimeo.com/123456",
-        "https://www.dailymotion.com/video/abc123",
-        "https://example.com/video",
-        "https://twitter.com/user/status/123",
-    ])
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://vimeo.com/123456",
+            "https://www.dailymotion.com/video/abc123",
+            "https://example.com/video",
+            "https://twitter.com/user/status/123",
+            "https://notyoutu.be/dQw4w9WgXcQ",
+            "https://evil-youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://notfb.watch/abc/",
+            "https://xvm.tiktok.com/abc/",
+        ],
+    )
     def test_unknown_platform(self, url):
         assert detect_platform(url) == Platform.UNKNOWN
 
