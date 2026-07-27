@@ -29,6 +29,8 @@ Copy `.env.example` to `.env` and fill in your API keys:
 | `WHISPER_DEVICE` | `cpu` | `cpu` or `cuda` |
 | `WHISPER_COMPUTE_TYPE` | `int8` | `int8` / `float16` / `float32` |
 | `TRANSCRIPT_TEMP_DIR` | system temp | Override temp directory for audio downloads |
+| `WHISPER_MAX_CONCURRENT` | `2` | Max concurrent Whisper transcriptions |
+| `WHISPER_MAX_DURATION_SECONDS` | `600` | Max video duration in seconds for the Whisper path |
 
 ### Run
 
@@ -59,6 +61,13 @@ Extract a transcript from a video/reel URL.
 }
 ```
 
+**Error responses:**
+```json
+{"detail": "Unsupported video platform for URL: ...", "error_type": "TranscriptUnsupportedPlatformError"}
+```
+
+Status codes: `400` (invalid URL / unsupported platform), `404` (no transcript available), `502` (download or transcription failed), `500` (unexpected error).
+
 Supported platforms: YouTube, Instagram, Facebook, TikTok.
 
 ## Architecture
@@ -70,7 +79,6 @@ src/
   transcript/                  # Transcript extraction module
     models.py                  # Platform, TranscriptSegment, Transcript, TranscriptResult
     exceptions.py              # Error hierarchy
-    base.py                    # TranscriptProvider ABC (returns Transcript)
     factory.py                 # URL validation and platform detection
     service.py                 # TranscriptService (wraps Transcript -> TranscriptResult)
     providers/
@@ -78,8 +86,8 @@ src/
       whisper.py               # WhisperProvider (yt-dlp + faster-whisper)
 ```
 
-- **YouTube**: Fetches captions directly via `youtube-transcript-api` (no download).
-- **All other platforms**: Downloads audio with `yt-dlp`, transcribes with `faster-whisper` (CTranslate2-backed, 4x faster than openai-whisper, built-in VAD).
+- **YouTube**: Fetches captions directly via `youtube-transcript-api` (no download). Prefers English captions, falls back to any `en-*` variant, then the first available transcript (human-created before auto-generated). Reports the true caption language.
+- **All other platforms**: Downloads audio with `yt-dlp`, transcribes with `faster-whisper` (CTranslate2-backed, 4x faster than openai-whisper, built-in VAD). Transcription uses beam_size=10, temperature=0.0, and a domain initial_prompt tuned for movie/music/book proper names.
 
 ## Development
 
