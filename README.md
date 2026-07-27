@@ -50,11 +50,10 @@ Extract a transcript from a video/reel URL.
 **Response (200):**
 ```json
 {
-  "full_text": "Full transcript text...",
-  "segments": [
-    {"text": "Hello", "start": 0.0, "end": 2.0, "speaker": null}
-  ],
-  "language": "en",
+  "transcript": {
+    "full_text": "Full transcript text without newlines...",
+    "language": "en"
+  },
   "platform": "youtube",
   "source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 }
@@ -69,11 +68,11 @@ src/
   config.py                    # Settings via pydantic-settings
   main.py                      # FastAPI application
   transcript/                  # Transcript extraction module
-    models.py                  # Platform enum, TranscriptSegment, TranscriptResult
+    models.py                  # Platform, TranscriptSegment, Transcript, TranscriptResult
     exceptions.py              # Error hierarchy
-    base.py                    # TranscriptProvider abstract base class
+    base.py                    # TranscriptProvider ABC (returns Transcript)
     factory.py                 # URL validation and platform detection
-    service.py                 # TranscriptService orchestrator
+    service.py                 # TranscriptService (wraps Transcript -> TranscriptResult)
     providers/
       youtube.py               # YouTubeProvider (youtube-transcript-api)
       whisper.py               # WhisperProvider (yt-dlp + faster-whisper)
