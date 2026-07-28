@@ -68,7 +68,7 @@ Extract a transcript from a video/reel URL.
 
 Status codes: `400` (invalid URL / unsupported platform), `404` (no transcript available), `502` (download or transcription failed), `500` (unexpected error).
 
-Supported platforms: YouTube, Instagram, Facebook, TikTok.
+Supported platforms: YouTube, Instagram, Facebook, TikTok, X (Twitter), and Threads.
 
 ## Architecture
 

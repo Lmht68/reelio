@@ -3,6 +3,7 @@ annotated-types==0.8.0
 anyio==4.14.2
 ast-serialize==0.6.0
 av==18.0.0
+brotli==1.2.0
 certifi==2026.7.22
 charset-normalizer==3.4.9
 click==8.4.2
@@ -33,6 +34,7 @@ librt==0.13.0
 markdown-it-py==4.2.0
 markupsafe==3.0.3
 mdurl==0.1.2
+mutagen==1.48.1
 mypy==2.3.0
 mypy-extensions==1.1.0
 numpy==2.5.1
@@ -41,6 +43,7 @@ packaging==26.2
 pathspec==1.1.1
 pluggy==1.6.0
 protobuf==7.35.1
+pycryptodomex==3.23.0
 pydantic==2.13.4
 pydantic-core==2.46.4
 pydantic-extra-types==2.11.1
@@ -72,3 +75,4 @@ watchfiles==1.2.0
 websockets==16.1.1
 youtube-transcript-api==1.2.4
 yt-dlp==2026.7.4
+yt-dlp-ejs==0.8.0
