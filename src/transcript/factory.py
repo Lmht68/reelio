@@ -48,7 +48,7 @@ _PLATFORM_PATTERNS: list[tuple[Platform, list[str]]] = [
     (
         Platform.THREADS,
         [
-            r"(?:https?://)?(?<![\w-])(?:www\.)?threads\.net/",
+            r"(?:https?://)?(?<![\w-])(?:www\.)?threads\.com/",
         ],
     ),
 ]

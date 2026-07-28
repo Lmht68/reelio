@@ -72,8 +72,8 @@ class TestDetectPlatform:
             ("https://x.com/user/status/1234567890123456789", Platform.X),
             ("https://mobile.twitter.com/user/status/1234567890123456789", Platform.X),
             ("https://www.x.com/user/status/1234567890123456789", Platform.X),
-            ("https://www.threads.net/@user/post/ABC123def", Platform.THREADS),
-            ("https://threads.net/@user/post/ABC123def", Platform.THREADS),
+            ("https://www.threads.com/@user/post/ABC123def", Platform.THREADS),
+            ("https://threads.com/@user/post/ABC123def", Platform.THREADS),
         ],
     )
     def test_detect_platform(self, url, expected):
