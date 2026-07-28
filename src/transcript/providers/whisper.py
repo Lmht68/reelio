@@ -11,6 +11,7 @@ from typing import Any
 import yt_dlp
 from faster_whisper import WhisperModel
 
+from src.transcript.cleaner import clean_transcript
 from src.transcript.exceptions import (
     TranscriptDownloadError,
     TranscriptTranscriptionError,
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class WhisperDefaults:
-    beam_size: int = 10
+    beam_size: int = 1
     vad_filter: bool = True
     temperature: float = 0.0
     condition_on_previous_text: bool = True
@@ -33,7 +34,9 @@ class WhisperDefaults:
         "Transcribe proper names accurately."
     )
 
+
 WHISPER_DEFAULTS = WhisperDefaults()
+
 
 class WhisperProvider(TranscriptProvider):
     """Downloads video audio via yt-dlp and transcribes with faster-whisper.
@@ -85,7 +88,9 @@ class WhisperProvider(TranscriptProvider):
         async with self._semaphore:
             try:
                 audio_path = await self._download_audio(url)
-                return await self._transcribe(audio_path)
+                transcript = await self._transcribe(audio_path)
+                cleaned_text = clean_transcript(transcript.full_text)
+                return transcript.model_copy(update={"full_text": cleaned_text})
             finally:
                 if audio_path and audio_path.exists():
                     try:
