@@ -53,7 +53,7 @@ Extract a transcript from a video/reel URL.
 ```json
 {
   "transcript": {
-    "full_text": "Full transcript text without newlines...",
+    "full_text": "Full transcript text...",
     "language": "en"
   },
   "platform": "youtube",

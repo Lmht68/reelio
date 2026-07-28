@@ -281,6 +281,7 @@ class TestDownloadAudio:
             def __init__(self, opts):
                 captured_opts.append(opts)
                 self._opts = opts
+
             def __enter__(self):
                 return self
 
@@ -365,6 +366,7 @@ class TestDownloadAudio:
 
         # No duration key -> None
         assert match_filter({}) is None
+
     @pytest.mark.anyio
     async def test_missing_output_file_raises_download_error(self, mocker):
         """If yt-dlp runs but produces no file, TranscriptDownloadError is raised."""
