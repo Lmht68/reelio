@@ -68,6 +68,12 @@ class TestDetectPlatform:
             ("https://www.tiktok.com/@user/video/123456789", Platform.TIKTOK),
             ("https://tiktok.com/@user/video/123456789", Platform.TIKTOK),
             ("https://vm.tiktok.com/abc123/", Platform.TIKTOK),
+            ("https://twitter.com/user/status/1234567890123456789", Platform.X),
+            ("https://x.com/user/status/1234567890123456789", Platform.X),
+            ("https://mobile.twitter.com/user/status/1234567890123456789", Platform.X),
+            ("https://www.x.com/user/status/1234567890123456789", Platform.X),
+            ("https://www.threads.net/@user/post/ABC123def", Platform.THREADS),
+            ("https://threads.net/@user/post/ABC123def", Platform.THREADS),
         ],
     )
     def test_detect_platform(self, url, expected):
@@ -79,7 +85,7 @@ class TestDetectPlatform:
             "https://vimeo.com/123456",
             "https://www.dailymotion.com/video/abc123",
             "https://example.com/video",
-            "https://twitter.com/user/status/123",
+            "https://notx.com/user/status/123",
             "https://notyoutu.be/dQw4w9WgXcQ",
             "https://evil-youtube.com/watch?v=dQw4w9WgXcQ",
             "https://notfb.watch/abc/",

@@ -8,6 +8,8 @@ class Platform(StrEnum):
     FACEBOOK = "facebook"
     INSTAGRAM = "instagram"
     TIKTOK = "tiktok"
+    X = "x"
+    THREADS = "threads"
     UNKNOWN = "unknown"
 
 

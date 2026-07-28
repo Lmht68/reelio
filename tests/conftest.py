@@ -31,6 +31,16 @@ def sample_tiktok_url() -> str:
 
 
 @pytest.fixture
+def sample_x_url() -> str:
+    return "https://x.com/user/status/1234567890123456789"
+
+
+@pytest.fixture
+def sample_threads_url() -> str:
+    return "https://www.threads.net/@user/post/ABC123def"
+
+
+@pytest.fixture
 def sample_transcript_snippets() -> list:
     """Synthetic YouTube-style FetchedTranscriptSnippet-like objects."""
     s1 = MagicMock()

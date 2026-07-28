@@ -39,6 +39,18 @@ _PLATFORM_PATTERNS: list[tuple[Platform, list[str]]] = [
             r"(?:https?://)?(?<![\w-])vm\.tiktok\.com/",
         ],
     ),
+    (
+        Platform.X,
+        [
+            r"(?:https?://)?(?<![\w-])(?:www\.|mobile\.)?(?:twitter|x)\.com/\w+/status/",
+        ],
+    ),
+    (
+        Platform.THREADS,
+        [
+            r"(?:https?://)?(?<![\w-])(?:www\.)?threads\.net/",
+        ],
+    ),
 ]
 
 MAX_URL_LENGTH = 2048

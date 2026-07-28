@@ -46,7 +46,7 @@ class TestTranscriptServiceGetProvider:
 
     def test_other_platforms_route_to_whisper(self):
         service = TranscriptService()
-        for platform in [Platform.INSTAGRAM, Platform.FACEBOOK, Platform.TIKTOK]:
+        for platform in [Platform.INSTAGRAM, Platform.FACEBOOK, Platform.TIKTOK, Platform.X, Platform.THREADS]:
             provider = service._get_provider(platform)
             assert isinstance(provider, WhisperProvider)
 
