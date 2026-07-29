@@ -22,5 +22,9 @@ class Settings(BaseSettings):
     whisper_max_concurrent: int = Field(default=2, gt=0)
     whisper_max_duration_seconds: int = Field(default=600, gt=0)
 
+    # Entity extraction (LLM)
+    llm_timeout_seconds: float = Field(default=60, gt=0)
+    entity_max_transcript_chars: int = Field(default=12000, gt=0)
+
 
 settings = Settings()
