@@ -19,6 +19,7 @@ coverage/
 
 # Type checking
 .mypy_cache/
+.ruff_cache/
 
 # Environment
 .env
@@ -39,3 +40,4 @@ Thumbs.db
 # Agents
 CLAUDE.md
 AGENTS.md
+docs/
