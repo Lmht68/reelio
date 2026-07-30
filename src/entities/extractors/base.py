@@ -21,3 +21,7 @@ class EntityExtractor(ABC):
             EntityExtractionError: Extraction failed after one retry.
         """
         ...
+
+    async def aclose(self) -> None:
+        """Release resources held by the extractor. Default: nothing to release."""
+        return None

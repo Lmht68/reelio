@@ -6,5 +6,13 @@ class EntityError(Exception):
         self.original_error = original_error
 
 
+class EntityConfigurationError(EntityError):
+    """Raised when required LLM configuration is absent."""
+
+
+class EntityInputTooLongError(EntityError):
+    """Raised when transcript text exceeds the configured character limit."""
+
+
 class EntityExtractionError(EntityError):
     """Raised when LLM entity extraction fails after one retry."""

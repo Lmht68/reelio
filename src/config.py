@@ -1,4 +1,4 @@
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     # LLM
     llm_base_url: str = "https://api.deepseek.com"
     llm_model: str = "deepseek-v4-pro"
-    llm_api_key: str = ""
+    llm_api_key: SecretStr = SecretStr("")
 
     # Whisper / Transcript
     whisper_model: str = "base"
@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     # Entity extraction (LLM)
     llm_timeout_seconds: float = Field(default=60, gt=0)
     entity_max_transcript_chars: int = Field(default=12000, gt=0)
+    entity_max_concurrent: int = Field(default=4, gt=0)
 
 
 settings = Settings()
