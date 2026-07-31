@@ -5,6 +5,7 @@ description = "An AI-powered app that extracts books, music, and movie recommend
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "cachetools>=7.1.6",
     "fastapi[standard]>=0.139.2",
     "faster-whisper>=1.2.1",
     "openai>=2.50.0",

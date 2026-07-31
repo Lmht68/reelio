@@ -186,6 +186,7 @@ class TestSelectTranscript:
         with pytest.raises(NoTranscriptFound):
             YouTubeProvider._select_transcript(tl)
 
+
 class TestYouTubeProviderExtractErrorMapping:
     """Parametrized tests that each youtube-transcript-api error maps correctly."""
 

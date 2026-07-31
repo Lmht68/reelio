@@ -248,8 +248,11 @@ class TestWhisperProviderLoadModel:
 
     def test_load_model_thread_safe(self, mocker):
         """Double-checked locking prevents multiple model loads under concurrency."""
+
         def _slow_model(*args: object, **kw: object) -> MagicMock:
-            time.sleep(0.05)  # releases the GIL so all 8 threads observe _model is None without the lock
+            time.sleep(
+                0.05
+            )  # releases the GIL so all 8 threads observe _model is None without the lock
             return MagicMock()
 
         mock_model_cls = mocker.patch("src.transcript.providers.whisper.WhisperModel")
