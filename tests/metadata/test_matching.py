@@ -128,7 +128,6 @@ def test_parse_year(value, expected):
 EXTRACT_YEAR_CASES = [
     # (input, expected)
     ("2024", 2024),
-    ("2024-06", 2024),
     ("2024-06-15", 2024),
     ("  2024-06-15  ", 2024),
     ("  2024  ", 2024),
@@ -138,8 +137,19 @@ EXTRACT_YEAR_CASES = [
     ("123", None),  # too short
     ("abc2024", None),  # leading non-numeric
     ("2024/06/15", None),  # slash separator
-    ("2024-", 2024),  # YYYY- is valid (dash separator)
-    ("\u0968\u0966\u0968\u096a-06", None),  # non-ASCII digits
+    ("\u0968\u0966\u0968\u096a-06-15", None),  # non-ASCII digits
+    ("2024-", None),  # incomplete date
+    ("2024-06", None),  # incomplete date (YYYY-MM)
+    ("2024-13-01", None),  # invalid month
+    ("2024-00-15", None),  # zero month
+    ("2024-02-30", None),  # Feb 30 impossible
+    ("2024-06-00", None),  # zero day
+    ("2024-06-32", None),  # day out of range
+    ("2024-not-a-date", None),  # trailing junk
+    ("2024-06-15T12:00:00Z", None),  # ISO timestamp not bare date
+    ("2024-02-29", 2024),  # valid leap day
+    ("2023-02-28", 2023),  # valid non-leap Feb
+    ("2024-12-31", 2024),  # valid Dec 31
 ]
 
 

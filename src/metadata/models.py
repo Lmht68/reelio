@@ -1,10 +1,27 @@
 from typing import Annotated, Literal, Self
 
-from pydantic import AnyUrl, BaseModel, ConfigDict, Field, UrlConstraints, model_validator
+from pydantic import (
+    AfterValidator,
+    AnyUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    UrlConstraints,
+    model_validator,
+)
 
 from src.entities.models import Entity
 
-HttpsUrl = Annotated[AnyUrl, UrlConstraints(allowed_schemes=["https"])]
+
+def _require_https(url: AnyUrl) -> AnyUrl:
+    if url.scheme != "https":
+        raise ValueError("URL scheme must be 'https'")
+    return url
+
+
+HttpsUrl = Annotated[
+    AnyUrl, UrlConstraints(allowed_schemes=["https"]), AfterValidator(_require_https)
+]
 
 
 class MovieMetadata(BaseModel):

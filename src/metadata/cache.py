@@ -25,7 +25,7 @@ class InMemoryTTLCache:
     """Bounded in-memory TTL cache for entity metadata results.
 
     Stores positive hits as EntityMetadata and negative hits as an internal sentinel.
-    Thread-safe for event-loop-local use only; no lock is needed.
+    Not thread-safe; safe only while confined to a single event loop and thread.
     """
 
     def __init__(

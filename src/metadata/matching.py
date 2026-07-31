@@ -49,8 +49,24 @@ def parse_year(value: str | None) -> int | None:
     return int(stripped)
 
 
+_DAYS_IN_MONTH = {
+    1: 31,
+    2: 29,
+    3: 31,
+    4: 30,
+    5: 31,
+    6: 30,
+    7: 31,
+    8: 31,
+    9: 30,
+    10: 31,
+    11: 30,
+    12: 31,
+}
+
+
 def extract_first_year(value: str | None) -> int | None:
-    """Extract a year from a YYYY, YYYY-MM, or YYYY-MM-DD string prefix, or return None."""
+    """Extract a year from a YYYY or YYYY-MM-DD date string, or return None."""
     if value is None:
         return None
     stripped = value.strip()
@@ -61,9 +77,23 @@ def extract_first_year(value: str | None) -> int | None:
         return None
     if len(stripped) == 4:
         return int(prefix)
-    if stripped[4] == "-":
-        return int(prefix)
-    return None
+    # Must be exactly YYYY-MM-DD with valid month and day.
+    if len(stripped) != 10:
+        return None
+    if stripped[4] != "-" or stripped[7] != "-":
+        return None
+    month_str = stripped[5:7]
+    day_str = stripped[8:10]
+    if not month_str.isdigit() or not day_str.isdigit():
+        return None
+    month = int(month_str)
+    day = int(day_str)
+    max_day = _DAYS_IN_MONTH.get(month)
+    if max_day is None:
+        return None
+    if not (1 <= day <= max_day):
+        return None
+    return int(prefix)
 
 
 def escape_search_filter(value: str) -> str:

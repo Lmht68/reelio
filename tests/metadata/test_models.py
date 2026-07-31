@@ -116,7 +116,7 @@ METADATA_CASES = [
             provider_id="frank herbert",
             name="Frank Herbert",
             known_for=["Dune"],
-            url=AnyUrl("https://books.google.com/books?id=abc123"),
+            url=AnyUrl("https://books.google.com/books?q=inauthor:%22Frank+Herbert%22"),
         ),
         {"kind", "provider", "provider_id", "name", "known_for", "url"},
     ),
@@ -466,6 +466,139 @@ def test_author_metadata_provider_id_frank_herbert():
     author = AuthorMetadata(
         provider_id="frank herbert",
         name="Frank Herbert",
-        url=AnyUrl("https://books.google.com/books?id=abc123"),
+        url=AnyUrl("https://books.google.com/books?q=inauthor:%22Frank+Herbert%22"),
     )
     assert author.provider_id == "frank herbert"
+
+
+# ── prevalidated AnyUrl bypass detection ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("metadata_cls", "required_kwargs", "url_field"),
+    [
+        (MovieMetadata, {"provider_id": "1", "title": "x"}, "url"),
+        (MovieMetadata, {"provider_id": "1", "title": "x"}, "poster_url"),
+        (DirectorMetadata, {"provider_id": "1", "name": "x"}, "url"),
+        (DirectorMetadata, {"provider_id": "1", "name": "x"}, "image_url"),
+        (SongMetadata, {"provider_id": "1", "title": "x"}, "url"),
+        (SongMetadata, {"provider_id": "1", "title": "x"}, "image_url"),
+        (AlbumMetadata, {"provider_id": "1", "title": "x"}, "url"),
+        (AlbumMetadata, {"provider_id": "1", "title": "x"}, "image_url"),
+        (ArtistMetadata, {"provider_id": "1", "name": "x"}, "url"),
+        (ArtistMetadata, {"provider_id": "1", "name": "x"}, "image_url"),
+        (BookMetadata, {"provider_id": "1", "title": "x"}, "url"),
+        (BookMetadata, {"provider_id": "1", "title": "x"}, "thumbnail_url"),
+        (AuthorMetadata, {"provider_id": "1", "name": "x"}, "url"),
+    ],
+)
+def test_rejects_prevalidated_http_url(metadata_cls, required_kwargs, url_field):
+    """A preconstructed HTTP AnyUrl must not bypass the HTTPS-only validator."""
+    kwargs = {**required_kwargs}
+    for f in metadata_cls.model_fields:
+        if f.endswith("_url") or f == "url":
+            kwargs[f] = "https://example.com/valid"
+    kwargs[url_field] = AnyUrl("http://example.com/insecure")
+    with pytest.raises(ValidationError):
+        metadata_cls(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("metadata_cls", "required_kwargs", "url_field"),
+    [
+        (MovieMetadata, {"provider_id": "1", "title": "x"}, "url"),
+        (DirectorMetadata, {"provider_id": "1", "name": "x"}, "url"),
+        (SongMetadata, {"provider_id": "1", "title": "x"}, "url"),
+        (AlbumMetadata, {"provider_id": "1", "title": "x"}, "url"),
+        (ArtistMetadata, {"provider_id": "1", "name": "x"}, "url"),
+        (BookMetadata, {"provider_id": "1", "title": "x"}, "url"),
+        (AuthorMetadata, {"provider_id": "1", "name": "x"}, "url"),
+    ],
+)
+def test_rejects_prevalidated_non_web_url(metadata_cls, required_kwargs, url_field):
+    """A preconstructed non-web-scheme AnyUrl must be rejected."""
+    kwargs = {**required_kwargs}
+    for f in metadata_cls.model_fields:
+        if f.endswith("_url") or f == "url":
+            kwargs[f] = "https://example.com/valid"
+    kwargs[url_field] = AnyUrl("ftp://example.com/file")
+    with pytest.raises(ValidationError):
+        metadata_cls(**kwargs)
+
+
+# ── omitted defaults serialise correctly ─────────────────────────────────────
+
+
+OMITTED_DEFAULTS_CASES = [
+    (
+        MovieMetadata,
+        {"provider_id": "1", "title": "x", "url": "https://example.com/movie"},
+        {"year", "overview", "poster_url", "imdb_id"},
+        [],
+    ),
+    (
+        DirectorMetadata,
+        {"provider_id": "1", "name": "x", "url": "https://example.com/dir"},
+        {"image_url"},
+        ["known_for"],
+    ),
+    (
+        SongMetadata,
+        {"provider_id": "1", "title": "x", "url": "https://example.com/song"},
+        {"album", "image_url"},
+        ["artists"],
+    ),
+    (
+        AlbumMetadata,
+        {"provider_id": "1", "title": "x", "url": "https://example.com/album"},
+        {"year", "image_url"},
+        ["artists"],
+    ),
+    (
+        ArtistMetadata,
+        {"provider_id": "1", "name": "x", "url": "https://example.com/artist"},
+        {"image_url"},
+        ["genres"],
+    ),
+    (
+        BookMetadata,
+        {"provider_id": "1", "title": "x", "url": "https://example.com/book"},
+        {"year", "description", "thumbnail_url", "isbn"},
+        ["authors"],
+    ),
+    (
+        AuthorMetadata,
+        {"provider_id": "1", "name": "x", "url": "https://example.com/author"},
+        set(),
+        ["known_for"],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("metadata_cls", "required_kwargs", "nullable_keys", "list_keys"),
+    OMITTED_DEFAULTS_CASES,
+)
+def test_omitted_defaults_serialize(metadata_cls, required_kwargs, nullable_keys, list_keys):
+    """Omitted optional scalars serialize as null; omitted lists serialize as empty arrays."""
+    m = metadata_cls(**required_kwargs)
+    dumped = m.model_dump(mode="json")
+    for key in nullable_keys:
+        assert dumped[key] is None, f"{key} should be null"
+    for key in list_keys:
+        assert dumped[key] == [], f"{key} should be empty list"
+
+
+@pytest.mark.parametrize(
+    ("metadata_cls", "required_kwargs", "nullable_keys", "list_keys"),
+    OMITTED_DEFAULTS_CASES,
+)
+def test_omitted_list_default_isolation(metadata_cls, required_kwargs, nullable_keys, list_keys):
+    """Mutating one instance's omitted default list must not affect another instance."""
+    if not list_keys:
+        pytest.skip("no list fields on this variant")
+    a = metadata_cls(**required_kwargs)
+    b = metadata_cls(**required_kwargs)
+    list_field = list_keys[0]
+    getattr(a, list_field).append("extra")
+    assert "extra" not in getattr(b, list_field)
