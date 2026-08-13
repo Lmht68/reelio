@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Documentation
+docs/
+
+# Agent
+AGENTS.md
+CLAUDE.md
+.agent/
