@@ -223,4 +223,6 @@ docs/
 # Agent
 AGENTS.md
 CLAUDE.md
+CONTEXT.md
+CONTEXT-MAP.md
 .agent/

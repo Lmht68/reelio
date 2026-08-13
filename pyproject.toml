@@ -1,10 +1,10 @@
 [project]
-name = "reelio"
+name = "Reelio"
 version = "0.1.0"
-description = "Add your description here"
+description = "A tool that extracts movies, music, books, and related people mentioned in social media content and enriches them with metadata and links to relevant platforms."
 readme = "README.md"
 authors = [
-    { name = "ThinhLe881", email = "thinhleminh201@gmail.com" }
+    { name = "Thinh" }
 ]
 requires-python = ">=3.14"
 dependencies = [
