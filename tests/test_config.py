@@ -10,9 +10,9 @@ from pydantic import ValidationError
 from pydantic_settings import BaseSettings
 
 from reelio.config import AppConfig, Environment
-from reelio.enrichment.config import TMDBConfig
-from reelio.entities.config import LLMConfig, LLMProviderName
-from reelio.transcription.config import TranscriptionConfig
+from reelio.extraction.services.enrichment.config import TMDBConfig
+from reelio.extraction.services.entities.config import LLMConfig, LLMProviderName
+from reelio.extraction.services.transcription.config import TranscriptionConfig
 
 
 def _without_dotenv[SettingsType: BaseSettings](

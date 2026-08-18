@@ -1,8 +1,16 @@
-"""HTTP routes for the Reelio API."""
+"""Operational HTTP endpoints for the application."""
+
+from typing import Literal
 
 from fastapi import APIRouter, status
+from pydantic import BaseModel
 
-from reelio.api.schemas import HealthResponse
+
+class HealthResponse(BaseModel):
+    """Represent a successful application health check."""
+
+    status: Literal["ok"] = "ok"
+
 
 router = APIRouter()
 

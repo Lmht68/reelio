@@ -1,4 +1,4 @@
-"""Transcription-domain environment configuration."""
+"""Transcription service environment configuration."""
 
 import tempfile
 from pathlib import Path

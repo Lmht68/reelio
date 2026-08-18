@@ -3,8 +3,8 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from reelio.composition import create_app
 from reelio.config import Environment, app_settings
+from reelio.main import create_app
 
 
 @pytest.mark.parametrize(
