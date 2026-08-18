@@ -1,10 +1,10 @@
 """Application composition root."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import JSONResponse
 
 from reelio.api.router import router as api_router
 from reelio.config import Environment, app_settings
@@ -19,7 +19,7 @@ _DOCS_ENVIRONMENTS = {Environment.LOCAL, Environment.STAGING}
 
 
 @asynccontextmanager
-async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
     """Manage application startup and shutdown resources.
 
     Args:
@@ -41,7 +41,7 @@ def create_app() -> FastAPI:
     application = FastAPI(
         title="Reelio API",
         version="0.1.0",
-        default_response_class=ORJSONResponse,
+        default_response_class=JSONResponse,
         openapi_url=(
             "/openapi.json" if app_settings.environment in _DOCS_ENVIRONMENTS else None
         ),
