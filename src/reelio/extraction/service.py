@@ -1,4 +1,4 @@
-"""Pipeline boundary and hybrid contract-phase implementation."""
+"""Orchestrate source inspection, transcription, and placeholder result stages."""
 
 from dataclasses import replace
 from typing import Final, Protocol
@@ -6,6 +6,8 @@ from typing import Final, Protocol
 from reelio.extraction.services.transcription.config import transcription_settings
 from reelio.extraction.services.transcription.service import (
     SourceMetadataService,
+    TranscriptionService,
+    YouTubeCaptionProvider,
     YtDlpMetadataExtractor,
 )
 from reelio.extraction.types import (
@@ -39,48 +41,76 @@ class Pipeline(Protocol):
         ...
 
 
-class FakePipeline:
-    """Return fake transcript and results for a real source."""
+class _SourceMetadataInspector(Protocol):
+    """Inspect one submitted URL into a canonical Source."""
+
+    async def inspect(self, submitted_url: str) -> Source:
+        """Return validated Source metadata."""
+        ...
+
+
+class _TranscriptAcquirer(Protocol):
+    """Acquire a Transcript for one validated Source."""
+
+    async def acquire(self, source: Source) -> Transcript:
+        """Return a normalized Transcript."""
+        ...
+
+
+class ExtractionPipeline:
+    """Orchestrate implemented stages while later results remain placeholders."""
 
     def __init__(
         self,
-        source_metadata_service: SourceMetadataService | None = None,
+        source_metadata_service: _SourceMetadataInspector | None = None,
+        transcription_service: _TranscriptAcquirer | None = None,
     ) -> None:
-        """Initialize the pipeline with an injectable source metadata service.
+        """Initialize the pipeline with injectable stage services.
 
         Args:
-            source_metadata_service: Service used to validate and inspect URLs.
-                The production service is used when no service is supplied.
+            source_metadata_service: Service that validates and inspects Sources.
+                The production service is used when omitted.
+            transcription_service: Service that acquires Transcripts.
+                The production service is used when omitted.
         """
         self._source_metadata_service = (
             source_metadata_service
             if source_metadata_service is not None
             else _DEFAULT_SOURCE_METADATA_SERVICE
         )
+        self._transcription_service = (
+            transcription_service
+            if transcription_service is not None
+            else _DEFAULT_TRANSCRIPTION_SERVICE
+        )
 
     async def run(self, url: str) -> PipelineResult:
-        """Return the deterministic transcript and results for a real source.
+        """Inspect the Source, acquire its Transcript, and retain placeholders.
 
         Args:
             url: Source URL submitted by the API caller.
 
         Returns:
-            PipelineResult: Real source metadata with deterministic later stages.
+            PipelineResult: Real Source and Transcript with placeholder results.
 
         Raises:
-            ExtractionError: If source validation or metadata retrieval fails.
+            ExtractionError: If Source inspection or Transcript acquisition fails.
         """
         source = await self._source_metadata_service.inspect(url)
-        return replace(_FAKE_RESULT, source=source)
+        transcript = await self._transcription_service.acquire(source)
+        return replace(_PLACEHOLDER_RESULT, source=source, transcript=transcript)
 
 
 _DEFAULT_SOURCE_METADATA_SERVICE: Final[SourceMetadataService] = SourceMetadataService(
     extractor=YtDlpMetadataExtractor(),
     settings=transcription_settings,
 )
+_DEFAULT_TRANSCRIPTION_SERVICE: Final[TranscriptionService] = TranscriptionService(
+    provider=YouTubeCaptionProvider(),
+)
 
 
-_FAKE_RESULT: Final[PipelineResult] = PipelineResult(
+_PLACEHOLDER_RESULT: Final[PipelineResult] = PipelineResult(
     source=Source(
         platform=Platform.YOUTUBE,
         video_id="f4k3v1de0id",

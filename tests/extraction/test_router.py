@@ -1,6 +1,6 @@
 """HTTP contract tests for the extraction endpoint."""
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import cast
 
 import pytest
@@ -21,9 +21,12 @@ from reelio.extraction.exceptions import (
 )
 from reelio.extraction.router import get_pipeline
 from reelio.extraction.schemas import ExtractResponse
-from reelio.extraction.service import FakePipeline, Pipeline
+from reelio.extraction.service import ExtractionPipeline, Pipeline
 from reelio.extraction.services.transcription.config import TranscriptionConfig
-from reelio.extraction.services.transcription.service import SourceMetadataService
+from reelio.extraction.services.transcription.service import (
+    SourceMetadataService,
+    TranscriptionService,
+)
 from reelio.extraction.types import PipelineResult, ResultStatus
 from reelio.main import app
 
@@ -68,6 +71,24 @@ def _settings() -> TranscriptionConfig:
     return settings_type(_env_file=None)
 
 
+class _CaptionTrack:
+    def __init__(self, language_code: str, segments: Sequence[str]) -> None:
+        self.language_code = language_code
+        self.is_generated = False
+        self._segments = segments
+
+    def fetch_segments(self) -> Sequence[str]:
+        return self._segments
+
+
+class _CaptionProvider:
+    def __init__(self, tracks: Sequence[_CaptionTrack]) -> None:
+        self._tracks = tracks
+
+    def list_tracks(self, video_id: str) -> Sequence[_CaptionTrack]:
+        return self._tracks
+
+
 def _install_pipeline(application: FastAPI, pipeline: Pipeline) -> None:
     application.dependency_overrides[get_pipeline] = lambda: pipeline
 
@@ -75,11 +96,14 @@ def _install_pipeline(application: FastAPI, pipeline: Pipeline) -> None:
 async def test_extract_returns_schema_valid_response(client: AsyncClient) -> None:
     """Return real source metadata and all deterministic result branches."""
     metadata_extractor = _MetadataExtractor()
-    pipeline = FakePipeline(
+    pipeline = ExtractionPipeline(
         SourceMetadataService(
             extractor=metadata_extractor,
             settings=_settings(),
-        )
+        ),
+        TranscriptionService(
+            _CaptionProvider([_CaptionTrack("en-GB", ["Router", "caption text."])])
+        ),
     )
     _install_pipeline(app, pipeline)
 
@@ -98,8 +122,9 @@ async def test_extract_returns_schema_valid_response(client: AsyncClient) -> Non
     assert payload.source.channel == "Router test channel"
     assert payload.source.duration_seconds == 43
     assert metadata_extractor.calls == [_CANONICAL_URL]
+    assert payload.transcript.language == "en-GB"
     assert payload.transcript.method == "youtube_captions"
-    assert payload.transcript.text
+    assert payload.transcript.text == "Router caption text."
     assert {result.status for result in payload.results} == {
         ResultStatus.RESOLVED,
         ResultStatus.AMBIGUOUS,
@@ -121,6 +146,33 @@ async def test_extract_returns_schema_valid_response(client: AsyncClient) -> Non
     assert unresolved.resolution_confidence is None
     assert unresolved.movie is None
     assert unresolved.candidates == []
+
+
+async def test_extract_maps_unavailable_captions_to_502(
+    client: AsyncClient,
+) -> None:
+    """Map a valid Source with no usable captions to Transcript Unavailable."""
+    pipeline = ExtractionPipeline(
+        SourceMetadataService(
+            extractor=_MetadataExtractor(),
+            settings=_settings(),
+        ),
+        TranscriptionService(_CaptionProvider([])),
+    )
+    _install_pipeline(app, pipeline)
+
+    response = await client.post(
+        "/api/extract",
+        json={"url": _CANONICAL_URL},
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "error": {
+            "code": "transcription_failed",
+            "message": "Transcript is unavailable for this video.",
+        }
+    }
 
 
 @pytest.mark.parametrize(

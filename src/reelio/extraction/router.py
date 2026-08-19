@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, status
 
 from reelio.extraction import schemas as extraction_schemas
-from reelio.extraction.service import FakePipeline, Pipeline
+from reelio.extraction.service import ExtractionPipeline, Pipeline
 from reelio.extraction.types import (
     Candidate,
     EnrichedMovie,
@@ -15,16 +15,16 @@ from reelio.extraction.types import (
 
 router = APIRouter(prefix="/api", tags=["extraction"])
 
-_fake_pipeline = FakePipeline()
+_extraction_pipeline = ExtractionPipeline()
 
 
 def get_pipeline() -> Pipeline:
     """Provide the extraction pipeline implementation for dependency injection.
 
     Returns:
-        Pipeline: The stateless fake pipeline used during the contract phase.
+        Pipeline: The composed extraction pipeline.
     """
-    return _fake_pipeline
+    return _extraction_pipeline
 
 
 def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.Movie:

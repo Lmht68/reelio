@@ -1,27 +1,35 @@
-"""Validate YouTube sources and retrieve normalized video metadata."""
+"""Inspect YouTube Sources and acquire Caption Transcripts."""
 
 import asyncio
 import logging
 import math
 import re
-from collections.abc import Mapping
+import xml.etree.ElementTree as ElementTree
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from decimal import Decimal
 from numbers import Real
 from typing import Final, Protocol, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yt_dlp  # type: ignore[import-untyped]
+from requests.exceptions import RequestException, Timeout
+from youtube_transcript_api import (
+    CouldNotRetrieveTranscript,
+    YouTubeTranscriptApi,
+)
 from yt_dlp.utils import YoutubeDLError  # type: ignore[import-untyped]
 
 from reelio.extraction.exceptions import (
     DurationLimitExceededError,
     InvalidSourceError,
     MetadataProviderError,
+    PipelineTimeoutError,
     SourceUnavailableError,
+    TranscriptionError,
     UnsupportedPlatformError,
 )
 from reelio.extraction.services.transcription.config import TranscriptionConfig
-from reelio.extraction.types import Platform, Source
+from reelio.extraction.types import Platform, Source, Transcript, TranscriptMethod
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +97,191 @@ _SENSITIVE_QUERY_PARTS: Final[frozenset[str]] = frozenset(
 )
 
 _MISSING = object()
+_TRANSCRIPT_UNAVAILABLE_MESSAGE: Final[str] = (
+    "Transcript is unavailable for this video."
+)
+_TRANSCRIPT_TIMEOUT_MESSAGE: Final[str] = "Transcript acquisition timed out."
+
+
+class _CaptionProviderFailure(Exception):
+    """Represent an ordinary failure at the caption provider boundary."""
+
+
+class _CaptionProviderTimeout(Exception):
+    """Represent a timeout at the caption provider boundary."""
+
+
+_CAPTION_EXTERNAL_FAILURES: Final[tuple[type[BaseException], ...]] = (
+    CouldNotRetrieveTranscript,
+    ElementTree.ParseError,
+    RequestException,
+    AttributeError,
+    KeyError,
+    TypeError,
+    ValueError,
+)
+_CAPTION_TRACK_FAILURES: Final[tuple[type[BaseException], ...]] = (
+    _CaptionProviderFailure,
+    *_CAPTION_EXTERNAL_FAILURES,
+)
+
+
+class CaptionTrack(Protocol):
+    """Expose the selection metadata and text for one Caption Track."""
+
+    @property
+    def language_code(self) -> str:
+        """Return the track's original BCP 47 language code."""
+        ...
+
+    @property
+    def is_generated(self) -> bool:
+        """Return whether the provider generated the track automatically."""
+        ...
+
+    def fetch_segments(self) -> Sequence[str]:
+        """Fetch the original timed-text segments without timestamps.
+
+        Returns:
+            Sequence[str]: Text content in provider segment order.
+
+        Raises:
+            _CaptionProviderFailure: If the provider payload is unusable.
+            _CaptionProviderTimeout: If the provider request times out.
+        """
+        ...
+
+
+class CaptionProvider(Protocol):
+    """List Caption Tracks for a validated Source."""
+
+    def list_tracks(self, video_id: str) -> Sequence[CaptionTrack]:
+        """Return tracks in the provider's insertion order.
+
+        Args:
+            video_id: Stable external video identity.
+
+        Returns:
+            Sequence[CaptionTrack]: Available Caption Tracks.
+
+        Raises:
+            _CaptionProviderFailure: If track listing fails.
+            _CaptionProviderTimeout: If track listing times out.
+        """
+        ...
+
+
+class _LibrarySnippet(Protocol):
+    """Expose the text field used from one provider snippet."""
+
+    text: str
+
+
+class _LibraryFetchedTranscript(Protocol):
+    """Expose the iterable snippets returned by the provider."""
+
+    def __iter__(self) -> Iterator[_LibrarySnippet]:
+        """Return snippets in provider segment order."""
+        ...
+
+
+class _LibraryTranscript(Protocol):
+    """Expose the provider track fields used by the adapter."""
+
+    language_code: str
+    is_generated: bool
+
+    def fetch(self, preserve_formatting: bool = False) -> object:
+        """Fetch provider timed-text data."""
+        ...
+
+
+class _YouTubeCaptionTrack:
+    """Adapt one youtube-transcript-api track to CaptionTrack."""
+
+    def __init__(self, transcript: _LibraryTranscript) -> None:
+        try:
+            language_code = transcript.language_code
+            is_generated = transcript.is_generated
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise _CaptionProviderFailure from exc
+        if not isinstance(language_code, str) or not isinstance(is_generated, bool):
+            raise _CaptionProviderFailure
+        self._transcript = transcript
+        self._language_code = language_code
+        self._is_generated = is_generated
+
+    @property
+    def language_code(self) -> str:
+        """Return the provider's original language code."""
+        return self._language_code
+
+    @property
+    def is_generated(self) -> bool:
+        """Return the provider's generated-track flag."""
+        return self._is_generated
+
+    def fetch_segments(self) -> Sequence[str]:
+        """Fetch segment text with provider formatting disabled.
+
+        Returns:
+            Sequence[str]: Provider segment text in original order.
+
+        Raises:
+            _CaptionProviderFailure: If the provider payload is malformed.
+            _CaptionProviderTimeout: If the provider request times out.
+        """
+        try:
+            fetched = cast(
+                _LibraryFetchedTranscript,
+                self._transcript.fetch(preserve_formatting=False),
+            )
+            segments = tuple(snippet.text for snippet in fetched)
+            if not all(isinstance(text, str) for text in segments):
+                raise _CaptionProviderFailure
+            return segments
+        except Timeout as exc:
+            raise _CaptionProviderTimeout from exc
+        except _CaptionProviderFailure:
+            raise
+        except _CAPTION_EXTERNAL_FAILURES as exc:
+            raise _CaptionProviderFailure from exc
+
+
+class YouTubeCaptionProvider:
+    """Adapt youtube-transcript-api to the Reelio CaptionProvider contract."""
+
+    def list_tracks(self, video_id: str) -> Sequence[CaptionTrack]:
+        """List Caption Tracks using one provider client instance.
+
+        Args:
+            video_id: Stable external video identity.
+
+        Returns:
+            Sequence[CaptionTrack]: Wrapped provider tracks in provider order.
+
+        Raises:
+            _CaptionProviderFailure: If the provider payload cannot be adapted.
+            _CaptionProviderTimeout: If the listing request times out.
+        """
+        try:
+            api = YouTubeTranscriptApi()
+            transcript_list = cast(Iterable[_LibraryTranscript], api.list(video_id))
+            wrapped_tracks: list[CaptionTrack] = []
+            for track in transcript_list:
+                try:
+                    wrapped_tracks.append(_YouTubeCaptionTrack(track))
+                except _CaptionProviderFailure:
+                    logger.debug(
+                        "caption track unavailable",
+                        extra={"stage": "transcription"},
+                    )
+                    continue
+            return tuple(wrapped_tracks)
+        except Timeout as exc:
+            raise _CaptionProviderTimeout from exc
+        except _CAPTION_EXTERNAL_FAILURES as exc:
+            raise _CaptionProviderFailure from exc
 
 
 class MetadataExtractor(Protocol):
@@ -216,6 +409,126 @@ class SourceMetadataService:
                 f"{self._settings.max_video_duration_seconds} seconds."
             )
         return source
+
+
+class TranscriptionService:
+    """Acquire a Transcript from an injected CaptionProvider."""
+
+    def __init__(self, provider: CaptionProvider) -> None:
+        """Initialize the service with a caption provider.
+
+        Args:
+            provider: Synchronous provider boundary for Caption Tracks.
+        """
+        self._provider = provider
+
+    async def acquire(self, source: Source) -> Transcript:
+        """Acquire the first usable Transcript for a validated Source.
+
+        Args:
+            source: Validated Source whose video ID identifies the provider data.
+
+        Returns:
+            Transcript: Normalized caption text and acquisition metadata.
+
+        Raises:
+            TranscriptionError: If no Caption Track produces usable text.
+            PipelineTimeoutError: If listing or fetching captions times out.
+        """
+        try:
+            transcript = await asyncio.to_thread(
+                _acquire_transcript,
+                self._provider,
+                source.video_id,
+            )
+        except _CaptionProviderTimeout as exc:
+            raise PipelineTimeoutError(_TRANSCRIPT_TIMEOUT_MESSAGE) from exc
+        except _CaptionProviderFailure as exc:
+            raise TranscriptionError(_TRANSCRIPT_UNAVAILABLE_MESSAGE) from exc
+
+        if transcript is None:
+            raise TranscriptionError(_TRANSCRIPT_UNAVAILABLE_MESSAGE)
+        return transcript
+
+
+def _rank_caption_tracks(
+    tracks: Sequence[CaptionTrack],
+) -> tuple[CaptionTrack, ...]:
+    buckets: list[list[CaptionTrack]] = [[], [], [], [], [], []]
+    for track in tracks:
+        language_code = track.language_code.casefold()
+        is_english = language_code == "en" or language_code.startswith("en-")
+        if is_english:
+            if track.is_generated:
+                bucket = 2 if language_code == "en" else 3
+            else:
+                bucket = 0 if language_code == "en" else 1
+        else:
+            bucket = 5 if track.is_generated else 4
+        buckets[bucket].append(track)
+    return tuple(track for bucket in buckets for track in bucket)
+
+
+def _normalize_segments(segments: Sequence[str]) -> str:
+    tokens: list[str] = []
+    for segment in segments:
+        tokens.extend(segment.split())
+    return " ".join(tokens)
+
+
+def _acquire_transcript(
+    provider: CaptionProvider,
+    video_id: str,
+) -> Transcript | None:
+    try:
+        tracks = provider.list_tracks(video_id)
+    except _CaptionProviderTimeout:
+        raise
+    except _CaptionProviderFailure:
+        raise
+    except Timeout as exc:
+        raise _CaptionProviderTimeout from exc
+    except _CAPTION_EXTERNAL_FAILURES as exc:
+        raise _CaptionProviderFailure from exc
+
+    for track in _rank_caption_tracks(tracks):
+        try:
+            segments = track.fetch_segments()
+        except _CaptionProviderTimeout:
+            raise
+        except Timeout as exc:
+            raise _CaptionProviderTimeout from exc
+        except _CAPTION_TRACK_FAILURES:
+            logger.debug(
+                "caption track unavailable",
+                extra={"stage": "transcription"},
+            )
+            continue
+
+        segment_count = len(segments)
+        transcript_text = _normalize_segments(segments)
+        if not transcript_text:
+            continue
+
+        language = track.language_code
+        method = TranscriptMethod.YOUTUBE_CAPTIONS
+        logger.debug(
+            "transcript acquired",
+            extra={
+                "stage": "transcription",
+                "transcript_text": transcript_text,
+                "language": language,
+                "method": method.value,
+                "segment_count": segment_count,
+            },
+        )
+        return Transcript(
+            text=transcript_text,
+            language=language,
+            method=method,
+        )
+
+    return None
 
 
 def _canonicalize_url(submitted_url: str) -> tuple[Platform, str, str]:

@@ -1162,6 +1162,7 @@ dependencies = [
     { name = "httpx" },
     { name = "openai" },
     { name = "pydantic-settings" },
+    { name = "requests" },
     { name = "youtube-transcript-api" },
     { name = "yt-dlp" },
 ]
@@ -1182,6 +1183,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "openai", specifier = ">=3.1.0" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
+    { name = "requests", specifier = ">=2.34.2" },
     { name = "youtube-transcript-api", specifier = ">=1.2.4" },
     { name = "yt-dlp", specifier = ">=2026.7.4" },
 ]
