@@ -3,13 +3,6 @@
 from dataclasses import replace
 from typing import Final, Protocol
 
-from reelio.extraction.services.transcription.config import transcription_settings
-from reelio.extraction.services.transcription.service import (
-    SourceMetadataService,
-    TranscriptionService,
-    YouTubeCaptionProvider,
-    YtDlpMetadataExtractor,
-)
 from reelio.extraction.types import (
     Candidate,
     EnrichedMovie,
@@ -62,27 +55,17 @@ class ExtractionPipeline:
 
     def __init__(
         self,
-        source_metadata_service: _SourceMetadataInspector | None = None,
-        transcription_service: _TranscriptAcquirer | None = None,
+        source_metadata_service: _SourceMetadataInspector,
+        transcription_service: _TranscriptAcquirer,
     ) -> None:
-        """Initialize the pipeline with injectable stage services.
+        """Initialize the pipeline with explicit stage services.
 
         Args:
             source_metadata_service: Service that validates and inspects Sources.
-                The production service is used when omitted.
             transcription_service: Service that acquires Transcripts.
-                The production service is used when omitted.
         """
-        self._source_metadata_service = (
-            source_metadata_service
-            if source_metadata_service is not None
-            else _DEFAULT_SOURCE_METADATA_SERVICE
-        )
-        self._transcription_service = (
-            transcription_service
-            if transcription_service is not None
-            else _DEFAULT_TRANSCRIPTION_SERVICE
-        )
+        self._source_metadata_service = source_metadata_service
+        self._transcription_service = transcription_service
 
     async def run(self, url: str) -> PipelineResult:
         """Inspect the Source, acquire its Transcript, and retain placeholders.
@@ -99,15 +82,6 @@ class ExtractionPipeline:
         source = await self._source_metadata_service.inspect(url)
         transcript = await self._transcription_service.acquire(source)
         return replace(_PLACEHOLDER_RESULT, source=source, transcript=transcript)
-
-
-_DEFAULT_SOURCE_METADATA_SERVICE: Final[SourceMetadataService] = SourceMetadataService(
-    extractor=YtDlpMetadataExtractor(),
-    settings=transcription_settings,
-)
-_DEFAULT_TRANSCRIPTION_SERVICE: Final[TranscriptionService] = TranscriptionService(
-    provider=YouTubeCaptionProvider(),
-)
 
 
 _PLACEHOLDER_RESULT: Final[PipelineResult] = PipelineResult(

@@ -1,7 +1,10 @@
 """HTTP contract tests for the extraction endpoint."""
 
+import asyncio
+import threading
 from collections.abc import Callable, Iterator, Sequence
-from typing import cast
+from pathlib import Path
+from typing import NoReturn, cast
 
 import pytest
 from fastapi import FastAPI
@@ -26,6 +29,8 @@ from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.services.transcription.service import (
     SourceMetadataService,
     TranscriptionService,
+    WhisperResult,
+    _WhisperProviderFailure,
 )
 from reelio.extraction.types import PipelineResult, ResultStatus
 from reelio.main import app
@@ -89,6 +94,50 @@ class _CaptionProvider:
         return self._tracks
 
 
+class _AudioDownloader:
+    def download(self, source: object, destination: Path) -> Path:
+        audio_path = destination / "audio.webm"
+        audio_path.write_bytes(b"audio")
+        return audio_path
+
+
+class _FailingWhisperTranscriber:
+    def transcribe(self, audio_path: Path) -> NoReturn:
+        raise _WhisperProviderFailure("model failure")
+
+
+class _FixedWhisperTranscriber:
+    def __init__(self, result: WhisperResult) -> None:
+        self.result = result
+
+    def transcribe(self, audio_path: Path) -> WhisperResult:
+        return self.result
+
+
+class _BlockingWhisperTranscriber:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def transcribe(self, audio_path: Path) -> WhisperResult:
+        self.calls += 1
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError("test worker was not released")
+        return WhisperResult(text="concurrent speech", language="en", segment_count=1)
+
+
+def _transcription_service(provider: _CaptionProvider) -> TranscriptionService:
+    return TranscriptionService(
+        provider=provider,
+        audio_downloader=_AudioDownloader(),
+        transcriber=_FailingWhisperTranscriber(),
+        temp_media_dir=_settings().temp_media_dir,
+        semaphore=asyncio.Semaphore(1),
+    )
+
+
 def _install_pipeline(application: FastAPI, pipeline: Pipeline) -> None:
     application.dependency_overrides[get_pipeline] = lambda: pipeline
 
@@ -101,7 +150,7 @@ async def test_extract_returns_schema_valid_response(client: AsyncClient) -> Non
             extractor=metadata_extractor,
             settings=_settings(),
         ),
-        TranscriptionService(
+        _transcription_service(
             _CaptionProvider([_CaptionTrack("en-GB", ["Router", "caption text."])])
         ),
     )
@@ -157,7 +206,7 @@ async def test_extract_maps_unavailable_captions_to_502(
             extractor=_MetadataExtractor(),
             settings=_settings(),
         ),
-        TranscriptionService(_CaptionProvider([])),
+        _transcription_service(_CaptionProvider([])),
     )
     _install_pipeline(app, pipeline)
 
@@ -173,6 +222,85 @@ async def test_extract_maps_unavailable_captions_to_502(
             "message": "Transcript is unavailable for this video.",
         }
     }
+
+
+async def test_extract_returns_whisper_transcript(
+    client: AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Serialize a successful Whisper Transcript through the unchanged schema."""
+    pipeline = ExtractionPipeline(
+        SourceMetadataService(
+            extractor=_MetadataExtractor(),
+            settings=_settings(),
+        ),
+        TranscriptionService(
+            provider=_CaptionProvider([]),
+            audio_downloader=_AudioDownloader(),
+            transcriber=_FixedWhisperTranscriber(
+                WhisperResult(
+                    text="Spoken audio text.",
+                    language="en",
+                    segment_count=2,
+                )
+            ),
+            temp_media_dir=tmp_path,
+            semaphore=asyncio.Semaphore(1),
+        ),
+    )
+    _install_pipeline(app, pipeline)
+
+    response = await client.post(
+        "/api/extract",
+        json={"url": _CANONICAL_URL},
+    )
+
+    assert response.status_code == 200
+    payload = ExtractResponse.model_validate(response.json())
+    assert payload.transcript.text == "Spoken audio text."
+    assert payload.transcript.language == "en"
+    assert payload.transcript.method == "whisper"
+
+
+async def test_concurrent_whisper_http_requests_queue_and_succeed(
+    client: AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Queue concurrent endpoint fallbacks behind one shared service semaphore."""
+    transcriber = _BlockingWhisperTranscriber()
+    pipeline = ExtractionPipeline(
+        SourceMetadataService(
+            extractor=_MetadataExtractor(),
+            settings=_settings(),
+        ),
+        TranscriptionService(
+            provider=_CaptionProvider([]),
+            audio_downloader=_AudioDownloader(),
+            transcriber=transcriber,
+            temp_media_dir=tmp_path,
+            semaphore=asyncio.Semaphore(1),
+        ),
+    )
+    _install_pipeline(app, pipeline)
+
+    first = asyncio.create_task(
+        client.post("/api/extract", json={"url": _CANONICAL_URL})
+    )
+    assert await asyncio.to_thread(transcriber.started.wait, 5)
+    second = asyncio.create_task(
+        client.post("/api/extract", json={"url": _CANONICAL_URL})
+    )
+    await asyncio.sleep(0)
+
+    assert transcriber.calls == 1
+
+    transcriber.release.set()
+    first_response, second_response = await asyncio.gather(first, second)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert transcriber.calls == 2
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize(
@@ -231,6 +359,7 @@ async def test_malformed_requests_keep_fastapi_422_contract(
     payload: dict[str, object],
 ) -> None:
     """Keep FastAPI validation responses for malformed request bodies."""
+    _install_pipeline(app, _RaisingPipeline(RuntimeError("unused")))
     response = await client.post("/api/extract", json=payload)
 
     assert response.status_code == 422

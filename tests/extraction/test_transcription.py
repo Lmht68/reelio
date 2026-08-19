@@ -1,18 +1,22 @@
 """Deterministic tests for source validation and metadata acquisition."""
 
+import asyncio
 import logging
 import math
+import tempfile
 import threading
 import xml.etree.ElementTree as ElementTree
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace, TracebackType
 from typing import ClassVar, cast
 
 import pytest
 import yt_dlp  # type: ignore[import-untyped]
 from requests.exceptions import Timeout
 from youtube_transcript_api import CouldNotRetrieveTranscript
-from yt_dlp.utils import YoutubeDLError  # type: ignore[import-untyped]
+from yt_dlp.utils import DownloadError, YoutubeDLError  # type: ignore[import-untyped]
 
 from reelio.extraction.exceptions import (
     DurationLimitExceededError,
@@ -26,10 +30,17 @@ from reelio.extraction.exceptions import (
 from reelio.extraction.services.transcription import service as transcription_service
 from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.services.transcription.service import (
+    AudioDownloader,
+    FasterWhisperTranscriber,
     SourceMetadataService,
     TranscriptionService,
+    WhisperResult,
+    WhisperTranscriber,
     YouTubeCaptionProvider,
+    YtDlpAudioDownloader,
     YtDlpMetadataExtractor,
+    _WhisperProviderFailure,
+    _WhisperProviderTimeout,
 )
 from reelio.extraction.types import Platform, Source, Transcript, TranscriptMethod
 
@@ -553,7 +564,7 @@ async def test_caption_service_returns_selected_caption_track() -> None:
         [_FakeCaptionTrack("en", False, ["Hello", "world."])]
     )
 
-    transcript = await TranscriptionService(provider).acquire(_source())
+    transcript = await _transcription_service(provider).acquire(_source())
 
     assert transcript == Transcript(
         text="Hello world.",
@@ -581,7 +592,7 @@ async def test_manual_exact_english_wins_regardless_of_provider_order() -> None:
         ("en", False, ["manual exact English"]),
     )
 
-    transcript = await TranscriptionService(_FakeCaptionProvider(tracks)).acquire(
+    transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
         _source()
     )
 
@@ -597,7 +608,7 @@ async def test_manual_regional_english_wins_generated_exact_english() -> None:
         ("en-GB", False, ["manual regional"]),
     )
 
-    transcript = await TranscriptionService(_FakeCaptionProvider(tracks)).acquire(
+    transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
         _source()
     )
 
@@ -619,7 +630,7 @@ async def test_exact_english_wins_regional_english_within_track_kind(
         ("en", generated, ["exact"]),
     )
 
-    transcript = await TranscriptionService(_FakeCaptionProvider(tracks)).acquire(
+    transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
         _source()
     )
 
@@ -634,7 +645,7 @@ async def test_regional_english_preserves_provider_order() -> None:
         ("en-AU", False, ["Australian"]),
     )
 
-    transcript = await TranscriptionService(_FakeCaptionProvider(tracks)).acquire(
+    transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
         _source()
     )
 
@@ -649,7 +660,7 @@ async def test_manual_other_language_wins_generated_other_language() -> None:
         ("de", False, ["manual German"]),
     )
 
-    transcript = await TranscriptionService(_FakeCaptionProvider(tracks)).acquire(
+    transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
         _source()
     )
 
@@ -664,7 +675,7 @@ async def test_other_language_tracks_preserve_provider_order() -> None:
         ("de", False, ["German"]),
     )
 
-    transcript = await TranscriptionService(_FakeCaptionProvider(tracks)).acquire(
+    transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
         _source()
     )
 
@@ -681,7 +692,7 @@ async def test_english_classification_accepts_bcp47_regional_codes_only() -> Non
         ("en-CA", True, ["regional English"]),
     )
 
-    transcript = await TranscriptionService(_FakeCaptionProvider(tracks)).acquire(
+    transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
         _source()
     )
 
@@ -696,7 +707,7 @@ async def test_failed_higher_ranked_track_falls_through() -> None:
         _FakeCaptionTrack("de", False, ["usable fallback"]),
     ]
 
-    transcript = await TranscriptionService(_FakeCaptionProvider(tracks)).acquire(
+    transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
         _source()
     )
 
@@ -712,7 +723,7 @@ async def test_empty_higher_ranked_track_falls_through() -> None:
         _FakeCaptionTrack("fr", False, ["usable fallback"]),
     ]
 
-    transcript = await TranscriptionService(_FakeCaptionProvider(tracks)).acquire(
+    transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
         _source()
     )
 
@@ -732,7 +743,7 @@ async def test_segment_whitespace_normalizes_to_plain_text() -> None:
         ]
     )
 
-    transcript = await TranscriptionService(provider).acquire(_source())
+    transcript = await _transcription_service(provider).acquire(_source())
 
     assert transcript.text == "Hello world Ça va? déjà."
 
@@ -753,30 +764,49 @@ async def test_unusable_caption_tracks_raise_transcription_error(
         TranscriptionError,
         match=r"^Transcript is unavailable for this video\.$",
     ):
-        await TranscriptionService(_FakeCaptionProvider(tracks)).acquire(_source())
+        await _transcription_service(_FakeCaptionProvider(tracks)).acquire(_source())
 
 
-async def test_listing_timeout_maps_to_pipeline_timeout() -> None:
-    """Map a listing timeout without exposing provider details."""
+async def test_listing_timeout_falls_back_to_whisper(tmp_path: Path) -> None:
+    """Fall back to Whisper when Caption Track listing times out."""
     provider = _FakeCaptionProvider([], error=Timeout("sensitive provider detail"))
+    downloader = _FakeAudioDownloader()
+    transcriber = _FakeWhisperTranscriber(
+        WhisperResult(text="Recovered speech.", language="en", segment_count=1)
+    )
 
-    with pytest.raises(
-        PipelineTimeoutError,
-        match=r"^Transcript acquisition timed out\.$",
-    ):
-        await TranscriptionService(provider).acquire(_source())
+    transcript = await _transcription_service(
+        provider,
+        audio_downloader=downloader,
+        transcriber=transcriber,
+        temp_media_dir=tmp_path,
+    ).acquire(_source())
+
+    assert transcript.method is TranscriptMethod.WHISPER
+    assert transcript.text == "Recovered speech."
+    assert len(downloader.calls) == 1
 
 
-async def test_track_timeout_stops_ranked_fallback() -> None:
-    """Stop ranked traversal immediately when a track fetch times out."""
+async def test_track_timeout_stops_ranked_fallback_and_uses_whisper(
+    tmp_path: Path,
+) -> None:
+    """Stop ranked caption traversal and fall back after a track timeout."""
     tracks = [
         _FakeCaptionTrack("en", False, [], error=Timeout("provider detail")),
         _FakeCaptionTrack("de", False, ["must not be fetched"]),
     ]
+    transcriber = _FakeWhisperTranscriber(
+        WhisperResult(text="Recovered speech.", language="en", segment_count=1)
+    )
 
-    with pytest.raises(PipelineTimeoutError):
-        await TranscriptionService(_FakeCaptionProvider(tracks)).acquire(_source())
+    transcript = await _transcription_service(
+        _FakeCaptionProvider(tracks),
+        audio_downloader=_FakeAudioDownloader(),
+        transcriber=transcriber,
+        temp_media_dir=tmp_path,
+    ).acquire(_source())
 
+    assert transcript.method is TranscriptMethod.WHISPER
     assert [track.fetch_calls for track in tracks] == [1, 0]
 
 
@@ -789,7 +819,7 @@ async def test_successful_acquisition_logs_required_fields(
     )
 
     with caplog.at_level(logging.DEBUG, logger=transcription_service.__name__):
-        await TranscriptionService(provider).acquire(_source())
+        await _transcription_service(provider).acquire(_source())
 
     record = next(
         item for item in caplog.records if item.getMessage() == "transcript acquired"
@@ -814,7 +844,7 @@ async def test_failed_and_empty_tracks_do_not_log_success(
         caplog.at_level(logging.DEBUG, logger=transcription_service.__name__),
         pytest.raises(TranscriptionError),
     ):
-        await TranscriptionService(_FakeCaptionProvider(tracks)).acquire(_source())
+        await _transcription_service(_FakeCaptionProvider(tracks)).acquire(_source())
 
     assert not any(
         item.getMessage() == "transcript acquired" for item in caplog.records
@@ -916,7 +946,9 @@ async def test_caption_listing_and_fetch_share_one_worker_thread(
     track = _LibraryTrack("en", False, [_LibrarySnippet("Hello")])
     _install_caption_api(monkeypatch, [track])
 
-    transcript = await TranscriptionService(YouTubeCaptionProvider()).acquire(_source())
+    transcript = await _transcription_service(YouTubeCaptionProvider()).acquire(
+        _source()
+    )
 
     api = _FakeCaptionApi.instances[0]
     assert transcript.text == "Hello"
@@ -971,7 +1003,7 @@ async def test_caption_provider_failures_use_stable_transcription_error(
         TranscriptionError,
         match=r"^Transcript is unavailable for this video\.$",
     ) as error:
-        await TranscriptionService(YouTubeCaptionProvider()).acquire(_source())
+        await _transcription_service(YouTubeCaptionProvider()).acquire(_source())
 
     assert _VIDEO_ID not in str(error.value)
     assert "malformed caption payload" not in str(error.value)
@@ -987,7 +1019,7 @@ async def test_missing_caption_metadata_maps_to_stable_transcription_error(
         TranscriptionError,
         match=r"^Transcript is unavailable for this video\.$",
     ):
-        await TranscriptionService(YouTubeCaptionProvider()).acquire(_source())
+        await _transcription_service(YouTubeCaptionProvider()).acquire(_source())
 
 
 async def test_malformed_caption_track_falls_through_to_valid_track(
@@ -1002,22 +1034,547 @@ async def test_malformed_caption_track_falls_through_to_valid_track(
         ],
     )
 
-    transcript = await TranscriptionService(YouTubeCaptionProvider()).acquire(_source())
+    transcript = await _transcription_service(YouTubeCaptionProvider()).acquire(
+        _source()
+    )
 
     assert transcript.text == "usable"
 
 
-async def test_caption_provider_timeout_remains_pipeline_timeout(
+async def test_caption_provider_timeout_falls_back_to_whisper(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    """Keep provider timeouts distinct from ordinary provider failures."""
+    """Fall back to Whisper after a caption fetch timeout."""
     _install_caption_api(
         monkeypatch,
         [_LibraryTrack("en", False, [], error=Timeout("provider timeout"))],
     )
+    transcriber = _FakeWhisperTranscriber(
+        WhisperResult(text="Recovered speech.", language="en", segment_count=1)
+    )
+
+    transcript = await _transcription_service(
+        YouTubeCaptionProvider(),
+        audio_downloader=_FakeAudioDownloader(),
+        transcriber=transcriber,
+        temp_media_dir=tmp_path,
+    ).acquire(_source())
+
+    assert transcript.method is TranscriptMethod.WHISPER
+    assert transcript.text == "Recovered speech."
+
+
+class _FakeAudioDownloader:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Source, Path]] = []
+
+    def download(self, source: Source, destination: Path) -> Path:
+        self.calls.append((source, destination))
+        audio_path = destination / "audio.webm"
+        audio_path.write_bytes(b"audio")
+        return audio_path
+
+
+class _FakeWhisperTranscriber:
+    def __init__(self, result: WhisperResult) -> None:
+        self.result = result
+        self.calls: list[Path] = []
+
+    def transcribe(self, audio_path: Path) -> WhisperResult:
+        self.calls.append(audio_path)
+        return self.result
+
+
+class _UnavailableWhisperTranscriber:
+    def transcribe(self, audio_path: Path) -> WhisperResult:
+        raise _WhisperProviderFailure("model failure")
+
+
+def _transcription_service(
+    provider: _FakeCaptionProvider | YouTubeCaptionProvider,
+    audio_downloader: AudioDownloader | None = None,
+    transcriber: WhisperTranscriber | None = None,
+    temp_media_dir: Path | None = None,
+    semaphore: asyncio.Semaphore | None = None,
+) -> TranscriptionService:
+    return TranscriptionService(
+        provider=provider,
+        audio_downloader=(
+            audio_downloader if audio_downloader is not None else _FakeAudioDownloader()
+        ),
+        transcriber=(
+            transcriber if transcriber is not None else _UnavailableWhisperTranscriber()
+        ),
+        temp_media_dir=(
+            temp_media_dir
+            if temp_media_dir is not None
+            else Path(tempfile.gettempdir()) / "reelio-test-transcription"
+        ),
+        semaphore=semaphore if semaphore is not None else asyncio.Semaphore(1),
+    )
+
+
+async def test_captionless_source_falls_back_to_whisper(tmp_path: Path) -> None:
+    """Acquire normalized Whisper text when no Caption Track is usable."""
+    downloader = _FakeAudioDownloader()
+    transcriber = _FakeWhisperTranscriber(
+        WhisperResult(text="Hello from audio.", language="en", segment_count=2)
+    )
+    service = TranscriptionService(
+        provider=_FakeCaptionProvider([]),
+        audio_downloader=downloader,
+        transcriber=transcriber,
+        temp_media_dir=tmp_path,
+        semaphore=asyncio.Semaphore(1),
+    )
+
+    transcript = await service.acquire(_source())
+
+    assert transcript == Transcript(
+        text="Hello from audio.",
+        language="en",
+        method=TranscriptMethod.WHISPER,
+    )
+    assert len(downloader.calls) == 1
+    assert len(transcriber.calls) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+class _TimeoutWhisperTranscriber:
+    def transcribe(self, audio_path: Path) -> WhisperResult:
+        raise Timeout("whisper timeout")
+
+
+class _PartialDownloadFailure:
+    def download(self, source: Source, destination: Path) -> Path:
+        partial_path = destination / "audio.part"
+        partial_path.write_bytes(b"partial")
+        raise _WhisperProviderFailure("download provider detail")
+
+
+async def test_caption_timeout_then_whisper_failure_maps_to_502(
+    tmp_path: Path,
+) -> None:
+    """Map ordinary dual acquisition failure to Transcript Unavailable."""
+    provider = _FakeCaptionProvider([], error=Timeout("caption timeout"))
+
+    with pytest.raises(
+        TranscriptionError,
+        match=r"^Transcript is unavailable for this video\.$",
+    ):
+        await _transcription_service(
+            provider,
+            audio_downloader=_FakeAudioDownloader(),
+            transcriber=_UnavailableWhisperTranscriber(),
+            temp_media_dir=tmp_path,
+        ).acquire(_source())
+
+
+async def test_caption_timeout_then_whisper_timeout_maps_to_504(
+    tmp_path: Path,
+) -> None:
+    """Map terminal Whisper timeout after a caption timeout to HTTP 504."""
+    provider = _FakeCaptionProvider([], error=Timeout("caption timeout"))
 
     with pytest.raises(
         PipelineTimeoutError,
         match=r"^Transcript acquisition timed out\.$",
     ):
-        await TranscriptionService(YouTubeCaptionProvider()).acquire(_source())
+        await _transcription_service(
+            provider,
+            audio_downloader=_FakeAudioDownloader(),
+            transcriber=_TimeoutWhisperTranscriber(),
+            temp_media_dir=tmp_path,
+        ).acquire(_source())
+
+
+@pytest.mark.parametrize("text", ["", " \t\n"])
+async def test_empty_whisper_output_maps_to_transcription_error(
+    tmp_path: Path,
+    text: str,
+) -> None:
+    """Reject empty or whitespace-only Whisper output."""
+    transcriber = _FakeWhisperTranscriber(
+        WhisperResult(text=text, language="en", segment_count=1)
+    )
+
+    with pytest.raises(
+        TranscriptionError,
+        match=r"^Transcript is unavailable for this video\.$",
+    ):
+        await _transcription_service(
+            _FakeCaptionProvider([]),
+            audio_downloader=_FakeAudioDownloader(),
+            transcriber=transcriber,
+            temp_media_dir=tmp_path,
+        ).acquire(_source())
+
+
+async def test_zero_segment_whisper_output_maps_to_transcription_error(
+    tmp_path: Path,
+) -> None:
+    """Reject a non-empty Whisper payload that reports zero segments."""
+    transcriber = _FakeWhisperTranscriber(
+        WhisperResult(text="speech", language="en", segment_count=0)
+    )
+
+    with pytest.raises(
+        TranscriptionError,
+        match=r"^Transcript is unavailable for this video\.$",
+    ):
+        await _transcription_service(
+            _FakeCaptionProvider([]),
+            audio_downloader=_FakeAudioDownloader(),
+            transcriber=transcriber,
+            temp_media_dir=tmp_path,
+        ).acquire(_source())
+
+
+async def test_whisper_success_logs_audio_fields_and_cleans_media(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """Log the complete Whisper acquisition record before cleanup."""
+    transcriber = _FakeWhisperTranscriber(
+        WhisperResult(text="Hello from audio.", language="en", segment_count=2)
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=transcription_service.__name__):
+        await _transcription_service(
+            _FakeCaptionProvider([]),
+            audio_downloader=_FakeAudioDownloader(),
+            transcriber=transcriber,
+            temp_media_dir=tmp_path,
+        ).acquire(_source())
+
+    record = next(
+        item for item in caplog.records if item.getMessage() == "transcript acquired"
+    )
+    assert record.__dict__["transcript_text"] == "Hello from audio."
+    assert record.__dict__["language"] == "en"
+    assert record.__dict__["method"] == "whisper"
+    assert record.__dict__["segment_count"] == 2
+    assert record.__dict__["audio_size_bytes"] == 5
+    assert not Path(record.__dict__["audio_path"]).exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_download_failure_removes_partial_request_media(tmp_path: Path) -> None:
+    """Remove partial audio and its request directory after download failure."""
+    with pytest.raises(
+        TranscriptionError,
+        match=r"^Transcript is unavailable for this video\.$",
+    ):
+        await _transcription_service(
+            _FakeCaptionProvider([]),
+            audio_downloader=_PartialDownloadFailure(),
+            transcriber=_UnavailableWhisperTranscriber(),
+            temp_media_dir=tmp_path,
+        ).acquire(_source())
+
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_transcription_failure_removes_completed_audio(tmp_path: Path) -> None:
+    """Remove completed audio and its request directory after model failure."""
+    with pytest.raises(
+        TranscriptionError,
+        match=r"^Transcript is unavailable for this video\.$",
+    ):
+        await _transcription_service(
+            _FakeCaptionProvider([]),
+            audio_downloader=_FakeAudioDownloader(),
+            transcriber=_UnavailableWhisperTranscriber(),
+            temp_media_dir=tmp_path,
+        ).acquire(_source())
+
+    assert list(tmp_path.iterdir()) == []
+
+
+class _FakeWhisperModel:
+    def __init__(self, texts: Sequence[object], language: object) -> None:
+        self._texts = texts
+        self._language = language
+        self.transcribe_calls = 0
+        self.yielded_segments = 0
+
+    def transcribe(
+        self,
+        audio: str,
+    ) -> tuple[Iterator[object], SimpleNamespace]:
+        self.transcribe_calls += 1
+
+        def segments() -> Iterator[object]:
+            for text in self._texts:
+                self.yielded_segments += 1
+                yield SimpleNamespace(text=text)
+
+        return segments(), SimpleNamespace(language=self._language)
+
+
+async def test_faster_whisper_adapter_exhausts_segments_once() -> None:
+    """Consume the lazy faster-whisper segment iterator exactly once."""
+    model = _FakeWhisperModel(
+        ["  Hello\tworld  ", "\nÇa va? déjà."],
+        "fr",
+    )
+
+    result = FasterWhisperTranscriber(model).transcribe(Path("audio.webm"))
+
+    assert result == WhisperResult(
+        text="Hello world Ça va? déjà.",
+        language="fr",
+        segment_count=2,
+    )
+    assert model.transcribe_calls == 1
+    assert model.yielded_segments == 2
+
+
+@pytest.mark.parametrize(
+    ("texts", "language"),
+    [(["hello"], ""), ([object()], "en")],
+)
+async def test_malformed_whisper_output_maps_to_transcription_error(
+    tmp_path: Path,
+    texts: Sequence[object],
+    language: object,
+) -> None:
+    """Hide malformed Whisper payloads behind Transcript Unavailable."""
+    model = _FakeWhisperModel(texts, language)
+
+    with pytest.raises(
+        TranscriptionError,
+        match=r"^Transcript is unavailable for this video\.$",
+    ):
+        await _transcription_service(
+            _FakeCaptionProvider([]),
+            audio_downloader=_FakeAudioDownloader(),
+            transcriber=FasterWhisperTranscriber(model),
+            temp_media_dir=tmp_path,
+        ).acquire(_source())
+
+
+class _FakeDownloadYoutubeDL:
+    def __init__(
+        self,
+        options: object,
+        result: object,
+        prepared_path: str,
+        error: Exception | None = None,
+    ) -> None:
+        self.options = options
+        self.result = result
+        self.prepared_path = prepared_path
+        self.error = error
+        self.extract_calls: list[tuple[str, bool]] = []
+
+    def __enter__(self) -> _FakeDownloadYoutubeDL:
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: object | None,
+    ) -> None:
+        return None
+
+    def extract_info(self, canonical_url: str, *, download: bool) -> object:
+        self.extract_calls.append((canonical_url, download))
+        if self.error is not None:
+            raise self.error
+        Path(self.prepared_path).write_bytes(b"audio")
+        return self.result
+
+    def prepare_filename(self, info: Mapping[str, object]) -> str:
+        return self.prepared_path
+
+
+def test_yt_dlp_audio_adapter_requests_native_audio_and_validates_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Request native best audio and accept only the completed local file."""
+    request_directory = tmp_path / "request"
+    request_directory.mkdir()
+    prepared_path = str(request_directory / "audio.webm")
+    fake = _FakeDownloadYoutubeDL({}, {"id": _VIDEO_ID}, prepared_path)
+
+    def make_youtube_dl(options: object) -> _FakeDownloadYoutubeDL:
+        fake.options = options
+        return fake
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", make_youtube_dl)
+
+    result = YtDlpAudioDownloader().download(_source(), request_directory)
+
+    assert result == Path(prepared_path)
+    assert fake.extract_calls == [(_CANONICAL_URL, True)]
+    assert fake.options["format"] == "bestaudio/best"  # type: ignore[index]
+    assert "postprocessors" not in fake.options  # type: ignore[operator]
+    assert str(request_directory) in fake.options["outtmpl"]  # type: ignore[index]
+
+
+def test_yt_dlp_audio_adapter_rejects_out_of_directory_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reject a completed provider path outside the private request directory."""
+    request_directory = tmp_path / "request"
+    request_directory.mkdir()
+    outside_path = tmp_path / "outside.webm"
+    fake = _FakeDownloadYoutubeDL({}, {"id": _VIDEO_ID}, str(outside_path))
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", lambda options: fake)
+
+    with pytest.raises(_WhisperProviderFailure):
+        YtDlpAudioDownloader().download(_source(), request_directory)
+
+
+def test_yt_dlp_audio_adapter_rejects_multi_entry_results(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reject yt-dlp metadata that represents more than one video."""
+    request_directory = tmp_path / "request"
+    request_directory.mkdir()
+    fake = _FakeDownloadYoutubeDL(
+        {},
+        {"entries": [{"id": _VIDEO_ID}, {"id": "another-video"}]},
+        str(request_directory / "audio.webm"),
+    )
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", lambda options: fake)
+
+    with pytest.raises(_WhisperProviderFailure):
+        YtDlpAudioDownloader().download(_source(), request_directory)
+
+
+def test_yt_dlp_audio_adapter_preserves_typed_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Map nested typed yt-dlp timeout information to the timeout signal."""
+    request_directory = tmp_path / "request"
+    request_directory.mkdir()
+    provider_timeout = Timeout("provider timeout")
+    error = DownloadError(
+        "redacted provider detail",
+        exc_info=(Timeout, provider_timeout, cast(TracebackType, None)),
+    )
+    fake = _FakeDownloadYoutubeDL(
+        {},
+        {"id": _VIDEO_ID},
+        str(request_directory / "audio.webm"),
+        error=error,
+    )
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", lambda options: fake)
+
+    with pytest.raises(_WhisperProviderTimeout):
+        YtDlpAudioDownloader().download(_source(), request_directory)
+
+
+class _BlockingWhisperTranscriber:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls: list[Path] = []
+
+    def transcribe(self, audio_path: Path) -> WhisperResult:
+        self.calls.append(audio_path)
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError("test worker was not released")
+        return WhisperResult(
+            text="serialized speech",
+            language="en",
+            segment_count=1,
+        )
+
+
+async def test_whisper_fallback_queues_behind_one_semaphore(
+    tmp_path: Path,
+) -> None:
+    """Serialize concurrent Whisper fallbacks and let both complete."""
+    transcriber = _BlockingWhisperTranscriber()
+    service = _transcription_service(
+        _FakeCaptionProvider([]),
+        audio_downloader=_FakeAudioDownloader(),
+        transcriber=transcriber,
+        temp_media_dir=tmp_path,
+    )
+
+    first = asyncio.create_task(service.acquire(_source()))
+    assert await asyncio.to_thread(transcriber.started.wait, 5)
+    second = asyncio.create_task(service.acquire(_source()))
+    await asyncio.sleep(0)
+
+    assert len(transcriber.calls) == 1
+
+    transcriber.release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert first_result.text == "serialized speech"
+    assert second_result.text == "serialized speech"
+    assert len(transcriber.calls) == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_cancellation_while_queued_starts_no_fallback(tmp_path: Path) -> None:
+    """Cancel a queued request without creating media or starting a worker."""
+    semaphore = asyncio.Semaphore(1)
+    await semaphore.acquire()
+    downloader = _FakeAudioDownloader()
+    service = _transcription_service(
+        _FakeCaptionProvider([]),
+        audio_downloader=downloader,
+        transcriber=_FakeWhisperTranscriber(
+            WhisperResult(text="unused", language="en", segment_count=1)
+        ),
+        temp_media_dir=tmp_path,
+        semaphore=semaphore,
+    )
+
+    queued = asyncio.create_task(service.acquire(_source()))
+    await asyncio.sleep(0)
+    queued.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+    semaphore.release()
+
+    assert downloader.calls == []
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_active_cancellation_waits_for_cleanup_before_next_worker(
+    tmp_path: Path,
+) -> None:
+    """Finish canceled native work before releasing the shared semaphore."""
+    transcriber = _BlockingWhisperTranscriber()
+    service = _transcription_service(
+        _FakeCaptionProvider([]),
+        audio_downloader=_FakeAudioDownloader(),
+        transcriber=transcriber,
+        temp_media_dir=tmp_path,
+    )
+
+    first = asyncio.create_task(service.acquire(_source()))
+    assert await asyncio.to_thread(transcriber.started.wait, 5)
+    first.cancel()
+    await asyncio.sleep(0)
+
+    assert not first.done()
+    assert len(list(tmp_path.iterdir())) == 1
+
+    second = asyncio.create_task(service.acquire(_source()))
+    await asyncio.sleep(0)
+    assert len(transcriber.calls) == 1
+
+    transcriber.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    second_result = await second
+
+    assert second_result.text == "serialized speech"
+    assert len(transcriber.calls) == 2
+    assert list(tmp_path.iterdir()) == []

@@ -99,6 +99,24 @@ async def test_pipeline_returns_real_source_and_transcript_with_placeholders() -
     assert result.results[2].mentioned_as == ["that 90s space movie"]
 
 
+async def test_pipeline_preserves_whisper_transcript_method() -> None:
+    """Pass a Whisper Transcript through orchestration unchanged."""
+    transcript = Transcript(
+        text="Spoken audio transcript.",
+        language="en",
+        method=TranscriptMethod.WHISPER,
+    )
+    pipeline = ExtractionPipeline(
+        _FakeSourceMetadataService(_source()),
+        _FakeTranscriptionService(transcript),
+    )
+
+    result = await pipeline.run(_CANONICAL_URL)
+
+    assert result.transcript is transcript
+    assert result.transcript.method is TranscriptMethod.WHISPER
+
+
 @pytest.mark.parametrize(
     "source_error",
     [

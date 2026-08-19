@@ -1,11 +1,11 @@
 """HTTP routing and domain-to-schema conversion for extraction."""
 
-from typing import Annotated
+from typing import Annotated, cast
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Request, status
 
 from reelio.extraction import schemas as extraction_schemas
-from reelio.extraction.service import ExtractionPipeline, Pipeline
+from reelio.extraction.service import Pipeline
 from reelio.extraction.types import (
     Candidate,
     EnrichedMovie,
@@ -15,16 +15,17 @@ from reelio.extraction.types import (
 
 router = APIRouter(prefix="/api", tags=["extraction"])
 
-_extraction_pipeline = ExtractionPipeline()
 
+def get_pipeline(request: Request) -> Pipeline:
+    """Provide the lifespan-owned extraction pipeline.
 
-def get_pipeline() -> Pipeline:
-    """Provide the extraction pipeline implementation for dependency injection.
+    Args:
+        request: Current request whose application owns the pipeline.
 
     Returns:
         Pipeline: The composed extraction pipeline.
     """
-    return _extraction_pipeline
+    return cast(Pipeline, request.app.state.extraction_pipeline)
 
 
 def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.Movie:

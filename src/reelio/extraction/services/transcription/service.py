@@ -1,23 +1,29 @@
-"""Inspect YouTube Sources and acquire Caption Transcripts."""
+"""Inspect YouTube Sources and acquire Caption or Whisper Transcripts."""
 
 import asyncio
 import logging
 import math
 import re
+import socket
+import tempfile
 import xml.etree.ElementTree as ElementTree
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from numbers import Real
+from pathlib import Path
 from typing import Final, Protocol, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import ctranslate2  # type: ignore[import-untyped]
 import yt_dlp  # type: ignore[import-untyped]
+from faster_whisper import WhisperModel  # type: ignore[import-untyped]
 from requests.exceptions import RequestException, Timeout
 from youtube_transcript_api import (
     CouldNotRetrieveTranscript,
     YouTubeTranscriptApi,
 )
-from yt_dlp.utils import YoutubeDLError  # type: ignore[import-untyped]
+from yt_dlp.utils import DownloadError, YoutubeDLError  # type: ignore[import-untyped]
 
 from reelio.extraction.exceptions import (
     DurationLimitExceededError,
@@ -101,6 +107,8 @@ _TRANSCRIPT_UNAVAILABLE_MESSAGE: Final[str] = (
     "Transcript is unavailable for this video."
 )
 _TRANSCRIPT_TIMEOUT_MESSAGE: Final[str] = "Transcript acquisition timed out."
+_AUDIO_OUTPUT_TEMPLATE: Final[str] = "audio.%(ext)s"
+_WHISPER_TEMP_PREFIX: Final[str] = "reelio-whisper-"
 
 
 class _CaptionProviderFailure(Exception):
@@ -111,19 +119,59 @@ class _CaptionProviderTimeout(Exception):
     """Represent a timeout at the caption provider boundary."""
 
 
+class _WhisperProviderFailure(Exception):
+    """Represent an ordinary failure at the Whisper provider boundary."""
+
+
+class _WhisperProviderTimeout(Exception):
+    """Represent a terminal timeout at the Whisper provider boundary."""
+
+
 _CAPTION_EXTERNAL_FAILURES: Final[tuple[type[BaseException], ...]] = (
     CouldNotRetrieveTranscript,
     ElementTree.ParseError,
     RequestException,
     AttributeError,
+    IndexError,
     KeyError,
+    RuntimeError,
     TypeError,
     ValueError,
 )
-_CAPTION_TRACK_FAILURES: Final[tuple[type[BaseException], ...]] = (
-    _CaptionProviderFailure,
-    *_CAPTION_EXTERNAL_FAILURES,
+_WHISPER_EXTERNAL_FAILURES: Final[tuple[type[BaseException], ...]] = (
+    AttributeError,
+    EOFError,
+    IndexError,
+    KeyError,
+    OSError,
+    RuntimeError,
+    TypeError,
+    ValueError,
 )
+
+
+def _is_timeout_exception(error: BaseException) -> bool:
+    pending: list[BaseException] = [error]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in visited:
+            continue
+        visited.add(candidate_id)
+        if isinstance(candidate, (Timeout, TimeoutError, socket.timeout)):
+            return True
+        if isinstance(candidate, DownloadError):
+            exc_info = getattr(candidate, "exc_info", None)
+            if isinstance(exc_info, tuple) and len(exc_info) > 1:
+                nested = exc_info[1]
+                if isinstance(nested, BaseException):
+                    pending.append(nested)
+        for attribute in ("__cause__", "__context__", "reason"):
+            nested = getattr(candidate, attribute, None)
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return False
 
 
 class CaptionTrack(Protocol):
@@ -167,6 +215,53 @@ class CaptionProvider(Protocol):
         Raises:
             _CaptionProviderFailure: If track listing fails.
             _CaptionProviderTimeout: If track listing times out.
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class WhisperResult:
+    """Contain normalized text and metadata from one Whisper operation."""
+
+    text: str
+    language: str
+    segment_count: int
+
+
+class AudioDownloader(Protocol):
+    """Download one Source's native best-audio representation."""
+
+    def download(self, source: Source, destination: Path) -> Path:
+        """Download audio into the provided request directory.
+
+        Args:
+            source: Canonical YouTube Source to download.
+            destination: Existing private request directory.
+
+        Returns:
+            Path: Completed audio file path owned by ``destination``.
+
+        Raises:
+            _WhisperProviderFailure: If the download result is unusable.
+            _WhisperProviderTimeout: If the provider times out.
+        """
+        ...
+
+
+class WhisperTranscriber(Protocol):
+    """Transcribe one local audio file with a preloaded model."""
+
+    def transcribe(self, audio_path: Path) -> WhisperResult:
+        """Transcribe the provided local audio file.
+
+        Args:
+            audio_path: Validated completed audio file.
+
+        Returns:
+            WhisperResult: Normalized text and detected language.
+
+        Raises:
+            _WhisperProviderFailure: If model inference or output validation fails.
         """
         ...
 
@@ -240,7 +335,7 @@ class _YouTubeCaptionTrack:
             if not all(isinstance(text, str) for text in segments):
                 raise _CaptionProviderFailure
             return segments
-        except Timeout as exc:
+        except (Timeout, TimeoutError) as exc:
             raise _CaptionProviderTimeout from exc
         except _CaptionProviderFailure:
             raise
@@ -278,7 +373,7 @@ class YouTubeCaptionProvider:
                     )
                     continue
             return tuple(wrapped_tracks)
-        except Timeout as exc:
+        except (Timeout, TimeoutError) as exc:
             raise _CaptionProviderTimeout from exc
         except _CAPTION_EXTERNAL_FAILURES as exc:
             raise _CaptionProviderFailure from exc
@@ -320,6 +415,156 @@ class YtDlpMetadataExtractor:
         if not isinstance(raw_metadata, Mapping):
             raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
         return cast(Mapping[str, object], raw_metadata)
+
+
+class _WhisperSegment(Protocol):
+    """Expose the text field returned by faster-whisper."""
+
+    text: str
+
+
+class _WhisperInfo(Protocol):
+    """Expose detected language returned by faster-whisper."""
+
+    language: str
+
+
+class _WhisperModel(Protocol):
+    """Expose the faster-whisper method used by the adapter."""
+
+    def transcribe(
+        self,
+        audio: str,
+    ) -> tuple[Iterable[_WhisperSegment], _WhisperInfo]:
+        """Return a lazy segment iterator and transcription metadata."""
+        ...
+
+
+class YtDlpAudioDownloader:
+    """Download native best audio into a private request directory."""
+
+    def download(self, source: Source, destination: Path) -> Path:
+        """Download one Source's native best-audio representation.
+
+        Args:
+            source: Canonical YouTube Source to download.
+            destination: Existing private request directory.
+
+        Returns:
+            Path: Validated completed audio file inside ``destination``.
+
+        Raises:
+            _WhisperProviderFailure: If yt-dlp returns unusable output.
+            _WhisperProviderTimeout: If yt-dlp reports a typed timeout.
+        """
+        request_directory = destination.resolve()
+        options = {
+            **_YTDLP_OPTIONS,
+            "format": "bestaudio/best",
+            "outtmpl": str(request_directory / _AUDIO_OUTPUT_TEMPLATE),
+        }
+        try:
+            with yt_dlp.YoutubeDL(options) as youtube_dl:
+                raw_info = youtube_dl.extract_info(source.url, download=True)
+                if not isinstance(raw_info, Mapping) or "entries" in raw_info:
+                    raise _WhisperProviderFailure
+                prepared_path = youtube_dl.prepare_filename(raw_info)
+        except _WhisperProviderFailure:
+            raise
+        except DownloadError as exc:
+            if _is_timeout_exception(exc):
+                raise _WhisperProviderTimeout from exc
+            raise _WhisperProviderFailure from exc
+        except YoutubeDLError as exc:
+            raise _WhisperProviderFailure from exc
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise _WhisperProviderFailure from exc
+
+        if not isinstance(prepared_path, (str, Path)):
+            raise _WhisperProviderFailure
+        completed_path = Path(prepared_path).resolve()
+        if completed_path.parent != request_directory or not completed_path.is_file():
+            raise _WhisperProviderFailure
+        return completed_path
+
+
+class FasterWhisperTranscriber:
+    """Adapt one preloaded faster-whisper model to WhisperTranscriber."""
+
+    def __init__(self, model: object) -> None:
+        """Initialize the adapter around an already-loaded model.
+
+        Args:
+            model: Preloaded faster-whisper model instance.
+        """
+        self._model = model
+
+    def transcribe(self, audio_path: Path) -> WhisperResult:
+        """Transcribe and normalize one local audio file.
+
+        Args:
+            audio_path: Validated completed audio file.
+
+        Returns:
+            WhisperResult: Normalized text, detected language, and segment count.
+
+        Raises:
+            _WhisperProviderFailure: If model output or inference is unusable.
+        """
+        segment_count = 0
+        try:
+            segments, info = cast(_WhisperModel, self._model).transcribe(
+                str(audio_path)
+            )
+
+            def segment_texts() -> Iterator[str]:
+                nonlocal segment_count
+                for segment in segments:
+                    segment_count += 1
+                    text = segment.text
+                    if not isinstance(text, str):
+                        raise TypeError
+                    yield text
+
+            text = _normalize_segments(segment_texts())
+            language = info.language
+            if not isinstance(language, str) or not language.strip() or not text:
+                raise ValueError
+        except _WHISPER_EXTERNAL_FAILURES as exc:
+            raise _WhisperProviderFailure from exc
+
+        return WhisperResult(
+            text=text,
+            language=language,
+            segment_count=segment_count,
+        )
+
+
+def load_whisper_transcriber(
+    settings: TranscriptionConfig,
+) -> FasterWhisperTranscriber:
+    """Load one configured faster-whisper model and wrap it.
+
+    Args:
+        settings: Environment-backed transcription settings.
+
+    Returns:
+        FasterWhisperTranscriber: Adapter around the loaded model.
+
+    Raises:
+        RuntimeError: If explicit CUDA configuration has no CUDA device.
+        Exception: If faster-whisper cannot load or download the model.
+    """
+    if settings.whisper_device == "cuda" and ctranslate2.get_cuda_device_count() == 0:
+        raise RuntimeError(
+            "REELIO_WHISPER_DEVICE is 'cuda', but no CUDA device is available."
+        )
+    model = WhisperModel(
+        model_size_or_path=settings.whisper_model,
+        device=settings.whisper_device,
+        compute_type=settings.whisper_compute_type,
+    )
+    return FasterWhisperTranscriber(model)
 
 
 class SourceMetadataService:
@@ -412,28 +657,43 @@ class SourceMetadataService:
 
 
 class TranscriptionService:
-    """Acquire a Transcript from an injected CaptionProvider."""
+    """Acquire a Transcript from captions with a Whisper fallback."""
 
-    def __init__(self, provider: CaptionProvider) -> None:
-        """Initialize the service with a caption provider.
+    def __init__(
+        self,
+        provider: CaptionProvider,
+        audio_downloader: AudioDownloader,
+        transcriber: WhisperTranscriber,
+        temp_media_dir: Path,
+        semaphore: asyncio.Semaphore,
+    ) -> None:
+        """Initialize caption and Whisper acquisition dependencies.
 
         Args:
             provider: Synchronous provider boundary for Caption Tracks.
+            audio_downloader: Synchronous native-audio download adapter.
+            transcriber: Preloaded synchronous Whisper adapter.
+            temp_media_dir: Root directory for request-scoped media.
+            semaphore: Application-lifetime Whisper concurrency gate.
         """
         self._provider = provider
+        self._audio_downloader = audio_downloader
+        self._transcriber = transcriber
+        self._temp_media_dir = temp_media_dir
+        self._semaphore = semaphore
 
     async def acquire(self, source: Source) -> Transcript:
-        """Acquire the first usable Transcript for a validated Source.
+        """Acquire a normalized Transcript for a validated Source.
 
         Args:
-            source: Validated Source whose video ID identifies the provider data.
+            source: Validated Source whose video ID identifies provider data.
 
         Returns:
-            Transcript: Normalized caption text and acquisition metadata.
+            Transcript: Caption or Whisper text and acquisition metadata.
 
         Raises:
-            TranscriptionError: If no Caption Track produces usable text.
-            PipelineTimeoutError: If listing or fetching captions times out.
+            TranscriptionError: If captions and Whisper produce no Transcript.
+            PipelineTimeoutError: If the terminal Whisper path times out.
         """
         try:
             transcript = await asyncio.to_thread(
@@ -441,14 +701,119 @@ class TranscriptionService:
                 self._provider,
                 source.video_id,
             )
-        except _CaptionProviderTimeout as exc:
+        except _CaptionProviderFailure, _CaptionProviderTimeout:
+            transcript = None
+
+        if transcript is not None:
+            return transcript
+
+        try:
+            return await self._acquire_whisper(source)
+        except _WhisperProviderTimeout as exc:
             raise PipelineTimeoutError(_TRANSCRIPT_TIMEOUT_MESSAGE) from exc
-        except _CaptionProviderFailure as exc:
+        except _WhisperProviderFailure as exc:
             raise TranscriptionError(_TRANSCRIPT_UNAVAILABLE_MESSAGE) from exc
 
-        if transcript is None:
-            raise TranscriptionError(_TRANSCRIPT_UNAVAILABLE_MESSAGE)
-        return transcript
+    async def _acquire_whisper(self, source: Source) -> Transcript:
+        await self._semaphore.acquire()
+        try:
+            worker = asyncio.create_task(
+                asyncio.to_thread(self._acquire_whisper_sync, source)
+            )
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                await _finish_cancelled_worker(worker)
+                raise
+        finally:
+            self._semaphore.release()
+
+    def _acquire_whisper_sync(self, source: Source) -> Transcript:
+        self._temp_media_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=_WHISPER_TEMP_PREFIX,
+            dir=str(self._temp_media_dir),
+        ) as request_directory_name:
+            request_directory = Path(request_directory_name).resolve()
+            try:
+                downloaded_path = self._audio_downloader.download(
+                    source,
+                    request_directory,
+                )
+            except _WhisperProviderTimeout:
+                raise
+            except _WhisperProviderFailure:
+                raise
+            except (Timeout, TimeoutError) as exc:
+                raise _WhisperProviderTimeout from exc
+            audio_path = _validate_audio_path(downloaded_path, request_directory)
+            audio_size_bytes = audio_path.stat().st_size
+            try:
+                result = self._transcriber.transcribe(audio_path)
+            except _WhisperProviderTimeout:
+                raise
+            except _WhisperProviderFailure:
+                raise
+            except (Timeout, TimeoutError) as exc:
+                raise _WhisperProviderTimeout from exc
+            if (
+                not isinstance(result, WhisperResult)
+                or not isinstance(result.text, str)
+                or not isinstance(result.language, str)
+                or not result.language.strip()
+                or result.segment_count <= 0
+            ):
+                raise _WhisperProviderFailure
+            transcript_text = _normalize_segments((result.text,))
+            if not transcript_text:
+                raise _WhisperProviderFailure
+
+            method = TranscriptMethod.WHISPER
+            logger.debug(
+                "transcript acquired",
+                extra={
+                    "stage": "transcription",
+                    "transcript_text": transcript_text,
+                    "language": result.language,
+                    "method": method.value,
+                    "segment_count": result.segment_count,
+                    "audio_path": str(audio_path),
+                    "audio_size_bytes": audio_size_bytes,
+                },
+            )
+            return Transcript(
+                text=transcript_text,
+                language=result.language,
+                method=method,
+            )
+
+
+async def _finish_cancelled_worker(
+    worker: asyncio.Task[Transcript],
+) -> None:
+    """Wait for a shielded native worker before releasing its semaphore."""
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+    try:
+        worker.result()
+    except _WhisperProviderFailure, _WhisperProviderTimeout:
+        return
+    except Exception:
+        logger.exception("Whisper worker failed after request cancellation")
+
+
+def _validate_audio_path(audio_path: Path, request_directory: Path) -> Path:
+    if not isinstance(audio_path, Path):
+        raise _WhisperProviderFailure
+    resolved_path = audio_path.resolve()
+    if resolved_path.parent != request_directory or not resolved_path.is_file():
+        raise _WhisperProviderFailure
+    return resolved_path
 
 
 def _rank_caption_tracks(
@@ -469,9 +834,11 @@ def _rank_caption_tracks(
     return tuple(track for bucket in buckets for track in bucket)
 
 
-def _normalize_segments(segments: Sequence[str]) -> str:
+def _normalize_segments(segments: Iterable[str]) -> str:
     tokens: list[str] = []
     for segment in segments:
+        if not isinstance(segment, str):
+            raise TypeError
         tokens.extend(segment.split())
     return " ".join(tokens)
 
@@ -482,35 +849,37 @@ def _acquire_transcript(
 ) -> Transcript | None:
     try:
         tracks = provider.list_tracks(video_id)
+        ranked_tracks = _rank_caption_tracks(tracks)
     except _CaptionProviderTimeout:
         raise
     except _CaptionProviderFailure:
         raise
-    except Timeout as exc:
+    except (Timeout, TimeoutError) as exc:
         raise _CaptionProviderTimeout from exc
     except _CAPTION_EXTERNAL_FAILURES as exc:
         raise _CaptionProviderFailure from exc
 
-    for track in _rank_caption_tracks(tracks):
+    for track in ranked_tracks:
         try:
             segments = track.fetch_segments()
+            segment_count = len(segments)
+            transcript_text = _normalize_segments(segments)
+            if not transcript_text:
+                continue
+            language = track.language_code
+            if not isinstance(language, str) or not language.strip():
+                raise TypeError
         except _CaptionProviderTimeout:
             raise
-        except Timeout as exc:
+        except (Timeout, TimeoutError) as exc:
             raise _CaptionProviderTimeout from exc
-        except _CAPTION_TRACK_FAILURES:
+        except _CAPTION_EXTERNAL_FAILURES:
             logger.debug(
                 "caption track unavailable",
                 extra={"stage": "transcription"},
             )
             continue
 
-        segment_count = len(segments)
-        transcript_text = _normalize_segments(segments)
-        if not transcript_text:
-            continue
-
-        language = track.language_code
         method = TranscriptMethod.YOUTUBE_CAPTIONS
         logger.debug(
             "transcript acquired",
