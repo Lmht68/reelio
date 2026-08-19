@@ -1,6 +1,7 @@
 """HTTP contract tests for the extraction endpoint."""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from typing import cast
 
 import pytest
 from fastapi import FastAPI
@@ -12,6 +13,7 @@ from reelio.extraction.exceptions import (
     EntityExtractionError,
     ExtractionError,
     InvalidSourceError,
+    MetadataProviderError,
     PipelineTimeoutError,
     SourceUnavailableError,
     TranscriptionError,
@@ -19,7 +21,9 @@ from reelio.extraction.exceptions import (
 )
 from reelio.extraction.router import get_pipeline
 from reelio.extraction.schemas import ExtractResponse
-from reelio.extraction.service import Pipeline
+from reelio.extraction.service import FakePipeline, Pipeline
+from reelio.extraction.services.transcription.config import TranscriptionConfig
+from reelio.extraction.services.transcription.service import SourceMetadataService
 from reelio.extraction.types import PipelineResult, ResultStatus
 from reelio.main import app
 
@@ -40,20 +44,60 @@ class _RaisingPipeline:
         raise self._exception
 
 
+_VIDEO_ID = "dQw4w9WgXcQ"
+_CANONICAL_URL = f"https://www.youtube.com/watch?v={_VIDEO_ID}"
+
+
+class _MetadataExtractor:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def extract(self, canonical_url: str) -> dict[str, object]:
+        self.calls.append(canonical_url)
+        return {
+            "id": _VIDEO_ID,
+            "title": "Router test video",
+            "description": "A complete router test description.",
+            "channel": "Router test channel",
+            "duration": 42.2,
+        }
+
+
+def _settings() -> TranscriptionConfig:
+    settings_type = cast(Callable[..., TranscriptionConfig], TranscriptionConfig)
+    return settings_type(_env_file=None)
+
+
 def _install_pipeline(application: FastAPI, pipeline: Pipeline) -> None:
     application.dependency_overrides[get_pipeline] = lambda: pipeline
 
 
 async def test_extract_returns_schema_valid_response(client: AsyncClient) -> None:
-    """Return all result branches in a schema-valid response."""
+    """Return real source metadata and all deterministic result branches."""
+    metadata_extractor = _MetadataExtractor()
+    pipeline = FakePipeline(
+        SourceMetadataService(
+            extractor=metadata_extractor,
+            settings=_settings(),
+        )
+    )
+    _install_pipeline(app, pipeline)
+
     response = await client.post(
         "/api/extract",
-        json={"url": "https://www.youtube.com/watch?v=anything"},
+        json={"url": _CANONICAL_URL},
     )
 
     assert response.status_code == 200
     payload = ExtractResponse.model_validate(response.json())
     assert payload.source.platform == "youtube"
+    assert payload.source.video_id == _VIDEO_ID
+    assert payload.source.url == _CANONICAL_URL
+    assert payload.source.title == "Router test video"
+    assert payload.source.description == "A complete router test description."
+    assert payload.source.channel == "Router test channel"
+    assert payload.source.duration_seconds == 43
+    assert metadata_extractor.calls == [_CANONICAL_URL]
     assert payload.transcript.method == "youtube_captions"
     assert payload.transcript.text
     assert {result.status for result in payload.results} == {
@@ -93,6 +137,11 @@ async def test_extract_returns_schema_valid_response(client: AsyncClient) -> Non
             DurationLimitExceededError("duration limit exceeded"),
             413,
             "duration_limit_exceeded",
+        ),
+        (
+            MetadataProviderError("Unable to retrieve YouTube metadata."),
+            502,
+            "metadata_provider_failed",
         ),
         (TranscriptionError("transcription failed"), 502, "transcription_failed"),
         (
@@ -165,7 +214,8 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     response = await client.get("/openapi.json")
 
     assert response.status_code == 200
-    operation = response.json()["paths"]["/api/extract"]["post"]
+    document = response.json()
+    operation = document["paths"]["/api/extract"]["post"]
     responses = operation["responses"]
     assert {"200", "400", "404", "413", "500", "502", "504", "422"} <= set(responses)
     for status_code in ("400", "404", "413", "500", "502", "504"):
@@ -174,3 +224,13 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
 
     request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
     assert request_schema == {"$ref": "#/components/schemas/ExtractRequest"}
+    source_properties = document["components"]["schemas"]["Source"]["properties"]
+    assert {
+        "platform",
+        "video_id",
+        "url",
+        "title",
+        "description",
+        "channel",
+        "duration_seconds",
+    } <= set(source_properties)

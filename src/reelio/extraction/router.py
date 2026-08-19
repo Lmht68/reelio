@@ -68,6 +68,10 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
             platform=result.source.platform,
             video_id=result.source.video_id,
             url=result.source.url,
+            title=result.source.title,
+            description=result.source.description,
+            channel=result.source.channel,
+            duration_seconds=result.source.duration_seconds,
         ),
         transcript=extraction_schemas.Transcript(
             text=result.transcript.text,
@@ -107,7 +111,7 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         },
         502: {
             "model": extraction_schemas.ErrorResponse,
-            "description": "Transcript, LLM, or TMDB provider failure.",
+            "description": "Metadata, transcript, LLM, or TMDB provider failure.",
         },
         504: {
             "model": extraction_schemas.ErrorResponse,

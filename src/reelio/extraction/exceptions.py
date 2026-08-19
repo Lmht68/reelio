@@ -49,6 +49,13 @@ class DurationLimitExceededError(ExtractionError):
     status_code = 413
 
 
+class MetadataProviderError(ExtractionError):
+    """Indicate that source metadata could not be retrieved or normalized."""
+
+    code = "metadata_provider_failed"
+    status_code = 502
+
+
 class TranscriptionError(ExtractionError):
     """Indicate that no transcript could be acquired."""
 

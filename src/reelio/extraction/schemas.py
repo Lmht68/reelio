@@ -16,11 +16,15 @@ class ExtractRequest(BaseModel):
 
 
 class Source(BaseModel):
-    """Canonical source identity returned by the extraction pipeline."""
+    """Canonical source identity and video metadata returned to the caller."""
 
     platform: Platform
     video_id: str
     url: str
+    title: str
+    description: str
+    channel: str
+    duration_seconds: int
 
 
 class Transcript(BaseModel):

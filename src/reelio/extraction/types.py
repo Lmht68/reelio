@@ -27,17 +27,25 @@ class ResultStatus(StrEnum):
 
 @dataclass
 class Source:
-    """Identify the source content and its canonical platform URL.
+    """Contain canonical source identity and normalized video metadata.
 
     Attributes:
         platform: Platform hosting the source.
         video_id: Stable external identifier for the source.
         url: Canonical URL reconstructed from the platform identity.
+        title: Provider-supplied video title.
+        description: Complete provider-supplied video description.
+        channel: Provider-supplied channel name.
+        duration_seconds: Video duration rounded up to whole seconds.
     """
 
     platform: Platform
     video_id: str
     url: str
+    title: str
+    description: str
+    channel: str
+    duration_seconds: int
 
 
 @dataclass
