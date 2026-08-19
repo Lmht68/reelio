@@ -7,6 +7,12 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from reelio.config import Environment, app_settings
+from reelio.extraction.exceptions import (
+    ExtractionError,
+    extraction_error_handler,
+    unhandled_error_handler,
+)
+from reelio.extraction.router import router as extraction_router
 from reelio.extraction.services.enrichment.config import (  # noqa: F401
     tmdb_settings as _tmdb_settings,
 )
@@ -52,6 +58,9 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     application.include_router(ops_router)
+    application.include_router(extraction_router)
+    application.add_exception_handler(ExtractionError, extraction_error_handler)
+    application.add_exception_handler(Exception, unhandled_error_handler)
     return application
 
 
