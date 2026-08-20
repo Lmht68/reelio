@@ -8,6 +8,10 @@ class Platform(StrEnum):
     """Content platforms supported by the extraction context."""
 
     YOUTUBE = "youtube"
+    INSTAGRAM = "instagram"
+    FACEBOOK = "facebook"
+    TIKTOK = "tiktok"
+    X = "x"
 
 
 class TranscriptMethod(StrEnum):
@@ -32,7 +36,7 @@ class Source:
     Attributes:
         platform: Platform hosting the source.
         video_id: Stable external identifier for the source.
-        url: Canonical URL reconstructed from the platform identity.
+        url: Validated canonical URL returned or reconstructed for the source.
         title: Provider-supplied video title.
         description: Complete provider-supplied video description.
         channel: Provider-supplied channel name.

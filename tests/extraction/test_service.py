@@ -117,6 +117,34 @@ async def test_pipeline_preserves_whisper_transcript_method() -> None:
     assert result.transcript.method is TranscriptMethod.WHISPER
 
 
+async def test_pipeline_is_platform_agnostic_for_social_whisper_sources() -> None:
+    """Pass a social Source and Whisper Transcript through unchanged."""
+    source = Source(
+        platform=Platform.INSTAGRAM,
+        video_id="ABC123",
+        url="https://www.instagram.com/reel/ABC123",
+        title="Social pipeline video",
+        description="Social pipeline description.",
+        channel="Social pipeline channel",
+        duration_seconds=42,
+    )
+    transcript = Transcript(
+        text="Social pipeline speech.",
+        language="en",
+        method=TranscriptMethod.WHISPER,
+    )
+    metadata_service = _FakeSourceMetadataService(source)
+    transcription_service = _FakeTranscriptionService(transcript)
+    pipeline = ExtractionPipeline(metadata_service, transcription_service)
+
+    result = await pipeline.run(source.url)
+
+    assert result.source is source
+    assert result.transcript is transcript
+    assert metadata_service.calls == [source.url]
+    assert transcription_service.calls == [source]
+
+
 @pytest.mark.parametrize(
     "source_error",
     [

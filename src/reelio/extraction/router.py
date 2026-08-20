@@ -86,25 +86,26 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
 @router.post(
     "/extract",
     status_code=status.HTTP_200_OK,
-    summary="Extract mentioned movies from a YouTube video",
+    summary="Extract mentioned movies from a supported public video Source",
     description=(
-        "Accept a public YouTube URL and return the normalized Source, the "
-        "Transcript with its acquisition method, and one Resolved, Ambiguous, "
-        "or Unresolved result per mentioned movie."
+        "Accept a public YouTube, Instagram, Facebook, TikTok, or X video URL "
+        "and return the normalized Source, the Transcript with its acquisition "
+        "method, and one Resolved, Ambiguous, or Unresolved result per mentioned "
+        "movie."
     ),
     response_description="Source, transcript, and per-mention results.",
     responses={
         400: {
             "model": extraction_schemas.ErrorResponse,
-            "description": "Invalid URL or unsupported platform.",
+            "description": "Invalid URL, unsupported platform, or unsupported Source.",
         },
         404: {
             "model": extraction_schemas.ErrorResponse,
-            "description": "Video unavailable, private, or not found.",
+            "description": "Source unavailable, private, or not found.",
         },
         413: {
             "model": extraction_schemas.ErrorResponse,
-            "description": "Video exceeds the duration limit.",
+            "description": "Source exceeds the duration limit.",
         },
         500: {
             "model": extraction_schemas.ErrorResponse,

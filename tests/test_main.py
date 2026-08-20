@@ -7,8 +7,8 @@ import ctranslate2  # type: ignore[import-untyped]
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+import reelio.extraction.services.transcription.acquisition as transcription_service
 from reelio.config import Environment, app_settings
-from reelio.extraction.services.transcription import service as transcription_service
 from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.types import PipelineResult
 from reelio.main import create_app

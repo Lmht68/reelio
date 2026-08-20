@@ -11,7 +11,13 @@ class ExtractRequest(BaseModel):
     url: str = Field(
         min_length=1,
         max_length=2048,
-        examples=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+        examples=[
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.instagram.com/reel/ABC123",
+            "https://www.facebook.com/reel/123456789",
+            "https://www.tiktok.com/@creator/video/1234567890123456789",
+            "https://x.com/creator/status/123456789",
+        ],
     )
 
 

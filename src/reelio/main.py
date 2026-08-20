@@ -21,16 +21,18 @@ from reelio.extraction.services.enrichment.config import (  # noqa: F401
 from reelio.extraction.services.entities.config import (  # noqa: F401
     llm_settings as _llm_settings,
 )
+from reelio.extraction.services.transcription.acquisition import (
+    YouTubeCaptionProvider,
+    YtDlpAudioDownloader,
+    load_whisper_transcriber,
+)
 from reelio.extraction.services.transcription.config import (
     transcription_settings as _transcription_settings,
 )
+from reelio.extraction.services.transcription.inspection import YtDlpMetadataExtractor
 from reelio.extraction.services.transcription.service import (
     SourceMetadataService,
     TranscriptionService,
-    YouTubeCaptionProvider,
-    YtDlpAudioDownloader,
-    YtDlpMetadataExtractor,
-    load_whisper_transcriber,
 )
 from reelio.logging import configure_logging
 from reelio.ops import router as ops_router

@@ -25,12 +25,14 @@ from reelio.extraction.exceptions import (
 from reelio.extraction.router import get_pipeline
 from reelio.extraction.schemas import ExtractResponse
 from reelio.extraction.service import ExtractionPipeline, Pipeline
+from reelio.extraction.services.transcription.acquisition import (
+    WhisperResult,
+    _WhisperProviderFailure,
+)
 from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.services.transcription.service import (
     SourceMetadataService,
     TranscriptionService,
-    WhisperResult,
-    _WhisperProviderFailure,
 )
 from reelio.extraction.types import PipelineResult, ResultStatus
 from reelio.main import app
@@ -69,6 +71,19 @@ class _MetadataExtractor:
             "channel": "Router test channel",
             "duration": 42.2,
         }
+
+
+class _SocialMetadataExtractor:
+    def __init__(
+        self,
+        metadata: dict[str, object],
+    ) -> None:
+        self.metadata = metadata
+        self.calls: list[str] = []
+
+    def extract(self, canonical_url: str) -> dict[str, object]:
+        self.calls.append(canonical_url)
+        return self.metadata
 
 
 def _settings() -> TranscriptionConfig:
@@ -249,7 +264,6 @@ async def test_extract_returns_whisper_transcript(
         ),
     )
     _install_pipeline(app, pipeline)
-
     response = await client.post(
         "/api/extract",
         json={"url": _CANONICAL_URL},
@@ -260,6 +274,107 @@ async def test_extract_returns_whisper_transcript(
     assert payload.transcript.text == "Spoken audio text."
     assert payload.transcript.language == "en"
     assert payload.transcript.method == "whisper"
+
+
+@pytest.mark.parametrize(
+    (
+        "submitted_url",
+        "provider_url",
+        "canonical_url",
+        "extractor_key",
+        "video_id",
+        "platform",
+    ),
+    [
+        (
+            "https://www.instagram.com/reel/ABC123",
+            "https://www.instagram.com/reel/ABC123",
+            "https://www.instagram.com/reel/ABC123",
+            "Instagram",
+            "ABC123",
+            "instagram",
+        ),
+        (
+            "https://www.facebook.com/reel/123456789",
+            "https://www.facebook.com/reel/123456789",
+            "https://www.facebook.com/reel/123456789",
+            "FacebookReel",
+            "123456789",
+            "facebook",
+        ),
+        (
+            "https://www.tiktok.com/@creator/video/1234567890123456789",
+            "https://www.tiktok.com/@creator/video/1234567890123456789",
+            "https://www.tiktok.com/@creator/video/1234567890123456789",
+            "TikTok",
+            "1234567890123456789",
+            "tiktok",
+        ),
+        (
+            "https://twitter.com/creator/status/1234567890123456789",
+            "https://twitter.com/creator/status/1234567890123456789",
+            "https://twitter.com/creator/status/1234567890123456789",
+            "Twitter",
+            "1234567890123456789",
+            "x",
+        ),
+    ],
+)
+async def test_social_sources_serialize_unchanged_response_schema(
+    client: AsyncClient,
+    tmp_path: Path,
+    submitted_url: str,
+    provider_url: str,
+    canonical_url: str,
+    extractor_key: str,
+    video_id: str,
+    platform: str,
+) -> None:
+    """Serialize every social Source with a direct Whisper Transcript."""
+    extractor = _SocialMetadataExtractor(
+        {
+            "id": video_id,
+            "extractor_key": extractor_key,
+            "webpage_url": canonical_url,
+            "title": "Social router video",
+            "description": "Social router description",
+            "channel": "Social router channel",
+            "duration": 42.2,
+            "formats": [{"vcodec": "avc1"}],
+        }
+    )
+    pipeline = ExtractionPipeline(
+        SourceMetadataService(extractor=extractor, settings=_settings()),
+        TranscriptionService(
+            provider=_CaptionProvider([_CaptionTrack("en", ["must", "not", "run"])]),
+            audio_downloader=_AudioDownloader(),
+            transcriber=_FixedWhisperTranscriber(
+                WhisperResult(
+                    text="Social router speech.",
+                    language="en",
+                    segment_count=1,
+                )
+            ),
+            temp_media_dir=tmp_path,
+            semaphore=asyncio.Semaphore(1),
+        ),
+    )
+    _install_pipeline(app, pipeline)
+
+    response = await client.post("/api/extract", json={"url": submitted_url})
+
+    assert response.status_code == 200
+    payload = ExtractResponse.model_validate(response.json())
+    assert payload.source.platform == platform
+    assert payload.source.video_id == video_id
+    assert payload.source.url == canonical_url
+    assert payload.source.title == "Social router video"
+    assert payload.source.description == "Social router description"
+    assert payload.source.channel == "Social router channel"
+    assert payload.source.duration_seconds == 43
+    assert payload.transcript.method == "whisper"
+    assert payload.transcript.text == "Social router speech."
+    assert extractor.calls == [provider_url]
 
 
 async def test_concurrent_whisper_http_requests_queue_and_succeed(
@@ -415,3 +530,11 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "channel",
         "duration_seconds",
     } <= set(source_properties)
+    assert set(document["components"]["schemas"]["Platform"]["enum"]) == {
+        "youtube",
+        "instagram",
+        "facebook",
+        "tiktok",
+        "x",
+    }
+    assert "YouTube, Instagram, Facebook, TikTok, or X" in operation["description"]
