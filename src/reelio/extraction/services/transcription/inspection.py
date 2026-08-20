@@ -146,8 +146,7 @@ _COLLECTION_TYPES: Final[frozenset[str]] = frozenset(
 _METADATA_YTDLP_OPTIONS: Final[dict[str, object]] = {
     "quiet": True,
     "no_warnings": True,
-    "noplaylist": False,
-    "ignoreconfig": True,
+    "noplaylist": True,
 }
 
 

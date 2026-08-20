@@ -363,7 +363,6 @@ class YtDlpAudioDownloader:
         }
         try:
             with yt_dlp.YoutubeDL(options) as youtube_dl:
-                source.url = "https://www.tiktok.com/@filmlvrrr/video/7644683862672411934?is_from_webapp=1&sender_device=pc&web_id=7615327134046848533"
                 raw_info = youtube_dl.extract_info(source.url, download=True)
                 if not isinstance(raw_info, Mapping) or "entries" in raw_info:
                     _log_acquisition_error(
@@ -516,7 +515,7 @@ async def _finish_cancelled_worker(
             break
     try:
         worker.result()
-    except _WhisperProviderFailure, _WhisperProviderTimeout:
+    except (_WhisperProviderFailure, _WhisperProviderTimeout):
         return
     except Exception:
         logger.exception(
