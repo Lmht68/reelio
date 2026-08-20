@@ -53,7 +53,7 @@ def configure_logging(level: str) -> None:
             "formatters": {
                 "key_value": {
                     "()": "reelio.logging._KeyValueFormatter",
-                    "format": "%(levelname)s %(name)s %(message)s",
+                    "format": "%(levelname)s:   [%(name)s] %(message)s",
                 }
             },
             "handlers": {
@@ -71,6 +71,7 @@ def configure_logging(level: str) -> None:
                 },
                 "httpx": {"level": "WARNING"},
                 "yt_dlp": {"level": "WARNING"},
+                "faster_whisper": {"level": "WARNING"},
             },
             "root": {"handlers": ["stderr"], "level": "WARNING"},
         }
