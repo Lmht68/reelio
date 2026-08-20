@@ -12,6 +12,7 @@ import yt_dlp  # type: ignore[import-untyped]
 from requests.exceptions import Timeout
 from yt_dlp.utils import DownloadError, YoutubeDLError  # type: ignore[import-untyped]
 
+import reelio.extraction.services.transcription.inspection as transcription_inspection
 from reelio.extraction.exceptions import (
     DurationLimitExceededError,
     InvalidSourceError,
@@ -444,6 +445,82 @@ def test_yt_dlp_adapter_rejects_non_mapping_results(
         MetadataProviderError, match="Unable to retrieve source metadata"
     ):
         YtDlpMetadataExtractor().extract(_CANONICAL_URL)
+
+
+@pytest.mark.parametrize(
+    ("provider_metadata", "expected_reason"),
+    [
+        (_metadata(title=123), "invalid_title"),
+        (_metadata(duration=None), "invalid_duration_type"),
+        (
+            {key: value for key, value in _metadata().items() if key != "duration"},
+            "missing_duration",
+        ),
+    ],
+)
+async def test_metadata_provider_log_identifies_failure_reason(
+    provider_metadata: object,
+    expected_reason: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Log a stable reason while keeping the public provider error generic."""
+    extractor = _FakeExtractor(provider_metadata)
+
+    with (
+        caplog.at_level(
+            logging.WARNING,
+            logger=transcription_inspection.__name__,
+        ),
+        pytest.raises(MetadataProviderError),
+    ):
+        await _service(extractor).inspect(_CANONICAL_URL)
+
+    record = next(
+        item
+        for item in caplog.records
+        if item.getMessage() == "metadata provider error"
+    )
+    assert record.__dict__["stage"] == "transcription"
+    assert record.__dict__["reason"] == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("submitted_url", "error_type", "event", "expected_reason"),
+    [
+        (
+            "https://www.youtube.com/watch?v=short",
+            InvalidSourceError,
+            "invalid source error",
+            "invalid_video_id",
+        ),
+        (
+            "https://vimeo.com/123456789",
+            UnsupportedPlatformError,
+            "unsupported platform error",
+            "unsupported_host",
+        ),
+    ],
+)
+async def test_inspection_error_log_identifies_failure_reason(
+    submitted_url: str,
+    error_type: type[InvalidSourceError | UnsupportedPlatformError],
+    event: str,
+    expected_reason: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Log a stable reason for each public inspection error type."""
+    with (
+        caplog.at_level(
+            logging.WARNING,
+            logger=transcription_inspection.__name__,
+        ),
+        pytest.raises(error_type),
+    ):
+        await _service(_FakeExtractor(_metadata())).inspect(submitted_url)
+
+    record = next(item for item in caplog.records if item.getMessage() == event)
+    assert record.__dict__["stage"] == "transcription"
+    assert record.__dict__["reason"] == expected_reason
 
 
 async def test_debug_event_contains_normalized_source_fields(

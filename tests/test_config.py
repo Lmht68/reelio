@@ -97,6 +97,11 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert transcription_settings.whisper_model == "large-v3-turbo"
     assert transcription_settings.whisper_device == "cuda"
     assert transcription_settings.whisper_compute_type == "float16"
+    assert transcription_settings.whisper_beam_size == 1
+    assert transcription_settings.whisper_vad_filter is True
+    assert transcription_settings.whisper_temperature == 0.0
+    assert transcription_settings.whisper_cond_on_prev_txt is True
+    assert transcription_settings.whisper_initial_prompt == ""
     assert llm_settings.deepseek_model == "deepseek-v4-flash"
     assert llm_settings.openai_model == "gpt-4o-mini"
     assert llm_settings.max_transcript_chars == 100_000
@@ -113,6 +118,25 @@ def test_video_duration_environment_override(
     settings = _without_dotenv(TranscriptionConfig)
 
     assert settings.max_video_duration_seconds == 60
+
+
+def test_whisper_transcription_environment_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parse Whisper inference options from environment variables."""
+    monkeypatch.setenv("REELIO_WHISPER_BEAM_SIZE", "7")
+    monkeypatch.setenv("REELIO_WHISPER_VAD_FILTER", "false")
+    monkeypatch.setenv("REELIO_WHISPER_TEMPERATURE", "0.25")
+    monkeypatch.setenv("REELIO_WHISPER_COND_ON_PREV_TXT", "false")
+    monkeypatch.setenv("REELIO_WHISPER_INITIAL_PROMPT", "Use proper names.")
+
+    settings = _without_dotenv(TranscriptionConfig)
+
+    assert settings.whisper_beam_size == 7
+    assert settings.whisper_vad_filter is False
+    assert settings.whisper_temperature == 0.25
+    assert settings.whisper_cond_on_prev_txt is False
+    assert settings.whisper_initial_prompt == "Use proper names."
 
 
 def test_invalid_provider_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:

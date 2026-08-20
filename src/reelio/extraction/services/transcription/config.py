@@ -23,6 +23,11 @@ class TranscriptionConfig(BaseSettings):
     whisper_model: str = Field(default="large-v3-turbo", min_length=1)
     whisper_device: Literal["cuda", "cpu", "auto"] = "cuda"
     whisper_compute_type: str = Field(default="float16", min_length=1)
+    whisper_beam_size: int = Field(default=1, gt=0)
+    whisper_vad_filter: bool = Field(default=True)
+    whisper_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
+    whisper_cond_on_prev_txt: bool = Field(default=True)
+    whisper_initial_prompt: str = Field(default="")
 
 
 transcription_settings = TranscriptionConfig()

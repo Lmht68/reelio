@@ -29,7 +29,14 @@ _YTDLP_OPTIONS: Final[dict[str, object]] = {
     "quiet": True,
     "no_warnings": True,
     "noplaylist": True,
-    "ignoreconfig": True,
+    "format": "bestaudio/best",
+    "postprocessors": [
+        {
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }
+    ],
 }
 _AUDIO_OUTPUT_TEMPLATE: Final[str] = "audio.%(ext)s"
 _WHISPER_TEMP_PREFIX: Final[str] = "reelio-whisper-"
@@ -49,6 +56,17 @@ class _WhisperProviderFailure(Exception):
 
 class _WhisperProviderTimeout(Exception):
     """Represent a terminal timeout at the Whisper provider boundary."""
+
+
+def _log_acquisition_error(event: str, reason: str) -> None:
+    """Log a safe, structured reason for an acquisition failure."""
+    logger.debug(
+        event,
+        extra={
+            "stage": "transcription",
+            "reason": reason,
+        },
+    )
 
 
 _CAPTION_EXTERNAL_FAILURES: Final[tuple[type[BaseException], ...]] = (
@@ -199,8 +217,10 @@ class _YouTubeCaptionTrack:
             language_code = transcript.language_code
             is_generated = transcript.is_generated
         except (AttributeError, TypeError, ValueError) as exc:
+            _log_acquisition_error("caption provider error", "invalid_track_metadata")
             raise _CaptionProviderFailure from exc
         if not isinstance(language_code, str) or not isinstance(is_generated, bool):
+            _log_acquisition_error("caption provider error", "invalid_track_metadata")
             raise _CaptionProviderFailure
         self._transcript = transcript
         self._language_code = language_code
@@ -233,13 +253,19 @@ class _YouTubeCaptionTrack:
             )
             segments = tuple(snippet.text for snippet in fetched)
             if not all(isinstance(text, str) for text in segments):
+                _log_acquisition_error(
+                    "caption provider error",
+                    "invalid_segment_payload",
+                )
                 raise _CaptionProviderFailure
             return segments
         except (Timeout, TimeoutError) as exc:
+            _log_acquisition_error("caption provider timeout", "track_fetch_timeout")
             raise _CaptionProviderTimeout from exc
         except _CaptionProviderFailure:
             raise
         except _CAPTION_EXTERNAL_FAILURES as exc:
+            _log_acquisition_error("caption provider error", "track_fetch_failed")
             raise _CaptionProviderFailure from exc
 
 
@@ -269,13 +295,18 @@ class YouTubeCaptionProvider:
                 except _CaptionProviderFailure:
                     logger.debug(
                         "caption track unavailable",
-                        extra={"stage": "transcription"},
+                        extra={
+                            "stage": "transcription",
+                            "reason": "invalid_track_metadata",
+                        },
                     )
                     continue
             return tuple(wrapped_tracks)
         except (Timeout, TimeoutError) as exc:
+            _log_acquisition_error("caption provider timeout", "track_listing_timeout")
             raise _CaptionProviderTimeout from exc
         except _CAPTION_EXTERNAL_FAILURES as exc:
+            _log_acquisition_error("caption provider error", "track_listing_failed")
             raise _CaptionProviderFailure from exc
 
 
@@ -297,6 +328,12 @@ class _WhisperModel(Protocol):
     def transcribe(
         self,
         audio: str,
+        *,
+        beam_size: int,
+        vad_filter: bool,
+        temperature: float,
+        condition_on_previous_text: bool,
+        initial_prompt: str,
     ) -> tuple[Iterable[_WhisperSegment], _WhisperInfo]:
         """Return a lazy segment iterator and transcription metadata."""
         ...
@@ -322,30 +359,52 @@ class YtDlpAudioDownloader:
         request_directory = destination.resolve()
         options = {
             **_YTDLP_OPTIONS,
-            "format": "bestaudio/best",
             "outtmpl": str(request_directory / _AUDIO_OUTPUT_TEMPLATE),
         }
         try:
             with yt_dlp.YoutubeDL(options) as youtube_dl:
+                source.url = "https://www.tiktok.com/@filmlvrrr/video/7644683862672411934?is_from_webapp=1&sender_device=pc&web_id=7615327134046848533"
                 raw_info = youtube_dl.extract_info(source.url, download=True)
                 if not isinstance(raw_info, Mapping) or "entries" in raw_info:
+                    _log_acquisition_error(
+                        "whisper provider error", "invalid_download_result"
+                    )
                     raise _WhisperProviderFailure
                 prepared_path = youtube_dl.prepare_filename(raw_info)
         except _WhisperProviderFailure:
             raise
         except DownloadError as exc:
             if _is_timeout_exception(exc):
+                _log_acquisition_error(
+                    "whisper provider timeout",
+                    "audio_download_timeout",
+                )
                 raise _WhisperProviderTimeout from exc
+            _log_acquisition_error(
+                "whisper provider error", "audio_download_failed=DownloadError"
+            )
             raise _WhisperProviderFailure from exc
         except YoutubeDLError as exc:
+            _log_acquisition_error(
+                "whisper provider error", "audio_download_failed=YoutubeDLError"
+            )
             raise _WhisperProviderFailure from exc
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            _log_acquisition_error("whisper provider error", "invalid_download_result")
             raise _WhisperProviderFailure from exc
 
         if not isinstance(prepared_path, (str, Path)):
+            _log_acquisition_error("whisper provider error", "invalid_download_path")
             raise _WhisperProviderFailure
         completed_path = Path(prepared_path).resolve()
-        if completed_path.parent != request_directory or not completed_path.is_file():
+        if completed_path.parent != request_directory:
+            _log_acquisition_error(
+                "whisper provider error",
+                "audio_path_outside_request_directory",
+            )
+            raise _WhisperProviderFailure
+        if not completed_path.is_file():
+            _log_acquisition_error("whisper provider error", "audio_file_missing")
             raise _WhisperProviderFailure
         return completed_path
 
@@ -353,13 +412,15 @@ class YtDlpAudioDownloader:
 class FasterWhisperTranscriber:
     """Adapt one preloaded faster-whisper model to WhisperTranscriber."""
 
-    def __init__(self, model: object) -> None:
+    def __init__(self, model: object, settings: TranscriptionConfig) -> None:
         """Initialize the adapter around an already-loaded model.
 
         Args:
             model: Preloaded faster-whisper model instance.
+            settings: Environment-backed options for model inference.
         """
         self._model = model
+        self._settings = settings
 
     def transcribe(self, audio_path: Path) -> WhisperResult:
         """Transcribe and normalize one local audio file.
@@ -375,8 +436,14 @@ class FasterWhisperTranscriber:
         """
         segment_count = 0
         try:
+            settings = self._settings
             segments, info = cast(_WhisperModel, self._model).transcribe(
-                str(audio_path)
+                str(audio_path),
+                beam_size=settings.whisper_beam_size,
+                vad_filter=settings.whisper_vad_filter,
+                temperature=settings.whisper_temperature,
+                condition_on_previous_text=settings.whisper_cond_on_prev_txt,
+                initial_prompt=settings.whisper_initial_prompt,
             )
 
             def segment_texts() -> Iterator[str]:
@@ -385,14 +452,20 @@ class FasterWhisperTranscriber:
                     segment_count += 1
                     text = segment.text
                     if not isinstance(text, str):
+                        logger.debug(
+                            "invalid segment text type",
+                            extra={"stage": "transcription"},
+                        )
                         raise TypeError
                     yield text
 
             text = _normalize_segments(segment_texts())
             language = info.language
             if not isinstance(language, str) or not language.strip() or not text:
+                logger.debug("invalid language type", extra={"stage": "transcription"})
                 raise ValueError
         except _WHISPER_EXTERNAL_FAILURES as exc:
+            _log_acquisition_error("whisper provider error", "transcription_failed")
             raise _WhisperProviderFailure from exc
 
         return WhisperResult(
@@ -418,6 +491,7 @@ def load_whisper_transcriber(
         Exception: If faster-whisper cannot load or download the model.
     """
     if settings.whisper_device == "cuda" and ctranslate2.get_cuda_device_count() == 0:
+        _log_acquisition_error("whisper provider error", "cuda_device_unavailable")
         raise RuntimeError(
             "REELIO_WHISPER_DEVICE is 'cuda', but no CUDA device is available."
         )
@@ -426,7 +500,7 @@ def load_whisper_transcriber(
         device=settings.whisper_device,
         compute_type=settings.whisper_compute_type,
     )
-    return FasterWhisperTranscriber(model)
+    return FasterWhisperTranscriber(model, settings)
 
 
 async def _finish_cancelled_worker(
@@ -445,14 +519,28 @@ async def _finish_cancelled_worker(
     except _WhisperProviderFailure, _WhisperProviderTimeout:
         return
     except Exception:
-        logger.exception("Whisper worker failed after request cancellation")
+        logger.exception(
+            "Whisper worker failed after request cancellation",
+            extra={
+                "stage": "transcription",
+                "reason": "unexpected_worker_failure",
+            },
+        )
 
 
 def _validate_audio_path(audio_path: Path, request_directory: Path) -> Path:
     if not isinstance(audio_path, Path):
+        _log_acquisition_error("whisper provider error", "invalid_audio_path_type")
         raise _WhisperProviderFailure
     resolved_path = audio_path.resolve()
-    if resolved_path.parent != request_directory or not resolved_path.is_file():
+    if resolved_path.parent != request_directory:
+        _log_acquisition_error(
+            "whisper provider error",
+            "audio_path_outside_request_directory",
+        )
+        raise _WhisperProviderFailure
+    if not resolved_path.is_file():
+        _log_acquisition_error("whisper provider error", "audio_file_missing")
         raise _WhisperProviderFailure
     return resolved_path
 
@@ -484,7 +572,7 @@ def _normalize_segments(segments: Iterable[str]) -> str:
     return " ".join(tokens)
 
 
-def _acquire_transcript(
+def acquire_transcript(
     provider: CaptionProvider,
     video_id: str,
 ) -> Transcript | None:
@@ -496,8 +584,10 @@ def _acquire_transcript(
     except _CaptionProviderFailure:
         raise
     except (Timeout, TimeoutError) as exc:
+        _log_acquisition_error("caption provider timeout", "track_listing_timeout")
         raise _CaptionProviderTimeout from exc
     except _CAPTION_EXTERNAL_FAILURES as exc:
+        _log_acquisition_error("caption provider error", "track_listing_failed")
         raise _CaptionProviderFailure from exc
 
     for track in ranked_tracks:
@@ -513,11 +603,15 @@ def _acquire_transcript(
         except _CaptionProviderTimeout:
             raise
         except (Timeout, TimeoutError) as exc:
+            _log_acquisition_error("caption provider timeout", "track_fetch_timeout")
             raise _CaptionProviderTimeout from exc
         except _CAPTION_EXTERNAL_FAILURES:
             logger.debug(
                 "caption track unavailable",
-                extra={"stage": "transcription"},
+                extra={
+                    "stage": "transcription",
+                    "reason": "track_fetch_failed",
+                },
             )
             continue
 
@@ -604,6 +698,7 @@ def _acquire_whisper_sync(
         except _WhisperProviderFailure:
             raise
         except (Timeout, TimeoutError) as exc:
+            _log_acquisition_error("whisper provider timeout", "audio_download_timeout")
             raise _WhisperProviderTimeout from exc
 
         audio_path = _validate_audio_path(downloaded_path, request_directory)
@@ -615,6 +710,7 @@ def _acquire_whisper_sync(
         except _WhisperProviderFailure:
             raise
         except (Timeout, TimeoutError) as exc:
+            _log_acquisition_error("whisper provider timeout", "transcription_timeout")
             raise _WhisperProviderTimeout from exc
 
         if (
@@ -624,9 +720,17 @@ def _acquire_whisper_sync(
             or not result.language.strip()
             or result.segment_count <= 0
         ):
+            _log_acquisition_error(
+                "whisper provider error",
+                "invalid_transcription_result",
+            )
             raise _WhisperProviderFailure
         transcript_text = _normalize_segments((result.text,))
         if not transcript_text:
+            _log_acquisition_error(
+                "whisper provider error",
+                "empty_transcription_result",
+            )
             raise _WhisperProviderFailure
 
         method = TranscriptMethod.WHISPER

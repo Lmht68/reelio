@@ -5,7 +5,7 @@ import logging
 import tempfile
 import threading
 import xml.etree.ElementTree as ElementTree
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import ClassVar, cast
@@ -28,11 +28,18 @@ from reelio.extraction.services.transcription.acquisition import (
     _WhisperProviderFailure,
     _WhisperProviderTimeout,
 )
+from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.services.transcription.service import TranscriptionService
 from reelio.extraction.types import Platform, Source, Transcript, TranscriptMethod
 
 _VIDEO_ID = "dQw4w9WgXcQ"
 _CANONICAL_URL = f"https://www.youtube.com/watch?v={_VIDEO_ID}"
+
+
+def _transcription_settings(**values: object) -> TranscriptionConfig:
+    """Build transcription settings without loading the repository dotenv file."""
+    settings_type = cast(Callable[..., TranscriptionConfig], TranscriptionConfig)
+    return settings_type(_env_file=None, **values)
 
 
 class _FakeCaptionTrack:
@@ -376,9 +383,53 @@ async def test_failed_and_empty_tracks_do_not_log_success(
     assert not any(
         item.getMessage() == "transcript acquired" for item in caplog.records
     )
-    assert any(
-        item.getMessage() == "caption track unavailable" for item in caplog.records
+    unavailable_record = next(
+        item
+        for item in caplog.records
+        if item.getMessage() == "caption track unavailable"
     )
+    assert unavailable_record.__dict__["reason"] == "track_fetch_failed"
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "expected_event", "expected_reason"),
+    [
+        (
+            ValueError("provider detail"),
+            "caption provider error",
+            "track_listing_failed",
+        ),
+        (
+            Timeout("sensitive provider timeout detail"),
+            "caption provider timeout",
+            "track_listing_timeout",
+        ),
+    ],
+)
+async def test_caption_provider_log_identifies_failure_reason(
+    provider_error: Exception,
+    expected_event: str,
+    expected_reason: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Log a stable reason while keeping provider details out of the event."""
+    with (
+        caplog.at_level(
+            logging.WARNING,
+            logger=acquisition_service.__name__,
+        ),
+        pytest.raises(TranscriptionError),
+    ):
+        await _transcription_service(
+            _FakeCaptionProvider([], error=provider_error)
+        ).acquire(_source())
+
+    record = next(
+        item for item in caplog.records if item.getMessage() == expected_event
+    )
+    assert record.__dict__["stage"] == "transcription"
+    assert record.__dict__["reason"] == expected_reason
+    assert str(provider_error) not in str(record.__dict__)
 
 
 class _LibrarySnippet:
@@ -720,15 +771,22 @@ async def test_caption_timeout_then_whisper_timeout_maps_to_504(
 async def test_empty_whisper_output_maps_to_transcription_error(
     tmp_path: Path,
     text: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Reject empty or whitespace-only Whisper output."""
     transcriber = _FakeWhisperTranscriber(
         WhisperResult(text=text, language="en", segment_count=1)
     )
 
-    with pytest.raises(
-        TranscriptionError,
-        match=r"^Transcript is unavailable for this video\.$",
+    with (
+        caplog.at_level(
+            logging.WARNING,
+            logger=acquisition_service.__name__,
+        ),
+        pytest.raises(
+            TranscriptionError,
+            match=r"^Transcript is unavailable for this video\.$",
+        ),
     ):
         await _transcription_service(
             _FakeCaptionProvider([]),
@@ -736,6 +794,12 @@ async def test_empty_whisper_output_maps_to_transcription_error(
             transcriber=transcriber,
             temp_media_dir=tmp_path,
         ).acquire(_source())
+
+    record = next(
+        item for item in caplog.records if item.getMessage() == "whisper provider error"
+    )
+    assert record.__dict__["stage"] == "transcription"
+    assert record.__dict__["reason"] == "empty_transcription_result"
 
 
 async def test_zero_segment_whisper_output_maps_to_transcription_error(
@@ -825,12 +889,27 @@ class _FakeWhisperModel:
         self._language = language
         self.transcribe_calls = 0
         self.yielded_segments = 0
+        self.transcribe_options: dict[str, object] = {}
 
     def transcribe(
         self,
         audio: str,
+        *,
+        beam_size: int,
+        vad_filter: bool,
+        temperature: float,
+        condition_on_previous_text: bool,
+        initial_prompt: str,
     ) -> tuple[Iterator[object], SimpleNamespace]:
         self.transcribe_calls += 1
+        self.transcribe_options = {
+            "audio": audio,
+            "beam_size": beam_size,
+            "vad_filter": vad_filter,
+            "temperature": temperature,
+            "condition_on_previous_text": condition_on_previous_text,
+            "initial_prompt": initial_prompt,
+        }
 
         def segments() -> Iterator[object]:
             for text in self._texts:
@@ -840,14 +919,18 @@ class _FakeWhisperModel:
         return segments(), SimpleNamespace(language=self._language)
 
 
-async def test_faster_whisper_adapter_exhausts_segments_once() -> None:
-    """Consume the lazy faster-whisper segment iterator exactly once."""
-    model = _FakeWhisperModel(
-        ["  Hello\tworld  ", "\nÇa va? déjà."],
-        "fr",
+async def test_faster_whisper_adapter_forwards_transcription_settings() -> None:
+    """Forward environment-backed options to faster-whisper inference."""
+    model = _FakeWhisperModel(["  Hello\tworld  ", "\nÇa va? déjà."], "fr")
+    settings = _transcription_settings(
+        whisper_beam_size=7,
+        whisper_vad_filter=False,
+        whisper_temperature=0.25,
+        whisper_cond_on_prev_txt=False,
+        whisper_initial_prompt="Use proper names.",
     )
 
-    result = FasterWhisperTranscriber(model).transcribe(Path("audio.webm"))
+    result = FasterWhisperTranscriber(model, settings).transcribe(Path("audio.webm"))
 
     assert result == WhisperResult(
         text="Hello world Ça va? déjà.",
@@ -856,6 +939,14 @@ async def test_faster_whisper_adapter_exhausts_segments_once() -> None:
     )
     assert model.transcribe_calls == 1
     assert model.yielded_segments == 2
+    assert model.transcribe_options == {
+        "audio": "audio.webm",
+        "beam_size": 7,
+        "vad_filter": False,
+        "temperature": 0.25,
+        "condition_on_previous_text": False,
+        "initial_prompt": "Use proper names.",
+    }
 
 
 @pytest.mark.parametrize(
@@ -877,7 +968,10 @@ async def test_malformed_whisper_output_maps_to_transcription_error(
         await _transcription_service(
             _FakeCaptionProvider([]),
             audio_downloader=_FakeAudioDownloader(),
-            transcriber=FasterWhisperTranscriber(model),
+            transcriber=FasterWhisperTranscriber(
+                model,
+                _transcription_settings(),
+            ),
             temp_media_dir=tmp_path,
         ).acquire(_source())
 

@@ -176,7 +176,7 @@ class TranscriptionService:
         if source.platform is Platform.YOUTUBE:
             try:
                 transcript = await asyncio.to_thread(
-                    acquisition._acquire_transcript,
+                    acquisition.acquire_transcript,
                     self._provider,
                     source.video_id,
                 )

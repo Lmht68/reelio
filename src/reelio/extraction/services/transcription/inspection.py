@@ -151,6 +151,35 @@ _METADATA_YTDLP_OPTIONS: Final[dict[str, object]] = {
 }
 
 
+def _log_inspection_error(event: str, reason: str) -> None:
+    """Log a safe, structured reason for an inspection failure."""
+    logger.debug(
+        event,
+        extra={
+            "stage": "transcription",
+            "reason": reason,
+        },
+    )
+
+
+def _metadata_provider_error(reason: str) -> MetadataProviderError:
+    """Log a safe reason before returning the stable provider error."""
+    _log_inspection_error("metadata provider error", reason)
+    return MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+
+
+def _invalid_source_error(reason: str) -> InvalidSourceError:
+    """Log a safe reason before returning the stable invalid-source error."""
+    _log_inspection_error("invalid source error", reason)
+    return InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+
+
+def _unsupported_platform_error(reason: str) -> UnsupportedPlatformError:
+    """Log a safe reason before returning the stable platform error."""
+    _log_inspection_error("unsupported platform error", reason)
+    return UnsupportedPlatformError(_UNSUPPORTED_PLATFORM_MESSAGE)
+
+
 class MetadataExtractor(Protocol):
     """Retrieve raw metadata for one validated provider URL."""
 
@@ -185,7 +214,7 @@ class YtDlpMetadataExtractor:
             raw_metadata = youtube_dl.extract_info(canonical_url, download=False)
 
         if not isinstance(raw_metadata, Mapping):
-            raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+            raise _metadata_provider_error("non_mapping_result")
         return cast(Mapping[str, object], raw_metadata)
 
 
@@ -226,8 +255,8 @@ def classify_submitted_url(submitted_url: str) -> SubmittedSource:
     parsed_url, host, query_pairs = _parse_url(submitted_url)
     if host not in _SUPPORTED_HOSTS:
         if _looks_like_supported_host_trick(host):
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
-        raise UnsupportedPlatformError(_UNSUPPORTED_PLATFORM_MESSAGE)
+            raise _invalid_source_error("deceptive_supported_host")
+        raise _unsupported_platform_error("unsupported_host")
     path_segments = _path_segments(parsed_url.path)
     if host in _YOUTUBE_HOSTS:
         video_id = _youtube_video_id(host, path_segments, query_pairs)
@@ -257,8 +286,8 @@ def classify_submitted_url(submitted_url: str) -> SubmittedSource:
         return SubmittedSource(Platform.X, _minimal_url(parsed_url))
 
     if _looks_like_supported_host_trick(host):
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
-    raise UnsupportedPlatformError(_UNSUPPORTED_PLATFORM_MESSAGE)
+        raise _invalid_source_error("deceptive_supported_host")
+    raise _unsupported_platform_error("unsupported_host")
 
 
 def normalize_processed_metadata(
@@ -279,25 +308,27 @@ def normalize_processed_metadata(
         MetadataProviderError: If the provider result is malformed.
     """
     if not isinstance(metadata, Mapping):
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+        raise _metadata_provider_error("non_mapping_metadata")
     _reject_collections_and_live(metadata, submitted.platform)
 
     if submitted.platform is Platform.YOUTUBE:
         video_id = submitted.youtube_video_id
         if video_id is None:
-            raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+            raise _metadata_provider_error("missing_submitted_video_id")
         provider_id = metadata.get("id", _MISSING)
         if provider_id is not _MISSING and provider_id != video_id:
-            raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+            raise _metadata_provider_error("provider_video_id_mismatch")
         canonical_url = f"https://www.youtube.com/watch?v={video_id}"
         expected_extractor_keys: frozenset[str] | None = None
     else:
         expected_extractor_keys = _EXPECTED_EXTRACTOR_KEYS[submitted.platform]
         extractor_key = metadata.get("extractor_key", _MISSING)
+        if extractor_key is _MISSING:
+            raise _metadata_provider_error("missing_extractor_key")
         if not isinstance(extractor_key, str) or not extractor_key.strip():
-            raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+            raise _metadata_provider_error("invalid_extractor_key")
         if extractor_key not in expected_extractor_keys:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("unexpected_extractor")
         video_id = _social_video_id(metadata)
         canonical_url = _canonical_social_url(metadata, submitted.platform)
         _validate_social_formats(metadata)
@@ -337,9 +368,9 @@ def _parse_url(
     submitted_url: str,
 ) -> tuple[SplitResult, str, list[tuple[str, str]]]:
     if not submitted_url or _contains_control_character(submitted_url):
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("empty_or_control_character_url")
     if _contains_malformed_percent_encoding(submitted_url):
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("malformed_percent_encoding")
 
     try:
         parsed_url = urlsplit(submitted_url)
@@ -348,31 +379,31 @@ def _parse_url(
         password = parsed_url.password
         port = parsed_url.port
     except ValueError as exc:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE) from exc
+        raise _invalid_source_error("malformed_url") from exc
 
     if parsed_url.scheme.casefold() != "https" or hostname is None:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("non_https_or_missing_host")
     if username is not None or password is not None:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("url_credentials")
     if port is not None or _authority_has_port(parsed_url.netloc):
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("url_port")
     if "\\" in parsed_url.netloc or not parsed_url.netloc:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("invalid_url_authority")
 
     try:
         query_pairs = parse_qsl(parsed_url.query, keep_blank_values=True)
     except ValueError as exc:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE) from exc
+        raise _invalid_source_error("malformed_query") from exc
 
     host = hostname.casefold()
     if "%" in parsed_url.path:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("encoded_path")
     return parsed_url, host, query_pairs
 
 
 def _reject_video_query(query_pairs: list[tuple[str, str]]) -> None:
     if any(key.casefold() == "v" for key, _ in query_pairs):
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("video_query_not_supported")
 
 
 def _minimal_url(parsed_url: SplitResult) -> str:
@@ -391,19 +422,19 @@ def _minimal_query(query: str) -> str:
     pairs = parse_qsl(query, keep_blank_values=True)
     identity_pairs = [(key, value) for key, value in pairs if key.casefold() == "v"]
     if len(identity_pairs) > 1:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("duplicate_video_query_parameter")
     return f"v={identity_pairs[0][1]}" if identity_pairs else ""
 
 
 def _path_segments(path: str) -> list[str]:
     if not path or not path.startswith("/"):
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("missing_path")
     normalized_path = path[:-1] if path.endswith("/") else path
     if not normalized_path or normalized_path == "/":
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("empty_path")
     segments = normalized_path[1:].split("/")
     if any(not segment for segment in segments):
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("empty_path_segment")
     return segments
 
 
@@ -414,29 +445,29 @@ def _youtube_video_id(
 ) -> str:
     video_query_values = [value for key, value in query_pairs if key == "v"]
     if len(video_query_values) > 1:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("duplicate_video_query_parameter")
 
     if host == "youtu.be":
         if len(path_segments) != 1:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_short_video_path")
         video_id = path_segments[0]
         if video_query_values and video_query_values[0] not in {"", video_id}:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("conflicting_video_query")
     elif path_segments[0] == "watch":
         if len(path_segments) != 1 or len(video_query_values) != 1:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_watch_path")
         video_id = video_query_values[0]
     elif path_segments[0] in _YOUTUBE_PATH_FORMS:
         if len(path_segments) != 2:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_video_path")
         video_id = path_segments[1]
         if video_query_values and video_query_values[0] not in {"", video_id}:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("conflicting_video_query")
     else:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("unsupported_video_path")
 
     if _VIDEO_ID_PATTERN.fullmatch(video_id) is None:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("invalid_video_id")
     return video_id
 
 
@@ -447,10 +478,10 @@ def _instagram_shortcode(path_segments: list[str]) -> str:
         "reel",
         "reels",
     }:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("invalid_instagram_path")
     shortcode = path_segments[1]
     if _SAFE_SEGMENT_PATTERN.fullmatch(shortcode) is None:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("invalid_instagram_shortcode")
     return shortcode
 
 
@@ -461,55 +492,59 @@ def _facebook_identity(
 ) -> str:
     query_values = [value for key, value in query_pairs if key.casefold() == "v"]
     if len(query_values) > 1:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("duplicate_facebook_query_parameter")
 
     if host in _FACEBOOK_SHORT_HOSTS:
         if len(path_segments) != 1 or query_values:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_facebook_short_path")
         return _safe_segment(path_segments[0])
 
     path = tuple(path_segments)
     if path == ("watch",):
         if len(query_values) != 1:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("missing_facebook_watch_id")
         return _facebook_id(query_values[0])
     if path == ("video.php",) or path == ("video", "video.php"):
         if len(query_values) != 1:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("missing_facebook_video_id")
         return _facebook_id(query_values[0])
     if len(path) == 2 and path[0] == "reel":
         if query_values:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("facebook_reel_query")
         return _facebook_id(path[1])
+    if len(path) == 3 and path[0] == "share":
+        if query_values:
+            raise _invalid_source_error("facebook_share_query")
+        return path[2]  # share ID, not facebook ID
     if len(path) in {3, 4} and path[1] in {"videos", "posts"}:
         if path[1] == "posts" and len(path) != 3:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_facebook_posts_path")
         if query_values:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("facebook_query_not_supported")
         if _FACEBOOK_OWNER_PATTERN.fullmatch(path[0]) is None:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_facebook_owner")
         if len(path) == 4 and _SAFE_SEGMENT_PATTERN.fullmatch(path[2]) is None:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_facebook_path_segment")
         return _facebook_id(path[-1])
-    raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+    raise _invalid_source_error("unsupported_facebook_path")
 
 
 def _facebook_id(value: str) -> str:
     if _FACEBOOK_ID_PATTERN.fullmatch(value) is None:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("invalid_facebook_id")
     return value
 
 
 def _tiktok_identity(host: str, path_segments: list[str]) -> str:
     if host in _TIKTOK_SHORT_HOSTS:
         if len(path_segments) != 1:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_tiktok_short_path")
         return _safe_segment(path_segments[0])
     if path_segments[0] == "t" and len(path_segments) == 2:
         return _safe_segment(path_segments[1])
     if path_segments[0] == "embed" and len(path_segments) == 2:
         if _TIKTOK_ID_PATTERN.fullmatch(path_segments[1]) is None:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_tiktok_embed_id")
         return path_segments[1]
     if (
         len(path_segments) == 3
@@ -519,47 +554,47 @@ def _tiktok_identity(host: str, path_segments: list[str]) -> str:
         user = path_segments[0][1:]
         video_id = path_segments[2]
         if _TIKTOK_USER_PATTERN.fullmatch(user) is None:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_tiktok_user")
         if _TIKTOK_ID_PATTERN.fullmatch(video_id) is None:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_tiktok_video_id")
         return video_id
-    raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+    raise _invalid_source_error("unsupported_tiktok_path")
 
 
 def _x_identity(host: str, path_segments: list[str]) -> str:
     if host in _X_SHORT_HOSTS:
         if len(path_segments) != 1:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_x_short_path")
         return _safe_segment(path_segments[0])
 
     base_segments = path_segments
     if len(path_segments) >= 2 and path_segments[-2] == "video":
         if len(path_segments) < 3 or not path_segments[-1].isdigit():
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_x_video_path")
         if int(path_segments[-1]) <= 0:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_x_video_id")
         base_segments = path_segments[:-2]
 
     if len(base_segments) == 3 and base_segments[1] == "status":
         if _X_USER_PATTERN.fullmatch(base_segments[0]) is None:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("invalid_x_user")
         return _x_status_id(base_segments[2])
     if len(base_segments) == 4 and base_segments[:3] == ["i", "web", "status"]:
         return _x_status_id(base_segments[3])
     if len(base_segments) == 2 and base_segments[0] == "statuses":
         return _x_status_id(base_segments[1])
-    raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+    raise _invalid_source_error("unsupported_x_path")
 
 
 def _x_status_id(value: str) -> str:
     if _X_STATUS_PATTERN.fullmatch(value) is None:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("invalid_x_status_id")
     return value
 
 
 def _safe_segment(value: str) -> str:
     if _SAFE_SEGMENT_PATTERN.fullmatch(value) is None:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("invalid_safe_segment")
     return value
 
 
@@ -568,58 +603,62 @@ def _reject_collections_and_live(
     platform: Platform,
 ) -> None:
     if "entries" in metadata:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("collection_entries")
 
     content_type = metadata.get("_type")
     if content_type is not None:
         if not isinstance(content_type, str):
-            raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+            raise _metadata_provider_error("invalid_content_type")
         if content_type in _COLLECTION_TYPES:
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("collection_type")
 
     if platform is Platform.YOUTUBE:
         return
 
     is_live = metadata.get("is_live", _MISSING)
     if is_live is not _MISSING and not isinstance(is_live, bool):
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+        raise _metadata_provider_error("invalid_is_live")
     if is_live is True:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("live_video")
 
     is_upcoming = metadata.get("is_upcoming", _MISSING)
     if is_upcoming is not _MISSING and not isinstance(is_upcoming, bool):
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+        raise _metadata_provider_error("invalid_is_upcoming")
     if is_upcoming is True:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("upcoming_video")
 
     live_status = metadata.get("live_status", _MISSING)
     if live_status is not _MISSING:
         if not isinstance(live_status, str):
-            raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+            raise _metadata_provider_error("invalid_live_status")
         if live_status != "not_live":
-            raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _invalid_source_error("unsupported_live_status")
 
 
 def _social_video_id(metadata: Mapping[str, object]) -> str:
     video_id = metadata.get("id", _MISSING)
+    if video_id is _MISSING:
+        raise _metadata_provider_error("missing_video_id")
     if (
         not isinstance(video_id, str)
         or not video_id
         or _contains_control_character(video_id)
     ):
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+        raise _metadata_provider_error("invalid_video_id")
     return video_id
 
 
 def _canonical_social_url(metadata: Mapping[str, object], platform: Platform) -> str:
     webpage_url = metadata.get("webpage_url", _MISSING)
+    if webpage_url is _MISSING:
+        raise _metadata_provider_error("missing_webpage_url")
     if (
         not isinstance(webpage_url, str)
         or not webpage_url
         or _contains_control_character(webpage_url)
         or _contains_malformed_percent_encoding(webpage_url)
     ):
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+        raise _metadata_provider_error("invalid_webpage_url")
 
     try:
         parsed_url = urlsplit(webpage_url)
@@ -628,7 +667,7 @@ def _canonical_social_url(metadata: Mapping[str, object], platform: Platform) ->
         password = parsed_url.password
         port = parsed_url.port
     except ValueError as exc:
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE) from exc
+        raise _metadata_provider_error("malformed_webpage_url") from exc
     if (
         parsed_url.scheme.casefold() != "https"
         or hostname is None
@@ -639,7 +678,7 @@ def _canonical_social_url(metadata: Mapping[str, object], platform: Platform) ->
         or "\\" in parsed_url.netloc
         or "%" in parsed_url.path
     ):
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+        raise _metadata_provider_error("unsafe_webpage_url")
 
     host = hostname.casefold()
     expected_hosts = _platform_hosts(platform)
@@ -650,17 +689,17 @@ def _canonical_social_url(metadata: Mapping[str, object], platform: Platform) ->
             or (platform is Platform.X and host in _X_SHORT_HOSTS)
         )
         if is_expected_short_host:
-            raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+            raise _metadata_provider_error("unexpected_short_webpage_url")
+
     if host not in _SUPPORTED_HOSTS:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("redirected_to_unsupported_host")
     if host not in expected_hosts:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("cross_platform_redirect")
 
     try:
         classify_submitted_url(webpage_url)
     except UnsupportedPlatformError as exc:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE) from exc
+        raise _invalid_source_error("cross_platform_redirect") from exc
     except InvalidSourceError:
         raise
     return urlunsplit(
@@ -688,12 +727,12 @@ def _normalize_title(metadata: Mapping[str, object], platform: Platform) -> str:
     title = metadata.get("title", _MISSING)
     if title is _MISSING or title is None:
         if platform is Platform.YOUTUBE:
-            raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+            raise _metadata_provider_error("missing_youtube_title")
         return ""
     if not isinstance(title, str):
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+        raise _metadata_provider_error("invalid_title")
     if not title.strip() and platform is Platform.YOUTUBE:
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+        raise _metadata_provider_error("empty_youtube_title")
     return title if title.strip() else ""
 
 
@@ -702,46 +741,50 @@ def _optional_text(metadata: Mapping[str, object], key: str) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+        raise _metadata_provider_error(f"invalid_optional_metadata={key}")
     return value
 
 
 def _normalize_duration(metadata: Mapping[str, object]) -> int:
     duration_value = metadata.get("duration", _MISSING)
+    if duration_value is _MISSING:
+        raise _metadata_provider_error("missing_duration")
     if isinstance(duration_value, bool) or not isinstance(
         duration_value, (Real, Decimal)
     ):
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+        raise _metadata_provider_error("invalid_duration_type")
     try:
-        if duration_value < 0 or not isfinite(duration_value):
-            raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+        if duration_value < 0:
+            raise _metadata_provider_error("negative_duration")
+        if not isfinite(duration_value):
+            raise _metadata_provider_error("non_finite_duration")
         return cast(int, ceil(duration_value))
     except (InvalidOperation, OverflowError, TypeError, ValueError) as exc:
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE) from exc
+        raise _metadata_provider_error("duration_normalization_failed") from exc
 
 
 def _validate_social_formats(metadata: Mapping[str, object]) -> None:
     formats = metadata.get("formats", _MISSING)
-    if (
-        formats is _MISSING
-        or not isinstance(formats, Sequence)
-        or isinstance(formats, (str, bytes, bytearray))
+    if formats is _MISSING:
+        raise _metadata_provider_error("missing_formats")
+    if not isinstance(formats, Sequence) or isinstance(
+        formats, (str, bytes, bytearray)
     ):
-        raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+        raise _metadata_provider_error("invalid_formats")
     if not formats:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("empty_formats")
 
     has_video = False
     for item in formats:
         if not isinstance(item, Mapping):
-            raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+            raise _metadata_provider_error("invalid_format_item")
         video_codec = item.get("vcodec")
         if video_codec is not None and not isinstance(video_codec, str):
-            raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE)
+            raise _metadata_provider_error("invalid_video_codec")
         if video_codec and video_codec.casefold() != "none":
             has_video = True
     if not has_video:
-        raise InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+        raise _invalid_source_error("no_video_format")
 
 
 def _looks_like_supported_host_trick(host: str) -> bool:
