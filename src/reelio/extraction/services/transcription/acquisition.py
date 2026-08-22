@@ -30,13 +30,13 @@ _YTDLP_OPTIONS: Final[dict[str, object]] = {
     "no_warnings": True,
     "noplaylist": True,
     "format": "bestaudio/best",
-    "postprocessors": [
-        {
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }
-    ],
+    # "postprocessors": [
+    #     {
+    #         "key": "FFmpegExtractAudio",
+    #         "preferredcodec": "mp3",
+    #         "preferredquality": "192",
+    #     }
+    # ],
 }
 _AUDIO_OUTPUT_TEMPLATE: Final[str] = "audio.%(ext)s"
 _WHISPER_TEMP_PREFIX: Final[str] = "reelio-whisper-"
