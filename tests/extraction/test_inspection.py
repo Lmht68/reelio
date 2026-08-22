@@ -403,6 +403,19 @@ class _FakeYoutubeDL:
         return self.result
 
 
+class _RetryingFakeYoutubeDL(_FakeYoutubeDL):
+    def __init__(self, outcomes: list[object]) -> None:
+        super().__init__({}, outcomes[-1])
+        self._outcomes = iter(outcomes)
+
+    def extract_info(self, canonical_url: str, *, download: bool) -> object:
+        self.extract_calls.append((canonical_url, download))
+        outcome = next(self._outcomes)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
 def _patch_youtube_dl(
     monkeypatch: pytest.MonkeyPatch,
     fake_youtube_dl: _FakeYoutubeDL,
@@ -434,6 +447,21 @@ def test_yt_dlp_adapter_uses_metadata_only_options(
     assert fake_youtube_dl.media_download_calls == 0
 
 
+def test_yt_dlp_adapter_retries_only_metadata_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry transient yt-dlp retrieval failures without repeating validation."""
+    fake_youtube_dl = _RetryingFakeYoutubeDL(
+        [YoutubeDLError("transient failure")] * 4 + [_metadata()]
+    )
+    _patch_youtube_dl(monkeypatch, fake_youtube_dl)
+
+    metadata = YtDlpMetadataExtractor().extract(_CANONICAL_URL)
+
+    assert metadata["title"] == "Example video"
+    assert fake_youtube_dl.extract_calls == [(_CANONICAL_URL, False)] * 5
+
+
 def test_yt_dlp_adapter_rejects_non_mapping_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -443,6 +471,7 @@ def test_yt_dlp_adapter_rejects_non_mapping_results(
 
     with pytest.raises(MetadataProviderError, match="Unable to retrieve source metadata"):
         YtDlpMetadataExtractor().extract(_CANONICAL_URL)
+    assert fake_youtube_dl.extract_calls == [(_CANONICAL_URL, False)]
 
 
 @pytest.mark.parametrize(

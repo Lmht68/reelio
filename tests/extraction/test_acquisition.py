@@ -1027,6 +1027,25 @@ class _FakeDownloadYoutubeDL:
         return self.prepared_path
 
 
+class _RetryingFakeDownloadYoutubeDL(_FakeDownloadYoutubeDL):
+    def __init__(self, outcomes: list[object], prepared_path: str) -> None:
+        super().__init__({}, outcomes[-1], prepared_path)
+        self._outcomes = iter(outcomes)
+        self.prepare_filename_calls = 0
+
+    def extract_info(self, canonical_url: str, *, download: bool) -> object:
+        self.extract_calls.append((canonical_url, download))
+        outcome = next(self._outcomes)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        Path(self.prepared_path).write_bytes(b"audio")
+        return outcome
+
+    def prepare_filename(self, info: Mapping[str, object]) -> str:
+        self.prepare_filename_calls += 1
+        return super().prepare_filename(info)
+
+
 def test_yt_dlp_audio_adapter_requests_native_audio_and_validates_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1050,6 +1069,26 @@ def test_yt_dlp_audio_adapter_requests_native_audio_and_validates_path(
     assert fake.options["format"] == "bestaudio/best"  # type: ignore[index]
     assert "postprocessors" not in fake.options  # type: ignore[operator]
     assert str(request_directory) in fake.options["outtmpl"]  # type: ignore[index]
+
+
+def test_yt_dlp_audio_adapter_retries_only_audio_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Retry transient yt-dlp downloads without repeating result validation."""
+    request_directory = tmp_path / "request"
+    request_directory.mkdir()
+    fake = _RetryingFakeDownloadYoutubeDL(
+        [DownloadError("transient failure")] * 4 + [{"id": _VIDEO_ID}],
+        str(request_directory / "audio.webm"),
+    )
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", lambda options: fake)
+
+    result = YtDlpAudioDownloader().download(_CANONICAL_URL, request_directory)
+
+    assert result == request_directory / "audio.webm"
+    assert fake.extract_calls == [(_CANONICAL_URL, True)] * 5
+    assert fake.prepare_filename_calls == 1
 
 
 def test_yt_dlp_audio_adapter_rejects_out_of_directory_path(
@@ -1083,6 +1122,7 @@ def test_yt_dlp_audio_adapter_rejects_multi_entry_results(
 
     with pytest.raises(_WhisperProviderFailure):
         YtDlpAudioDownloader().download(_CANONICAL_URL, request_directory)
+    assert fake.extract_calls == [(_CANONICAL_URL, True)]
 
 
 def test_yt_dlp_audio_adapter_preserves_typed_timeout(
@@ -1107,6 +1147,7 @@ def test_yt_dlp_audio_adapter_preserves_typed_timeout(
 
     with pytest.raises(_WhisperProviderTimeout):
         YtDlpAudioDownloader().download(_CANONICAL_URL, request_directory)
+    assert fake.extract_calls == [(_CANONICAL_URL, True)] * 5
 
 
 class _BlockingWhisperTranscriber:

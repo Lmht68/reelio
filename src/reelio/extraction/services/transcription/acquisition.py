@@ -21,6 +21,7 @@ from yt_dlp.utils import DownloadError, YoutubeDLError
 
 from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.services.transcription.inspection import _is_timeout_exception
+from reelio.extraction.services.transcription.util import extract_info_with_retries
 from reelio.extraction.types import Transcript, TranscriptMethod
 
 logger = logging.getLogger(__name__)
@@ -363,7 +364,11 @@ class YtDlpAudioDownloader:
         }
         try:
             with yt_dlp.YoutubeDL(options) as youtube_dl:
-                raw_info = youtube_dl.extract_info(source_url, download=True)
+                raw_info = extract_info_with_retries(
+                    youtube_dl.extract_info,
+                    source_url,
+                    download=True,
+                )
                 if not isinstance(raw_info, Mapping) or "entries" in raw_info:
                     _log_acquisition_error("whisper provider error", "invalid_download_result")
                     raise _WhisperProviderFailure

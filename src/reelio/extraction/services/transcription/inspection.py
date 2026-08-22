@@ -20,6 +20,7 @@ from reelio.extraction.exceptions import (
     MetadataProviderError,
     UnsupportedPlatformError,
 )
+from reelio.extraction.services.transcription.util import extract_info_with_retries
 from reelio.extraction.types import Platform
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,7 @@ _METADATA_YTDLP_OPTIONS: Final[dict[str, object]] = {
     "quiet": True,
     "no_warnings": True,
     "noplaylist": False,
+    "ignoreconfig": True,
 }
 
 
@@ -204,7 +206,11 @@ class YtDlpMetadataExtractor:
             MetadataProviderError: If yt-dlp returns a non-mapping value.
         """
         with yt_dlp.YoutubeDL(_METADATA_YTDLP_OPTIONS) as youtube_dl:
-            raw_metadata = youtube_dl.extract_info(canonical_url, download=False)
+            raw_metadata = extract_info_with_retries(
+                youtube_dl.extract_info,
+                canonical_url,
+                download=False,
+            )
 
         if not isinstance(raw_metadata, Mapping):
             raise _metadata_provider_error("non_mapping_result")
