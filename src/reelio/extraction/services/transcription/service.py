@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from requests.exceptions import RequestException, Timeout
@@ -11,6 +12,7 @@ import reelio.extraction.services.transcription.acquisition as acquisition
 import reelio.extraction.services.transcription.inspection as inspection
 from reelio.extraction.exceptions import (
     DurationLimitExceededError,
+    InvalidSourceError,
     MetadataProviderError,
     PipelineTimeoutError,
     SourceUnavailableError,
@@ -27,6 +29,19 @@ _METADATA_TIMEOUT_MESSAGE = "Source metadata acquisition timed out."
 _TRANSCRIPT_UNAVAILABLE_MESSAGE = "Transcript is unavailable for this video."
 _TRANSCRIPT_TIMEOUT_MESSAGE = "Transcript acquisition timed out."
 _REDACTED_LOG_VALUE = "[REDACTED]"
+
+
+@dataclass(frozen=True, slots=True)
+class InspectedSource:
+    """Contain a normalized Source and optional inspection-stage audio."""
+
+    source: Source
+    prepared_audio: inspection.PreparedAudio | None = None
+
+    def cleanup(self) -> None:
+        """Delete temporary audio created while inspecting the Source."""
+        if self.prepared_audio is not None:
+            self.prepared_audio.cleanup()
 
 
 class SourceMetadataService:
@@ -46,14 +61,14 @@ class SourceMetadataService:
         self._extractor = extractor
         self._settings = settings
 
-    async def inspect(self, submitted_url: str) -> Source:
-        """Validate a URL, retrieve metadata, enforce duration, and return a Source.
+    async def inspect(self, submitted_url: str) -> InspectedSource:
+        """Validate a URL, retrieve metadata, enforce duration, and return it.
 
         Args:
             submitted_url: URL submitted by the API caller.
 
         Returns:
-            Source: Canonical identity and normalized metadata.
+            InspectedSource: Canonical Source metadata and optional prepared audio.
 
         Raises:
             inspection.InvalidSourceError: If the URL or processed shape is invalid.
@@ -65,10 +80,15 @@ class SourceMetadataService:
         """
         submitted = inspection.classify_submitted_url(submitted_url)
         try:
-            raw_metadata = await asyncio.to_thread(
+            extracted_metadata = await asyncio.to_thread(
                 self._extractor.extract,
                 submitted.provider_url,
             )
+        except inspection._MetadataDurationLimitExceeded as exc:
+            raise DurationLimitExceededError(
+                "Video exceeds the configured duration limit of "
+                f"{self._settings.max_video_duration_seconds} seconds."
+            ) from exc
         except MetadataProviderError as exc:
             raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE) from exc
         except (Timeout, TimeoutError) as exc:
@@ -95,10 +115,15 @@ class SourceMetadataService:
                 raise PipelineTimeoutError(_METADATA_TIMEOUT_MESSAGE) from exc
             raise MetadataProviderError(_METADATA_PROVIDER_MESSAGE) from exc
 
-        normalized = inspection.normalize_processed_metadata(
-            raw_metadata,
-            submitted,
-        )
+        try:
+            normalized = inspection.normalize_processed_metadata(
+                extracted_metadata.metadata,
+                submitted,
+            )
+        except (InvalidSourceError, MetadataProviderError):
+            if extracted_metadata.prepared_audio is not None:
+                extracted_metadata.prepared_audio.cleanup()
+            raise
         source = Source(
             platform=submitted.platform,
             video_id=normalized.video_id,
@@ -127,11 +152,13 @@ class SourceMetadataService:
         )
 
         if source.duration_seconds > self._settings.max_video_duration_seconds:
+            if extracted_metadata.prepared_audio is not None:
+                extracted_metadata.prepared_audio.cleanup()
             raise DurationLimitExceededError(
                 "Video exceeds the configured duration limit of "
                 f"{self._settings.max_video_duration_seconds} seconds."
             )
-        return source
+        return InspectedSource(source, extracted_metadata.prepared_audio)
 
 
 class TranscriptionService:
@@ -160,15 +187,21 @@ class TranscriptionService:
         self._temp_media_dir = temp_media_dir
         self._semaphore = semaphore
 
-    async def acquire(self, source: Source, submitted_url: str) -> Transcript:
+    async def acquire(
+        self,
+        source: Source,
+        submitted_url: str,
+        prepared_audio: inspection.PreparedAudio | None = None,
+    ) -> Transcript:
         """Acquire a normalized Transcript for a validated Source.
 
         Args:
             source: Validated Source whose identity identifies provider data.
             submitted_url: Validated URL supplied by the API caller.
+            prepared_audio: Audio downloaded during metadata inspection, when available.
+
         Returns:
             Transcript: Caption or Whisper text and acquisition metadata.
-
         Raises:
             TranscriptionError: If no usable Transcript can be acquired.
             PipelineTimeoutError: If the terminal Whisper path times out.
@@ -197,6 +230,7 @@ class TranscriptionService:
                 self._audio_downloader,
                 self._transcriber,
                 self._temp_media_dir,
+                prepared_audio,
                 self._semaphore,
             )
         except acquisition._WhisperProviderTimeout as exc:

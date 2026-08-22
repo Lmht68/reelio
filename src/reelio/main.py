@@ -48,7 +48,10 @@ async def _create_production_pipeline() -> Pipeline:
         _transcription_settings,
     )
     source_metadata_service = SourceMetadataService(
-        extractor=YtDlpMetadataExtractor(),
+        extractor=YtDlpMetadataExtractor(
+            max_duration_seconds=_transcription_settings.max_video_duration_seconds,
+            temp_media_dir=_transcription_settings.temp_media_dir,
+        ),
         settings=_transcription_settings,
     )
     transcription_service = TranscriptionService(

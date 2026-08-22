@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import tempfile
 import threading
 import xml.etree.ElementTree as ElementTree
@@ -31,6 +32,7 @@ from reelio.extraction.services.transcription.acquisition import (
     _WhisperProviderTimeout,
 )
 from reelio.extraction.services.transcription.config import TranscriptionConfig
+from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import TranscriptionService
 from reelio.extraction.types import Platform, Source, Transcript, TranscriptMethod
 
@@ -640,9 +642,11 @@ async def test_caption_provider_timeout_falls_back_to_whisper(
 class _FakeAudioDownloader:
     def __init__(self) -> None:
         self.calls: list[tuple[str, Path]] = []
+        self.destination_existed: list[bool] = []
 
     def download(self, source_url: str, destination: Path) -> Path:
         self.calls.append((source_url, destination))
+        self.destination_existed.append(destination.is_dir())
         audio_path = destination / "audio.webm"
         audio_path.write_bytes(b"audio")
         return audio_path
@@ -708,6 +712,67 @@ async def test_captionless_source_falls_back_to_whisper(tmp_path: Path) -> None:
     )
     assert len(downloader.calls) == 1
     assert len(transcriber.calls) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_whisper_reuses_audio_prepared_during_inspection(tmp_path: Path) -> None:
+    """Transcribe inspection-stage audio without issuing a second download."""
+    request_directory = tmp_path / "inspection"
+    request_directory.mkdir()
+    audio_path = request_directory / "audio.m4a"
+    audio_path.write_bytes(b"audio")
+    source = _source()
+    source.platform = Platform.INSTAGRAM
+    prepared_audio = PreparedAudio(audio_path, request_directory)
+    downloader = _FakeAudioDownloader()
+    transcriber = _FakeWhisperTranscriber(
+        WhisperResult(text="Recovered speech.", language="en", segment_count=1)
+    )
+
+    transcript = await _transcription_service(
+        _FakeCaptionProvider([]),
+        audio_downloader=downloader,
+        transcriber=transcriber,
+        temp_media_dir=tmp_path,
+    ).acquire(source, _CANONICAL_URL, prepared_audio)
+
+    assert transcript.method is TranscriptMethod.WHISPER
+    assert downloader.calls == []
+    assert transcriber.calls == [audio_path]
+    assert request_directory.exists()
+    prepared_audio.cleanup()
+    assert not request_directory.exists()
+
+
+async def test_missing_prepared_audio_downloads_into_fresh_directory(
+    tmp_path: Path,
+) -> None:
+    """Re-download into a fresh managed directory when inspection audio vanished."""
+    stale_directory = tmp_path / "inspection"
+    stale_directory.mkdir()
+    prepared_audio = PreparedAudio(stale_directory / "audio.m4a", stale_directory)
+    shutil.rmtree(stale_directory)
+    downloader = _FakeAudioDownloader()
+    transcriber = _FakeWhisperTranscriber(
+        WhisperResult(text="Recovered speech.", language="en", segment_count=1)
+    )
+
+    transcript = await _transcription_service(
+        _FakeCaptionProvider([]),
+        audio_downloader=downloader,
+        transcriber=transcriber,
+        temp_media_dir=tmp_path,
+    ).acquire(_source(), _CANONICAL_URL, prepared_audio)
+
+    assert transcript.method is TranscriptMethod.WHISPER
+    assert len(downloader.calls) == 1
+    download_url, download_directory = downloader.calls[0]
+    assert download_url == _CANONICAL_URL
+    assert download_directory != stale_directory
+    assert download_directory.is_relative_to(tmp_path.resolve())
+    assert transcriber.calls == [download_directory / "audio.webm"]
+    assert downloader.destination_existed == [True]
+    assert not download_directory.exists()
     assert list(tmp_path.iterdir()) == []
 
 
@@ -1147,7 +1212,7 @@ def test_yt_dlp_audio_adapter_preserves_typed_timeout(
 
     with pytest.raises(_WhisperProviderTimeout):
         YtDlpAudioDownloader().download(_CANONICAL_URL, request_directory)
-    assert fake.extract_calls == [(_CANONICAL_URL, True)] * 5
+    assert fake.extract_calls == [(_CANONICAL_URL, True)] * 10
 
 
 class _BlockingWhisperTranscriber:

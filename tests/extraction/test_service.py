@@ -1,7 +1,12 @@
 """Pipeline orchestration contract tests."""
 
+import logging
+import shutil
+from pathlib import Path
+
 import pytest
 
+import reelio.extraction.services.transcription.inspection as transcription_inspection
 from reelio.extraction.exceptions import (
     DurationLimitExceededError,
     InvalidSourceError,
@@ -10,6 +15,8 @@ from reelio.extraction.exceptions import (
     TranscriptionError,
 )
 from reelio.extraction.service import ExtractionPipeline
+from reelio.extraction.services.transcription.inspection import PreparedAudio
+from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
     MentionResult,
     Platform,
@@ -28,17 +35,19 @@ class _FakeSourceMetadataService:
         self,
         source: Source | None = None,
         error: Exception | None = None,
+        prepared_audio: PreparedAudio | None = None,
     ) -> None:
         self.source = source
+        self.prepared_audio = prepared_audio
         self.error = error
         self.calls: list[str] = []
 
-    async def inspect(self, submitted_url: str) -> Source:
+    async def inspect(self, submitted_url: str) -> InspectedSource:
         self.calls.append(submitted_url)
         if self.error is not None:
             raise self.error
         assert self.source is not None
-        return self.source
+        return InspectedSource(self.source, self.prepared_audio)
 
 
 class _FakeTranscriptionService:
@@ -47,7 +56,12 @@ class _FakeTranscriptionService:
         self.error = error
         self.calls: list[tuple[Source, str]] = []
 
-    async def acquire(self, source: Source, submitted_url: str) -> Transcript:
+    async def acquire(
+        self,
+        source: Source,
+        submitted_url: str,
+        prepared_audio: object | None = None,
+    ) -> Transcript:
         self.calls.append((source, submitted_url))
         if self.error is not None:
             raise self.error
@@ -207,3 +221,70 @@ async def test_pipeline_result_keeps_each_placeholder_result_branch() -> None:
     assert len(ambiguous.candidates) == 3
     assert unresolved.movie is None
     assert unresolved.candidates == []
+
+
+@pytest.mark.parametrize(
+    "transcription_error",
+    [None, TranscriptionError("Transcript is unavailable for this video.")],
+)
+async def test_pipeline_cleans_inspection_audio_after_transcript_stage(
+    tmp_path: Path,
+    transcription_error: TranscriptionError | None,
+) -> None:
+    """Remove inspection media after transcript success and failure."""
+    request_directory = tmp_path / "inspection"
+    request_directory.mkdir()
+    audio_path = request_directory / "audio.m4a"
+    audio_path.write_bytes(b"audio")
+    metadata_service = _FakeSourceMetadataService(
+        _source(),
+        prepared_audio=PreparedAudio(audio_path, request_directory),
+    )
+    transcription_service = _FakeTranscriptionService(
+        _transcript(),
+        error=transcription_error,
+    )
+    pipeline = ExtractionPipeline(metadata_service, transcription_service)
+
+    if transcription_error is None:
+        await pipeline.run(_CANONICAL_URL)
+    else:
+        with pytest.raises(TranscriptionError):
+            await pipeline.run(_CANONICAL_URL)
+
+    assert not request_directory.exists()
+
+
+async def test_pipeline_preserves_transcription_error_when_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """Keep the transcript failure when temporary media cleanup also fails."""
+    request_directory = tmp_path / "inspection"
+    request_directory.mkdir()
+    audio_path = request_directory / "audio.m4a"
+    audio_path.write_bytes(b"audio")
+    transcription_error = TranscriptionError("Transcript is unavailable for this video.")
+    pipeline = ExtractionPipeline(
+        _FakeSourceMetadataService(
+            _source(),
+            prepared_audio=PreparedAudio(audio_path, request_directory),
+        ),
+        _FakeTranscriptionService(_transcript(), error=transcription_error),
+    )
+
+    def raise_cleanup_error(path: Path) -> None:
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(shutil, "rmtree", raise_cleanup_error)
+
+    with (
+        caplog.at_level(logging.ERROR, logger=transcription_inspection.__name__),
+        pytest.raises(TranscriptionError) as error,
+    ):
+        await pipeline.run(_CANONICAL_URL)
+
+    assert error.value is transcription_error
+    assert request_directory.exists()
+    assert any(record.getMessage() == "temporary media cleanup failed" for record in caplog.records)

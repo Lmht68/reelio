@@ -2,18 +2,22 @@
 
 import logging
 import re
+import shutil
 import socket
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from math import ceil, isfinite
 from numbers import Real
-from typing import Final, Protocol, cast
+from pathlib import Path
+from typing import Any, Final, Protocol, cast
 from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit, urlunsplit
 
+import av
 import yt_dlp
 from requests.exceptions import Timeout
-from yt_dlp.utils import DownloadError
+from yt_dlp.utils import DownloadCancelled, DownloadError
 
 from reelio.extraction.exceptions import (
     InvalidSourceError,
@@ -145,6 +149,13 @@ _METADATA_YTDLP_OPTIONS: Final[dict[str, object]] = {
     "ignoreconfig": True,
 }
 
+_AUDIO_OUTPUT_TEMPLATE: Final[str] = "audio.%(ext)s"
+_INSPECTION_TEMP_PREFIX: Final[str] = "reelio-inspection-"
+_AUDIO_FALLBACK_YTDLP_OPTIONS: Final[dict[str, object]] = {
+    **_METADATA_YTDLP_OPTIONS,
+    "format": "bestaudio/best",
+}
+
 
 def _log_inspection_error(event: str, reason: str) -> None:
     """Log a safe, structured reason for an inspection failure."""
@@ -155,6 +166,22 @@ def _log_inspection_error(event: str, reason: str) -> None:
             "reason": reason,
         },
     )
+
+
+def _cleanup_request_directory(request_directory: Path) -> None:
+    """Remove private media without masking the operation's primary result."""
+    if not request_directory.exists():
+        return
+    try:
+        shutil.rmtree(request_directory)
+    except OSError:
+        logger.error(
+            "temporary media cleanup failed",
+            extra={
+                "stage": "transcription",
+                "reason": "temporary_media_cleanup_failed",
+            },
+        )
 
 
 def _metadata_provider_error(reason: str) -> MetadataProviderError:
@@ -175,35 +202,74 @@ def _unsupported_platform_error(reason: str) -> UnsupportedPlatformError:
     return UnsupportedPlatformError(_UNSUPPORTED_PLATFORM_MESSAGE)
 
 
-class MetadataExtractor(Protocol):
-    """Retrieve raw metadata for one validated provider URL."""
+class _MetadataDurationLimitExceeded(Exception):
+    """Indicate that inspection found a source exceeding the duration limit."""
 
-    def extract(self, canonical_url: str) -> Mapping[str, object]:
-        """Return provider metadata without downloading media.
+
+class _DurationLimitDownloadCancelled(DownloadCancelled):  # type: ignore[misc]
+    """Stop yt-dlp after the inspection duration filter rejects a source."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedAudio:
+    """Contain an inspection-stage audio file and its private directory."""
+
+    path: Path
+    request_directory: Path
+
+    def cleanup(self) -> None:
+        """Delete the private request directory that owns the audio file."""
+        _cleanup_request_directory(self.request_directory)
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedMetadata:
+    """Contain yt-dlp metadata and audio prepared during metadata inspection."""
+
+    metadata: Mapping[str, object]
+    prepared_audio: PreparedAudio | None = None
+
+
+class MetadataExtractor(Protocol):
+    """Retrieve raw metadata and optional prepared audio for one provider URL."""
+
+    def extract(self, canonical_url: str) -> ExtractedMetadata:
+        """Return provider metadata and optional inspection-stage audio.
 
         Args:
             canonical_url: Minimal provider URL produced by URL inspection.
 
         Returns:
-            Mapping[str, object]: Raw provider metadata.
+            ExtractedMetadata: Raw provider metadata and prepared audio when needed.
         """
         ...
 
 
 class YtDlpMetadataExtractor:
-    """Retrieve one Source's metadata through yt-dlp."""
+    """Retrieve Source metadata and recover missing durations through audio download."""
 
-    def extract(self, canonical_url: str) -> Mapping[str, object]:
-        """Extract metadata without downloading media.
+    def __init__(self, max_duration_seconds: int, temp_media_dir: Path) -> None:
+        """Initialize fallback media storage and the permitted video duration.
+
+        Args:
+            max_duration_seconds: Maximum duration accepted by the extraction pipeline.
+            temp_media_dir: Root directory for private inspection media directories.
+        """
+        self._max_duration_seconds = max_duration_seconds
+        self._temp_media_dir = temp_media_dir
+
+    def extract(self, canonical_url: str) -> ExtractedMetadata:
+        """Extract metadata and download audio when the provider omits duration.
 
         Args:
             canonical_url: Minimal provider URL produced by URL inspection.
 
         Returns:
-            Mapping[str, object]: Raw yt-dlp metadata.
+            ExtractedMetadata: Raw yt-dlp metadata and optional prepared audio.
 
         Raises:
             MetadataProviderError: If yt-dlp returns a non-mapping value.
+            _MetadataDurationLimitExceeded: If fallback inspection exceeds the limit.
         """
         with yt_dlp.YoutubeDL(_METADATA_YTDLP_OPTIONS) as youtube_dl:
             raw_metadata = extract_info_with_retries(
@@ -214,7 +280,84 @@ class YtDlpMetadataExtractor:
 
         if not isinstance(raw_metadata, Mapping):
             raise _metadata_provider_error("non_mapping_result")
-        return cast(Mapping[str, object], raw_metadata)
+        metadata = cast(Mapping[str, object], raw_metadata)
+        if metadata.get("duration") is not None:
+            return ExtractedMetadata(metadata)
+        return self._download_audio_for_duration(canonical_url)
+
+    def _download_audio_for_duration(self, canonical_url: str) -> ExtractedMetadata:
+        self._temp_media_dir.mkdir(parents=True, exist_ok=True)
+        request_directory = Path(
+            tempfile.mkdtemp(
+                prefix=_INSPECTION_TEMP_PREFIX,
+                dir=str(self._temp_media_dir),
+            )
+        ).resolve()
+
+        def _duration_filter(
+            info: dict[str, Any],
+            *,
+            incomplete: bool = False,
+        ) -> str | None:
+            duration = info.get("duration")
+            if duration is not None and duration > self._max_duration_seconds:
+                raise _DurationLimitDownloadCancelled(
+                    f"Video duration ({duration}s) exceeds the {self._max_duration_seconds}s limit"
+                )
+            return None
+
+        completed = False
+        try:
+            options = {
+                **_AUDIO_FALLBACK_YTDLP_OPTIONS,
+                "outtmpl": str(request_directory / _AUDIO_OUTPUT_TEMPLATE),
+                "match_filter": _duration_filter,
+            }
+            with yt_dlp.YoutubeDL(options) as youtube_dl:
+                raw_metadata = extract_info_with_retries(
+                    youtube_dl.extract_info,
+                    canonical_url,
+                    download=True,
+                )
+                if not isinstance(raw_metadata, Mapping) or "entries" in raw_metadata:
+                    raise _metadata_provider_error("invalid_duration_download_result")
+                prepared_path = youtube_dl.prepare_filename(raw_metadata)
+
+            if not isinstance(prepared_path, (str, Path)):
+                raise _metadata_provider_error("invalid_duration_download_path")
+            audio_path = Path(prepared_path).resolve()
+            if audio_path.parent != request_directory or not audio_path.is_file():
+                raise _metadata_provider_error("duration_audio_file_missing")
+            audio_duration = _probe_audio_duration(audio_path)
+            if audio_duration > self._max_duration_seconds:
+                raise _MetadataDurationLimitExceeded
+            metadata = dict(cast(Mapping[str, object], raw_metadata))
+            metadata["duration"] = audio_duration
+            completed = True
+            return ExtractedMetadata(
+                metadata=metadata,
+                prepared_audio=PreparedAudio(audio_path, request_directory),
+            )
+        except _DurationLimitDownloadCancelled as exc:
+            raise _MetadataDurationLimitExceeded from exc
+        finally:
+            if not completed:
+                _cleanup_request_directory(request_directory)
+
+
+def _probe_audio_duration(audio_path: Path) -> float:
+    """Return the finite positive duration of one downloaded audio file."""
+    try:
+        with av.open(str(audio_path)) as container:
+            duration = container.duration
+    except (av.FFmpegError, OSError, ValueError) as exc:
+        raise _metadata_provider_error("audio_duration_probe_failed") from exc
+    if duration is None:
+        raise _metadata_provider_error("audio_duration_unavailable")
+    duration_seconds = duration / av.time_base
+    if not isfinite(duration_seconds) or duration_seconds <= 0:
+        raise _metadata_provider_error("invalid_audio_duration")
+    return duration_seconds
 
 
 @dataclass(frozen=True, slots=True)

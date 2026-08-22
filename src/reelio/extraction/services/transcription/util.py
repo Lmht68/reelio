@@ -3,6 +3,8 @@
 from collections.abc import Callable
 from typing import Final
 
+from yt_dlp.utils import DownloadCancelled
+
 _MAX_YTDLP_ATTEMPTS: Final[int] = 10
 
 
@@ -12,7 +14,7 @@ def extract_info_with_retries[T](
     *,
     download: bool,
 ) -> T:
-    """Call yt-dlp's data-retrieval API at most five times.
+    """Call yt-dlp's data-retrieval API at most ten times.
 
     Args:
         extract_info: Bound ``yt_dlp.YoutubeDL.extract_info`` method.
@@ -23,11 +25,14 @@ def extract_info_with_retries[T](
         The result of the first successful yt-dlp request.
 
     Raises:
-        Exception: The final exception raised by yt-dlp after five attempts.
+        DownloadCancelled: If yt-dlp cancels the operation.
+        Exception: The final retryable exception raised by yt-dlp after ten attempts.
     """
     for attempt in range(_MAX_YTDLP_ATTEMPTS):
         try:
             return extract_info(source_url, download=download)
+        except DownloadCancelled:
+            raise
         except Exception:
             if attempt == _MAX_YTDLP_ATTEMPTS - 1:
                 raise

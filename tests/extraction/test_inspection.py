@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
+import wave
 from collections.abc import Callable, Mapping
 from decimal import Decimal
+from pathlib import Path
 from types import TracebackType
 from typing import cast
 
@@ -25,7 +28,11 @@ from reelio.extraction.exceptions import (
 )
 from reelio.extraction.services.transcription import service as transcription_service
 from reelio.extraction.services.transcription.config import TranscriptionConfig
-from reelio.extraction.services.transcription.inspection import YtDlpMetadataExtractor
+from reelio.extraction.services.transcription.inspection import (
+    ExtractedMetadata,
+    PreparedAudio,
+    YtDlpMetadataExtractor,
+)
 from reelio.extraction.services.transcription.service import SourceMetadataService
 from reelio.extraction.types import Platform
 
@@ -39,11 +46,11 @@ class _FakeExtractor:
         self.error = error
         self.calls: list[str] = []
 
-    def extract(self, canonical_url: str) -> Mapping[str, object]:
+    def extract(self, canonical_url: str) -> ExtractedMetadata:
         self.calls.append(canonical_url)
         if self.error is not None:
             raise self.error
-        return cast(Mapping[str, object], self.metadata)
+        return ExtractedMetadata(cast(Mapping[str, object], self.metadata))
 
 
 def _metadata(**overrides: object) -> dict[str, object]:
@@ -94,7 +101,7 @@ async def test_youtube_url_forms_normalize_to_one_source_identity(
     """Normalize every accepted YouTube URL form to one canonical identity."""
     extractor = _FakeExtractor(_metadata())
 
-    source = await _service(extractor).inspect(submitted_url)
+    source = (await _service(extractor).inspect(submitted_url)).source
 
     assert source.platform is Platform.YOUTUBE
     assert source.video_id == _VIDEO_ID
@@ -198,7 +205,7 @@ async def test_metadata_fields_are_normalized_into_source() -> None:
         )
     )
 
-    source = await _service(extractor).inspect(_CANONICAL_URL)
+    source = (await _service(extractor).inspect(_CANONICAL_URL)).source
 
     assert source.platform is Platform.YOUTUBE
     assert source.video_id == _VIDEO_ID
@@ -228,7 +235,7 @@ async def test_missing_metadata_uses_empty_or_fallback_values(
     """Use documented fallback values for optional provider metadata."""
     extractor = _FakeExtractor(_metadata(**metadata_overrides))
 
-    source = await _service(extractor).inspect(_CANONICAL_URL)
+    source = (await _service(extractor).inspect(_CANONICAL_URL)).source
 
     assert source.description == expected_description
     assert source.channel == expected_channel
@@ -240,7 +247,7 @@ async def test_provider_id_is_optional_when_url_identity_is_valid() -> None:
     del metadata["id"]
     extractor = _FakeExtractor(metadata)
 
-    source = await _service(extractor).inspect(_CANONICAL_URL)
+    source = (await _service(extractor).inspect(_CANONICAL_URL)).source
 
     assert source.video_id == _VIDEO_ID
 
@@ -249,7 +256,7 @@ async def test_youtube_preserves_finite_live_status_metadata() -> None:
     """Keep legacy YouTube metadata behavior outside social finite checks."""
     extractor = _FakeExtractor(_metadata(live_status="was_live"))
 
-    source = await _service(extractor).inspect(_CANONICAL_URL)
+    source = (await _service(extractor).inspect(_CANONICAL_URL)).source
 
     assert source.platform is Platform.YOUTUBE
     assert source.video_id == _VIDEO_ID
@@ -304,7 +311,7 @@ async def test_duration_equal_to_limit_is_allowed() -> None:
     """Allow a video whose ceiled duration exactly equals the configured limit."""
     extractor = _FakeExtractor(_metadata(duration=1800.0))
 
-    source = await _service(extractor, max_duration=1800).inspect(_CANONICAL_URL)
+    source = (await _service(extractor, max_duration=1800).inspect(_CANONICAL_URL)).source
 
     assert source.duration_seconds == 1800
 
@@ -429,14 +436,15 @@ def _patch_youtube_dl(
 
 def test_yt_dlp_adapter_uses_metadata_only_options(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Pass the canonical URL and metadata-only options to yt-dlp exactly once."""
     fake_youtube_dl = _FakeYoutubeDL({}, _metadata())
     _patch_youtube_dl(monkeypatch, fake_youtube_dl)
 
-    metadata = YtDlpMetadataExtractor().extract(_CANONICAL_URL)
+    metadata = YtDlpMetadataExtractor(1800, tmp_path).extract(_CANONICAL_URL)
 
-    assert metadata["title"] == "Example video"
+    assert metadata.metadata["title"] == "Example video"
     assert fake_youtube_dl.options == {
         "quiet": True,
         "no_warnings": True,
@@ -449,6 +457,7 @@ def test_yt_dlp_adapter_uses_metadata_only_options(
 
 def test_yt_dlp_adapter_retries_only_metadata_retrieval(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Retry transient yt-dlp retrieval failures without repeating validation."""
     fake_youtube_dl = _RetryingFakeYoutubeDL(
@@ -456,22 +465,248 @@ def test_yt_dlp_adapter_retries_only_metadata_retrieval(
     )
     _patch_youtube_dl(monkeypatch, fake_youtube_dl)
 
-    metadata = YtDlpMetadataExtractor().extract(_CANONICAL_URL)
+    metadata = YtDlpMetadataExtractor(1800, tmp_path).extract(_CANONICAL_URL)
 
-    assert metadata["title"] == "Example video"
+    assert metadata.metadata["title"] == "Example video"
     assert fake_youtube_dl.extract_calls == [(_CANONICAL_URL, False)] * 5
 
 
 def test_yt_dlp_adapter_rejects_non_mapping_results(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Reject a provider response that cannot supply named metadata fields."""
     fake_youtube_dl = _FakeYoutubeDL({}, ["not metadata"])
     _patch_youtube_dl(monkeypatch, fake_youtube_dl)
 
     with pytest.raises(MetadataProviderError, match="Unable to retrieve source metadata"):
-        YtDlpMetadataExtractor().extract(_CANONICAL_URL)
+        YtDlpMetadataExtractor(1800, tmp_path).extract(_CANONICAL_URL)
     assert fake_youtube_dl.extract_calls == [(_CANONICAL_URL, False)]
+
+
+@pytest.mark.parametrize(
+    ("audio_duration", "expected_duration"),
+    [(60.0, 60), (61.0, None)],
+)
+async def test_missing_metadata_duration_uses_probed_audio_duration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    audio_duration: float,
+    expected_duration: int | None,
+) -> None:
+    """Use the downloaded audio duration when both yt-dlp results omit it."""
+    metadata_without_duration = _metadata(duration=None)
+    downloaded_metadata = dict(metadata_without_duration)
+    del downloaded_metadata["duration"]
+    metadata_youtube_dl = _FakeYoutubeDL({}, metadata_without_duration)
+
+    class _AudioYoutubeDL:
+        def __init__(self, options: object) -> None:
+            self.options = cast(dict[str, object], options)
+            self.extract_calls: list[tuple[str, bool]] = []
+            self.prepared_path = Path(cast(str, self.options["outtmpl"]).replace("%(ext)s", "m4a"))
+
+        def __enter__(self) -> _AudioYoutubeDL:
+            return self
+
+        def __exit__(
+            self,
+            exception_type: type[BaseException] | None,
+            exception: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            return None
+
+        def extract_info(self, canonical_url: str, *, download: bool) -> object:
+            self.extract_calls.append((canonical_url, download))
+            match_filter = cast(
+                Callable[[dict[str, object]], str | None],
+                self.options["match_filter"],
+            )
+            assert match_filter(downloaded_metadata) is None
+            self.prepared_path.write_bytes(b"audio")
+            return downloaded_metadata
+
+        def prepare_filename(self, metadata: object) -> Path:
+            return self.prepared_path
+
+    audio_youtube_dl: _AudioYoutubeDL | None = None
+
+    def make_youtube_dl(options: object) -> _FakeYoutubeDL | _AudioYoutubeDL:
+        nonlocal audio_youtube_dl
+        if isinstance(options, dict) and "match_filter" in options:
+            audio_youtube_dl = _AudioYoutubeDL(options)
+            return audio_youtube_dl
+        metadata_youtube_dl.options = options
+        return metadata_youtube_dl
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", make_youtube_dl)
+    monkeypatch.setattr(
+        transcription_inspection,
+        "_probe_audio_duration",
+        lambda audio_path: audio_duration,
+        raising=False,
+    )
+
+    metadata_service = SourceMetadataService(
+        YtDlpMetadataExtractor(60, tmp_path),
+        _settings(60),
+    )
+    if expected_duration is None:
+        with pytest.raises(DurationLimitExceededError):
+            await metadata_service.inspect(_CANONICAL_URL)
+        assert list(tmp_path.iterdir()) == []
+        return
+
+    inspected = await metadata_service.inspect(_CANONICAL_URL)
+
+    assert inspected.source.duration_seconds == expected_duration
+    assert metadata_youtube_dl.extract_calls == [(_CANONICAL_URL, False)]
+    assert audio_youtube_dl is not None
+    assert audio_youtube_dl.extract_calls == [(_CANONICAL_URL, True)]
+    match_filter = cast(
+        Callable[[dict[str, object]], str | None],
+        audio_youtube_dl.options["match_filter"],
+    )
+    with pytest.raises(yt_dlp.utils.DownloadCancelled):
+        match_filter({"duration": 61})
+    inspected.cleanup()
+
+
+async def test_duration_filter_cancellation_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Map the first duration-filter cancellation to the configured limit."""
+    metadata_without_duration = _metadata()
+    del metadata_without_duration["duration"]
+    metadata_youtube_dl = _FakeYoutubeDL({}, metadata_without_duration)
+
+    class _DurationLimitYoutubeDL:
+        def __init__(self, options: object) -> None:
+            self.options = cast(dict[str, object], options)
+            self.extract_calls: list[tuple[str, bool]] = []
+
+        def __enter__(self) -> _DurationLimitYoutubeDL:
+            return self
+
+        def __exit__(
+            self,
+            exception_type: type[BaseException] | None,
+            exception: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            return None
+
+        def extract_info(self, canonical_url: str, *, download: bool) -> object:
+            self.extract_calls.append((canonical_url, download))
+            match_filter = cast(
+                Callable[[dict[str, object]], str | None],
+                self.options["match_filter"],
+            )
+            match_filter({"duration": 61})
+            raise AssertionError("duration filter did not cancel yt-dlp")
+
+    duration_limit_youtube_dl: _DurationLimitYoutubeDL | None = None
+
+    def make_youtube_dl(options: object) -> _FakeYoutubeDL | _DurationLimitYoutubeDL:
+        nonlocal duration_limit_youtube_dl
+        if isinstance(options, dict) and "match_filter" in options:
+            duration_limit_youtube_dl = _DurationLimitYoutubeDL(options)
+            return duration_limit_youtube_dl
+        metadata_youtube_dl.options = options
+        return metadata_youtube_dl
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", make_youtube_dl)
+
+    with pytest.raises(DurationLimitExceededError):
+        await SourceMetadataService(
+            YtDlpMetadataExtractor(60, tmp_path),
+            _settings(60),
+        ).inspect(_CANONICAL_URL)
+
+    assert metadata_youtube_dl.extract_calls == [(_CANONICAL_URL, False)]
+    assert duration_limit_youtube_dl is not None
+    assert duration_limit_youtube_dl.extract_calls == [(_CANONICAL_URL, True)]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_audio_duration_probe_reads_wav_duration(tmp_path: Path) -> None:
+    """Read a generated WAV duration through the real PyAV boundary."""
+    audio_path = tmp_path / "audio.wav"
+    with wave.open(str(audio_path), "wb") as audio_file:
+        audio_file.setnchannels(1)
+        audio_file.setsampwidth(2)
+        audio_file.setframerate(8_000)
+        audio_file.writeframes(b"\x00\x00" * 8_000)
+
+    assert transcription_inspection._probe_audio_duration(audio_path) == pytest.approx(1.0)
+
+
+def test_audio_duration_probe_maps_invalid_audio_to_metadata_error(tmp_path: Path) -> None:
+    """Hide unreadable audio details behind the stable metadata provider error."""
+    audio_path = tmp_path / "invalid-audio"
+    audio_path.write_bytes(b"not audio")
+
+    with pytest.raises(MetadataProviderError, match="Unable to retrieve source metadata"):
+        transcription_inspection._probe_audio_duration(audio_path)
+
+
+def test_prepared_audio_cleanup_logs_nonfatal_os_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """Report a media cleanup failure without raising from cleanup."""
+    request_directory = tmp_path / "inspection"
+    request_directory.mkdir()
+
+    def raise_cleanup_error(path: Path) -> None:
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(shutil, "rmtree", raise_cleanup_error)
+
+    with caplog.at_level(logging.ERROR, logger=transcription_inspection.__name__):
+        PreparedAudio(request_directory / "audio.m4a", request_directory).cleanup()
+
+    record = next(
+        item for item in caplog.records if item.getMessage() == "temporary media cleanup failed"
+    )
+    assert record.__dict__["stage"] == "transcription"
+    assert record.__dict__["reason"] == "temporary_media_cleanup_failed"
+
+
+def test_failed_audio_fallback_logs_nonfatal_cleanup_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """Preserve audio fallback failure when its temporary directory cannot delete."""
+    metadata_without_duration = _metadata()
+    del metadata_without_duration["duration"]
+    metadata_youtube_dl = _FakeYoutubeDL({}, metadata_without_duration)
+    audio_youtube_dl = _FakeYoutubeDL({}, {"entries": []})
+
+    def make_youtube_dl(options: object) -> _FakeYoutubeDL:
+        if isinstance(options, dict) and "match_filter" in options:
+            audio_youtube_dl.options = options
+            return audio_youtube_dl
+        metadata_youtube_dl.options = options
+        return metadata_youtube_dl
+
+    def raise_cleanup_error(path: Path) -> None:
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", make_youtube_dl)
+    monkeypatch.setattr(shutil, "rmtree", raise_cleanup_error)
+
+    with (
+        caplog.at_level(logging.ERROR, logger=transcription_inspection.__name__),
+        pytest.raises(MetadataProviderError),
+    ):
+        YtDlpMetadataExtractor(60, tmp_path).extract(_CANONICAL_URL)
+
+    assert any(record.getMessage() == "temporary media cleanup failed" for record in caplog.records)
 
 
 @pytest.mark.parametrize(
@@ -819,7 +1054,7 @@ async def test_social_forms_normalize_and_reach_provider_once(
     """Accept every allowlisted social form and preserve provider identity."""
     extractor = _FakeExtractor(_social_metadata(extractor_key, video_id, canonical_url))
 
-    source = await _service(extractor).inspect(submitted_url)
+    source = (await _service(extractor).inspect(submitted_url)).source
 
     assert source.platform is platform
     assert source.video_id == video_id
@@ -1033,7 +1268,7 @@ async def test_social_optional_metadata_uses_normalized_fallbacks() -> None:
         )
     )
 
-    source = await _service(extractor).inspect("https://www.instagram.com/reel/ABC123")
+    source = (await _service(extractor).inspect("https://www.instagram.com/reel/ABC123")).source
 
     assert source.title == ""
     assert source.description == ""
@@ -1088,7 +1323,7 @@ async def test_social_duration_limit_is_applied_after_metadata(
     )
 
     if duration == 1800.0:
-        source = await _service(extractor, max_duration=1800).inspect(submitted_url)
+        source = (await _service(extractor, max_duration=1800).inspect(submitted_url)).source
         assert source.duration_seconds == 1800
     else:
         with pytest.raises(DurationLimitExceededError):
@@ -1195,6 +1430,6 @@ async def test_social_video_formats_allow_audio_entries_with_one_video() -> None
         )
     )
 
-    source = await _service(extractor).inspect("https://www.instagram.com/reel/ABC123")
+    source = (await _service(extractor).inspect("https://www.instagram.com/reel/ABC123")).source
 
     assert source.video_id == "ABC123"

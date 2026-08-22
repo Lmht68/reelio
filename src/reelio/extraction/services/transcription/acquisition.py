@@ -20,7 +20,10 @@ from youtube_transcript_api import (
 from yt_dlp.utils import DownloadError, YoutubeDLError
 
 from reelio.extraction.services.transcription.config import TranscriptionConfig
-from reelio.extraction.services.transcription.inspection import _is_timeout_exception
+from reelio.extraction.services.transcription.inspection import (
+    PreparedAudio,
+    _is_timeout_exception,
+)
 from reelio.extraction.services.transcription.util import extract_info_with_retries
 from reelio.extraction.types import Transcript, TranscriptMethod
 
@@ -636,6 +639,7 @@ async def acquire_whisper(
     audio_downloader: AudioDownloader,
     transcriber: WhisperTranscriber,
     temp_media_dir: Path,
+    prepared_audio: PreparedAudio | None,
     semaphore: asyncio.Semaphore,
 ) -> Transcript:
     """Run one complete Whisper operation under the shared semaphore.
@@ -645,6 +649,7 @@ async def acquire_whisper(
         audio_downloader: Synchronous native-audio adapter.
         transcriber: Synchronous preloaded Whisper adapter.
         temp_media_dir: Root directory for request-scoped media.
+        prepared_audio: Audio downloaded during metadata inspection, when available.
         semaphore: Application-lifetime Whisper concurrency gate.
 
     Returns:
@@ -664,6 +669,7 @@ async def acquire_whisper(
                 audio_downloader,
                 transcriber,
                 temp_media_dir,
+                prepared_audio,
             )
         )
         try:
@@ -680,70 +686,97 @@ def _acquire_whisper_sync(
     audio_downloader: AudioDownloader,
     transcriber: WhisperTranscriber,
     temp_media_dir: Path,
+    prepared_audio: PreparedAudio | None,
 ) -> Transcript:
+    if prepared_audio is not None and prepared_audio.path.is_file():
+        return _transcribe_audio(
+            prepared_audio.path,
+            prepared_audio.request_directory,
+            transcriber,
+        )
+
     temp_media_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         prefix=_WHISPER_TEMP_PREFIX,
         dir=str(temp_media_dir),
     ) as request_directory_name:
         request_directory = Path(request_directory_name).resolve()
-        try:
-            downloaded_path = audio_downloader.download(source_url, request_directory)
-        except _WhisperProviderTimeout:
-            raise
-        except _WhisperProviderFailure:
-            raise
-        except (Timeout, TimeoutError) as exc:
-            _log_acquisition_error("whisper provider timeout", "audio_download_timeout")
-            raise _WhisperProviderTimeout from exc
-
-        audio_path = _validate_audio_path(downloaded_path, request_directory)
-        audio_size_bytes = audio_path.stat().st_size
-        try:
-            result = transcriber.transcribe(audio_path)
-        except _WhisperProviderTimeout:
-            raise
-        except _WhisperProviderFailure:
-            raise
-        except (Timeout, TimeoutError) as exc:
-            _log_acquisition_error("whisper provider timeout", "transcription_timeout")
-            raise _WhisperProviderTimeout from exc
-
-        if (
-            not isinstance(result, WhisperResult)
-            or not isinstance(result.text, str)
-            or not isinstance(result.language, str)
-            or not result.language.strip()
-            or result.segment_count <= 0
-        ):
-            _log_acquisition_error(
-                "whisper provider error",
-                "invalid_transcription_result",
-            )
-            raise _WhisperProviderFailure
-        transcript_text = _normalize_segments((result.text,))
-        if not transcript_text:
-            _log_acquisition_error(
-                "whisper provider error",
-                "empty_transcription_result",
-            )
-            raise _WhisperProviderFailure
-
-        method = TranscriptMethod.WHISPER
-        logger.debug(
-            "transcript acquired",
-            extra={
-                "stage": "transcription",
-                "transcript_text": transcript_text,
-                "language": result.language,
-                "method": method.value,
-                "segment_count": result.segment_count,
-                "audio_path": str(audio_path),
-                "audio_size_bytes": audio_size_bytes,
-            },
+        downloaded_path = _download_audio(
+            source_url,
+            audio_downloader,
+            request_directory,
         )
-        return Transcript(
-            text=transcript_text,
-            language=result.language,
-            method=method,
+        return _transcribe_audio(downloaded_path, request_directory, transcriber)
+
+
+def _download_audio(
+    source_url: str,
+    audio_downloader: AudioDownloader,
+    request_directory: Path,
+) -> Path:
+    try:
+        return audio_downloader.download(source_url, request_directory)
+    except _WhisperProviderTimeout:
+        raise
+    except _WhisperProviderFailure:
+        raise
+    except (Timeout, TimeoutError) as exc:
+        _log_acquisition_error("whisper provider timeout", "audio_download_timeout")
+        raise _WhisperProviderTimeout from exc
+
+
+def _transcribe_audio(
+    downloaded_path: Path,
+    request_directory: Path,
+    transcriber: WhisperTranscriber,
+) -> Transcript:
+    audio_path = _validate_audio_path(downloaded_path, request_directory)
+    audio_size_bytes = audio_path.stat().st_size
+    try:
+        result = transcriber.transcribe(audio_path)
+    except _WhisperProviderTimeout:
+        raise
+    except _WhisperProviderFailure:
+        raise
+    except (Timeout, TimeoutError) as exc:
+        _log_acquisition_error("whisper provider timeout", "transcription_timeout")
+        raise _WhisperProviderTimeout from exc
+
+    if (
+        not isinstance(result, WhisperResult)
+        or not isinstance(result.text, str)
+        or not isinstance(result.language, str)
+        or not result.language.strip()
+        or result.segment_count <= 0
+    ):
+        _log_acquisition_error(
+            "whisper provider error",
+            "invalid_transcription_result",
         )
+        raise _WhisperProviderFailure
+    transcript_text = _normalize_segments((result.text,))
+    if not transcript_text:
+        _log_acquisition_error(
+            "whisper provider error",
+            "empty_transcription_result",
+        )
+        raise _WhisperProviderFailure
+
+    method = TranscriptMethod.WHISPER
+    logger.debug(
+        "transcript acquired",
+        extra={
+            "stage": "transcription",
+            "transcript_text": transcript_text,
+            "language": result.language,
+            "method": method.value,
+            "segment_count": result.segment_count,
+            "audio_path": str(audio_path),
+            "audio_size_bytes": audio_size_bytes,
+        },
+    )
+    return Transcript(
+        text=transcript_text,
+        language=result.language,
+        method=method,
+    )

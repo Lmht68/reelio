@@ -3,6 +3,8 @@
 from dataclasses import replace
 from typing import Final, Protocol
 
+from reelio.extraction.services.transcription.inspection import PreparedAudio
+from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
     Candidate,
     EnrichedMovie,
@@ -35,18 +37,24 @@ class Pipeline(Protocol):
 
 
 class _SourceMetadataInspector(Protocol):
-    """Inspect one submitted URL into a canonical Source."""
+    """Inspect one submitted URL into a Source and request-scoped resources."""
 
-    async def inspect(self, submitted_url: str) -> Source:
-        """Return validated Source metadata."""
+    async def inspect(self, submitted_url: str) -> InspectedSource:
+        """Return validated Source metadata and temporary inspection resources."""
         ...
 
 
 class _TranscriptAcquirer(Protocol):
     """Acquire a Transcript for one validated Source."""
 
-    async def acquire(self, source: Source, submitted_url: str) -> Transcript:
+    async def acquire(
+        self,
+        source: Source,
+        submitted_url: str,
+        prepared_audio: PreparedAudio | None = None,
+    ) -> Transcript:
         """Return a normalized Transcript using the validated submitted URL."""
+        ...
 
 
 class ExtractionPipeline:
@@ -78,9 +86,20 @@ class ExtractionPipeline:
         Raises:
             ExtractionError: If Source inspection or Transcript acquisition fails.
         """
-        source = await self._source_metadata_service.inspect(url)
-        transcript = await self._transcription_service.acquire(source, url)
-        return replace(_PLACEHOLDER_RESULT, source=source, transcript=transcript)
+        inspected = await self._source_metadata_service.inspect(url)
+        try:
+            transcript = await self._transcription_service.acquire(
+                inspected.source,
+                url,
+                inspected.prepared_audio,
+            )
+            return replace(
+                _PLACEHOLDER_RESULT,
+                source=inspected.source,
+                transcript=transcript,
+            )
+        finally:
+            inspected.cleanup()
 
 
 _PLACEHOLDER_RESULT: Final[PipelineResult] = PipelineResult(

@@ -30,6 +30,7 @@ from reelio.extraction.services.transcription.acquisition import (
     _WhisperProviderFailure,
 )
 from reelio.extraction.services.transcription.config import TranscriptionConfig
+from reelio.extraction.services.transcription.inspection import ExtractedMetadata
 from reelio.extraction.services.transcription.service import (
     SourceMetadataService,
     TranscriptionService,
@@ -62,15 +63,17 @@ class _MetadataExtractor:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def extract(self, canonical_url: str) -> dict[str, object]:
+    def extract(self, canonical_url: str) -> ExtractedMetadata:
         self.calls.append(canonical_url)
-        return {
-            "id": _VIDEO_ID,
-            "title": "Router test video",
-            "description": "A complete router test description.",
-            "channel": "Router test channel",
-            "duration": 42.2,
-        }
+        return ExtractedMetadata(
+            {
+                "id": _VIDEO_ID,
+                "title": "Router test video",
+                "description": "A complete router test description.",
+                "channel": "Router test channel",
+                "duration": 42.2,
+            }
+        )
 
 
 class _SocialMetadataExtractor:
@@ -81,9 +84,9 @@ class _SocialMetadataExtractor:
         self.metadata = metadata
         self.calls: list[str] = []
 
-    def extract(self, canonical_url: str) -> dict[str, object]:
+    def extract(self, canonical_url: str) -> ExtractedMetadata:
         self.calls.append(canonical_url)
-        return self.metadata
+        return ExtractedMetadata(self.metadata)
 
 
 def _settings() -> TranscriptionConfig:
