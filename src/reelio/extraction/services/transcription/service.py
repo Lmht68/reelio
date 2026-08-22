@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from requests.exceptions import RequestException, Timeout
-from yt_dlp.utils import YoutubeDLError  # type: ignore[import-untyped]
+from yt_dlp.utils import YoutubeDLError
 
 import reelio.extraction.services.transcription.acquisition as acquisition
 import reelio.extraction.services.transcription.inspection as inspection
@@ -160,12 +160,12 @@ class TranscriptionService:
         self._temp_media_dir = temp_media_dir
         self._semaphore = semaphore
 
-    async def acquire(self, source: Source) -> Transcript:
+    async def acquire(self, source: Source, submitted_url: str) -> Transcript:
         """Acquire a normalized Transcript for a validated Source.
 
         Args:
             source: Validated Source whose identity identifies provider data.
-
+            submitted_url: Validated URL supplied by the API caller.
         Returns:
             Transcript: Caption or Whisper text and acquisition metadata.
 
@@ -188,9 +188,12 @@ class TranscriptionService:
             if transcript is not None:
                 return transcript
 
+        download_url = (
+            submitted_url if source.platform is Platform.TIKTOK else source.url
+        )  # TikTok canonical URL does not work with yt-dlp audio download
         try:
             return await acquisition.acquire_whisper(
-                source,
+                download_url,
                 self._audio_downloader,
                 self._transcriber,
                 self._temp_media_dir,

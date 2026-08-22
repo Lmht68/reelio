@@ -45,10 +45,10 @@ class _FakeTranscriptionService:
     def __init__(self, transcript: Transcript, error: Exception | None = None) -> None:
         self.transcript = transcript
         self.error = error
-        self.calls: list[Source] = []
+        self.calls: list[tuple[Source, str]] = []
 
-    async def acquire(self, source: Source) -> Transcript:
-        self.calls.append(source)
+    async def acquire(self, source: Source, submitted_url: str) -> Transcript:
+        self.calls.append((source, submitted_url))
         if self.error is not None:
             raise self.error
         return self.transcript
@@ -87,7 +87,7 @@ async def test_pipeline_returns_real_source_and_transcript_with_placeholders() -
     assert result.source is source
     assert result.transcript is transcript
     assert metadata_service.calls == [_CANONICAL_URL]
-    assert transcription_service.calls == [source]
+    assert transcription_service.calls == [(source, _CANONICAL_URL)]
     assert [item.status for item in result.results] == [
         ResultStatus.RESOLVED,
         ResultStatus.AMBIGUOUS,
@@ -142,7 +142,7 @@ async def test_pipeline_is_platform_agnostic_for_social_whisper_sources() -> Non
     assert result.source is source
     assert result.transcript is transcript
     assert metadata_service.calls == [source.url]
-    assert transcription_service.calls == [source]
+    assert transcription_service.calls == [(source, source.url)]
 
 
 @pytest.mark.parametrize(
@@ -180,16 +180,14 @@ async def test_pipeline_propagates_transcription_errors_unchanged(
 ) -> None:
     """Propagate transcription domain errors without HTTP-layer translation."""
     metadata_service = _FakeSourceMetadataService(_source())
-    transcription_service = _FakeTranscriptionService(
-        _transcript(), error=transcription_error
-    )
+    transcription_service = _FakeTranscriptionService(_transcript(), error=transcription_error)
     pipeline = ExtractionPipeline(metadata_service, transcription_service)
 
     with pytest.raises(type(transcription_error)) as error:
         await pipeline.run(_CANONICAL_URL)
 
     assert error.value is transcription_error
-    assert transcription_service.calls == [_source()]
+    assert transcription_service.calls == [(_source(), _CANONICAL_URL)]
 
 
 async def test_pipeline_result_keeps_each_placeholder_result_branch() -> None:

@@ -118,12 +118,8 @@ def create_app(pipeline_factory: _PipelineFactory | None = None) -> FastAPI:
         title="Reelio API",
         version="0.1.0",
         default_response_class=JSONResponse,
-        openapi_url=(
-            "/openapi.json" if app_settings.environment in _DOCS_ENVIRONMENTS else None
-        ),
-        lifespan=(
-            lifespan if pipeline_factory is None else _lifespan_for(pipeline_factory)
-        ),
+        openapi_url=("/openapi.json" if app_settings.environment in _DOCS_ENVIRONMENTS else None),
+        lifespan=(lifespan if pipeline_factory is None else _lifespan_for(pipeline_factory)),
     )
     application.include_router(ops_router)
     application.include_router(extraction_router)

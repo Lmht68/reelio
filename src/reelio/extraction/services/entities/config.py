@@ -48,9 +48,7 @@ class LLMConfig(BaseSettings):
                 "REELIO_DEEPSEEK_API_KEY is required when REELIO_LLM_PROVIDER=deepseek"
             )
         if self.provider is LLMProviderName.OPENAI and self.openai_api_key is None:
-            raise ValueError(
-                "REELIO_OPENAI_API_KEY is required when REELIO_LLM_PROVIDER=openai"
-            )
+            raise ValueError("REELIO_OPENAI_API_KEY is required when REELIO_LLM_PROVIDER=openai")
         return self
 
 

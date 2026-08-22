@@ -45,9 +45,8 @@ class _SourceMetadataInspector(Protocol):
 class _TranscriptAcquirer(Protocol):
     """Acquire a Transcript for one validated Source."""
 
-    async def acquire(self, source: Source) -> Transcript:
-        """Return a normalized Transcript."""
-        ...
+    async def acquire(self, source: Source, submitted_url: str) -> Transcript:
+        """Return a normalized Transcript using the validated submitted URL."""
 
 
 class ExtractionPipeline:
@@ -80,7 +79,7 @@ class ExtractionPipeline:
             ExtractionError: If Source inspection or Transcript acquisition fails.
         """
         source = await self._source_metadata_service.inspect(url)
-        transcript = await self._transcription_service.acquire(source)
+        transcript = await self._transcription_service.acquire(source, url)
         return replace(_PLACEHOLDER_RESULT, source=source, transcript=transcript)
 
 
@@ -117,9 +116,7 @@ _PLACEHOLDER_RESULT: Final[PipelineResult] = PipelineResult(
                     "Paul Atreides unites with Chani and the Fremen while seeking "
                     "revenge against the conspirators who destroyed his family."
                 ),
-                poster_url=(
-                    "https://image.tmdb.org/t/p/w500/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg"
-                ),
+                poster_url=("https://image.tmdb.org/t/p/w500/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg"),
                 tmdb_id=693134,
                 tmdb_url="https://www.themoviedb.org/movie/693134",
                 imdb_id="tt15239678",
@@ -144,10 +141,7 @@ _PLACEHOLDER_RESULT: Final[PipelineResult] = PipelineResult(
                         "A gifted young man travels to the most dangerous planet "
                         "in the universe to secure his family's future."
                     ),
-                    poster_url=(
-                        "https://image.tmdb.org/t/p/w500/"
-                        "1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg"
-                    ),
+                    poster_url=("https://image.tmdb.org/t/p/w500/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg"),
                     tmdb_id=438631,
                     tmdb_url="https://www.themoviedb.org/movie/438631",
                     imdb_id="tt1160419",
@@ -163,10 +157,7 @@ _PLACEHOLDER_RESULT: Final[PipelineResult] = PipelineResult(
                         "A noble family becomes embroiled in a war for control of "
                         "a valuable desert planet."
                     ),
-                    poster_url=(
-                        "https://image.tmdb.org/t/p/w500/"
-                        "rK0ah8i2A4B5Yjz8b5dL5f4XQ3a.jpg"
-                    ),
+                    poster_url=("https://image.tmdb.org/t/p/w500/rK0ah8i2A4B5Yjz8b5dL5f4XQ3a.jpg"),
                     tmdb_id=841,
                     tmdb_url="https://www.themoviedb.org/movie/841",
                     imdb_id="tt0087182",

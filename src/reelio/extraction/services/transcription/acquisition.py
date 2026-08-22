@@ -9,19 +9,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Protocol, cast
 
-import ctranslate2  # type: ignore[import-untyped]
-import yt_dlp  # type: ignore[import-untyped]
-from faster_whisper import WhisperModel  # type: ignore[import-untyped]
+import ctranslate2
+import yt_dlp
+from faster_whisper import WhisperModel
 from requests.exceptions import RequestException, Timeout
 from youtube_transcript_api import (
     CouldNotRetrieveTranscript,
     YouTubeTranscriptApi,
 )
-from yt_dlp.utils import DownloadError, YoutubeDLError  # type: ignore[import-untyped]
+from yt_dlp.utils import DownloadError, YoutubeDLError
 
 from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.services.transcription.inspection import _is_timeout_exception
-from reelio.extraction.types import Source, Transcript, TranscriptMethod
+from reelio.extraction.types import Transcript, TranscriptMethod
 
 logger = logging.getLogger(__name__)
 
@@ -149,11 +149,11 @@ class WhisperResult:
 class AudioDownloader(Protocol):
     """Download one Source's native best-audio representation."""
 
-    def download(self, source: Source, destination: Path) -> Path:
+    def download(self, source_url: str, destination: Path) -> Path:
         """Download audio into the provided request directory.
 
         Args:
-            source: Canonical Source to download.
+            source_url: Validated provider URL to download.
             destination: Existing private request directory.
 
         Returns:
@@ -342,11 +342,11 @@ class _WhisperModel(Protocol):
 class YtDlpAudioDownloader:
     """Download native best audio into a private request directory."""
 
-    def download(self, source: Source, destination: Path) -> Path:
+    def download(self, source_url: str, destination: Path) -> Path:
         """Download one Source's native best-audio representation.
 
         Args:
-            source: Canonical Source to download.
+            source_url: Validated provider URL to download.
             destination: Existing private request directory.
 
         Returns:
@@ -363,11 +363,9 @@ class YtDlpAudioDownloader:
         }
         try:
             with yt_dlp.YoutubeDL(options) as youtube_dl:
-                raw_info = youtube_dl.extract_info(source.url, download=True)
+                raw_info = youtube_dl.extract_info(source_url, download=True)
                 if not isinstance(raw_info, Mapping) or "entries" in raw_info:
-                    _log_acquisition_error(
-                        "whisper provider error", "invalid_download_result"
-                    )
+                    _log_acquisition_error("whisper provider error", "invalid_download_result")
                     raise _WhisperProviderFailure
                 prepared_path = youtube_dl.prepare_filename(raw_info)
         except _WhisperProviderFailure:
@@ -379,14 +377,10 @@ class YtDlpAudioDownloader:
                     "audio_download_timeout",
                 )
                 raise _WhisperProviderTimeout from exc
-            _log_acquisition_error(
-                "whisper provider error", "audio_download_failed=DownloadError"
-            )
+            _log_acquisition_error("whisper provider error", "audio_download_failed=DownloadError")
             raise _WhisperProviderFailure from exc
         except YoutubeDLError as exc:
-            _log_acquisition_error(
-                "whisper provider error", "audio_download_failed=YoutubeDLError"
-            )
+            _log_acquisition_error("whisper provider error", "audio_download_failed=YoutubeDLError")
             raise _WhisperProviderFailure from exc
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             _log_acquisition_error("whisper provider error", "invalid_download_result")
@@ -491,9 +485,7 @@ def load_whisper_transcriber(
     """
     if settings.whisper_device == "cuda" and ctranslate2.get_cuda_device_count() == 0:
         _log_acquisition_error("whisper provider error", "cuda_device_unavailable")
-        raise RuntimeError(
-            "REELIO_WHISPER_DEVICE is 'cuda', but no CUDA device is available."
-        )
+        raise RuntimeError("REELIO_WHISPER_DEVICE is 'cuda', but no CUDA device is available.")
     model = WhisperModel(
         model_size_or_path=settings.whisper_model,
         device=settings.whisper_device,
@@ -635,7 +627,7 @@ def acquire_transcript(
 
 
 async def acquire_whisper(
-    source: Source,
+    source_url: str,
     audio_downloader: AudioDownloader,
     transcriber: WhisperTranscriber,
     temp_media_dir: Path,
@@ -644,7 +636,7 @@ async def acquire_whisper(
     """Run one complete Whisper operation under the shared semaphore.
 
     Args:
-        source: Validated Source whose canonical URL should be downloaded.
+        source_url: Validated provider URL whose audio should be downloaded.
         audio_downloader: Synchronous native-audio adapter.
         transcriber: Synchronous preloaded Whisper adapter.
         temp_media_dir: Root directory for request-scoped media.
@@ -663,7 +655,7 @@ async def acquire_whisper(
         worker = asyncio.create_task(
             asyncio.to_thread(
                 _acquire_whisper_sync,
-                source,
+                source_url,
                 audio_downloader,
                 transcriber,
                 temp_media_dir,
@@ -679,7 +671,7 @@ async def acquire_whisper(
 
 
 def _acquire_whisper_sync(
-    source: Source,
+    source_url: str,
     audio_downloader: AudioDownloader,
     transcriber: WhisperTranscriber,
     temp_media_dir: Path,
@@ -691,7 +683,7 @@ def _acquire_whisper_sync(
     ) as request_directory_name:
         request_directory = Path(request_directory_name).resolve()
         try:
-            downloaded_path = audio_downloader.download(source, request_directory)
+            downloaded_path = audio_downloader.download(source_url, request_directory)
         except _WhisperProviderTimeout:
             raise
         except _WhisperProviderFailure:

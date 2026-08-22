@@ -1,5 +1,7 @@
 """Deterministic tests for Transcript acquisition."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import tempfile
@@ -11,10 +13,10 @@ from types import SimpleNamespace, TracebackType
 from typing import ClassVar, cast
 
 import pytest
-import yt_dlp  # type: ignore[import-untyped]
+import yt_dlp
 from requests.exceptions import Timeout
 from youtube_transcript_api import CouldNotRetrieveTranscript
-from yt_dlp.utils import DownloadError  # type: ignore[import-untyped]
+from yt_dlp.utils import DownloadError
 
 import reelio.extraction.services.transcription.acquisition as acquisition_service
 from reelio.extraction.exceptions import PipelineTimeoutError, TranscriptionError
@@ -94,11 +96,9 @@ def _source() -> Source:
 
 async def test_caption_service_returns_selected_caption_track() -> None:
     """Return normalized text and metadata from an available caption track."""
-    provider = _FakeCaptionProvider(
-        [_FakeCaptionTrack("en", False, ["Hello", "world."])]
-    )
+    provider = _FakeCaptionProvider([_FakeCaptionTrack("en", False, ["Hello", "world."])])
 
-    transcript = await _transcription_service(provider).acquire(_source())
+    transcript = await _transcription_service(provider).acquire(_source(), _CANONICAL_URL)
 
     assert transcript == Transcript(
         text="Hello world.",
@@ -127,7 +127,7 @@ async def test_manual_exact_english_wins_regardless_of_provider_order() -> None:
     )
 
     transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
-        _source()
+        _source(), _CANONICAL_URL
     )
 
     assert transcript.language == "en"
@@ -143,7 +143,7 @@ async def test_manual_regional_english_wins_generated_exact_english() -> None:
     )
 
     transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
-        _source()
+        _source(), _CANONICAL_URL
     )
 
     assert transcript.language == "en-GB"
@@ -165,7 +165,7 @@ async def test_exact_english_wins_regional_english_within_track_kind(
     )
 
     transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
-        _source()
+        _source(), _CANONICAL_URL
     )
 
     assert transcript.language == expected_language
@@ -180,7 +180,7 @@ async def test_regional_english_preserves_provider_order() -> None:
     )
 
     transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
-        _source()
+        _source(), _CANONICAL_URL
     )
 
     assert transcript.language == "en-GB"
@@ -195,7 +195,7 @@ async def test_manual_other_language_wins_generated_other_language() -> None:
     )
 
     transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
-        _source()
+        _source(), _CANONICAL_URL
     )
 
     assert transcript.language == "de"
@@ -210,7 +210,7 @@ async def test_other_language_tracks_preserve_provider_order() -> None:
     )
 
     transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
-        _source()
+        _source(), _CANONICAL_URL
     )
 
     assert transcript.language == "fr"
@@ -227,7 +227,7 @@ async def test_english_classification_accepts_bcp47_regional_codes_only() -> Non
     )
 
     transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
-        _source()
+        _source(), _CANONICAL_URL
     )
 
     assert transcript.language == "en-CA"
@@ -242,7 +242,7 @@ async def test_failed_higher_ranked_track_falls_through() -> None:
     ]
 
     transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
-        _source()
+        _source(), _CANONICAL_URL
     )
 
     assert transcript.language == "de"
@@ -258,7 +258,7 @@ async def test_empty_higher_ranked_track_falls_through() -> None:
     ]
 
     transcript = await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
-        _source()
+        _source(), _CANONICAL_URL
     )
 
     assert transcript.language == "fr"
@@ -277,7 +277,7 @@ async def test_segment_whitespace_normalizes_to_plain_text() -> None:
         ]
     )
 
-    transcript = await _transcription_service(provider).acquire(_source())
+    transcript = await _transcription_service(provider).acquire(_source(), _CANONICAL_URL)
 
     assert transcript.text == "Hello world Ça va? déjà."
 
@@ -298,7 +298,9 @@ async def test_unusable_caption_tracks_raise_transcription_error(
         TranscriptionError,
         match=r"^Transcript is unavailable for this video\.$",
     ):
-        await _transcription_service(_FakeCaptionProvider(tracks)).acquire(_source())
+        await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
+            _source(), _CANONICAL_URL
+        )
 
 
 async def test_listing_timeout_falls_back_to_whisper(tmp_path: Path) -> None:
@@ -314,7 +316,7 @@ async def test_listing_timeout_falls_back_to_whisper(tmp_path: Path) -> None:
         audio_downloader=downloader,
         transcriber=transcriber,
         temp_media_dir=tmp_path,
-    ).acquire(_source())
+    ).acquire(_source(), _CANONICAL_URL)
 
     assert transcript.method is TranscriptMethod.WHISPER
     assert transcript.text == "Recovered speech."
@@ -338,7 +340,7 @@ async def test_track_timeout_stops_ranked_fallback_and_uses_whisper(
         audio_downloader=_FakeAudioDownloader(),
         transcriber=transcriber,
         temp_media_dir=tmp_path,
-    ).acquire(_source())
+    ).acquire(_source(), _CANONICAL_URL)
 
     assert transcript.method is TranscriptMethod.WHISPER
     assert [track.fetch_calls for track in tracks] == [1, 0]
@@ -348,16 +350,12 @@ async def test_successful_acquisition_logs_required_fields(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Log complete successful Transcript metadata at DEBUG."""
-    provider = _FakeCaptionProvider(
-        [_FakeCaptionTrack("en", False, ["Hello", "world."])]
-    )
+    provider = _FakeCaptionProvider([_FakeCaptionTrack("en", False, ["Hello", "world."])])
 
     with caplog.at_level(logging.DEBUG, logger=acquisition_service.__name__):
-        await _transcription_service(provider).acquire(_source())
+        await _transcription_service(provider).acquire(_source(), _CANONICAL_URL)
 
-    record = next(
-        item for item in caplog.records if item.getMessage() == "transcript acquired"
-    )
+    record = next(item for item in caplog.records if item.getMessage() == "transcript acquired")
     assert record.__dict__["stage"] == "transcription"
     assert record.__dict__["transcript_text"] == "Hello world."
     assert record.__dict__["language"] == "en"
@@ -378,15 +376,13 @@ async def test_failed_and_empty_tracks_do_not_log_success(
         caplog.at_level(logging.DEBUG, logger=acquisition_service.__name__),
         pytest.raises(TranscriptionError),
     ):
-        await _transcription_service(_FakeCaptionProvider(tracks)).acquire(_source())
+        await _transcription_service(_FakeCaptionProvider(tracks)).acquire(
+            _source(), _CANONICAL_URL
+        )
 
-    assert not any(
-        item.getMessage() == "transcript acquired" for item in caplog.records
-    )
+    assert not any(item.getMessage() == "transcript acquired" for item in caplog.records)
     unavailable_record = next(
-        item
-        for item in caplog.records
-        if item.getMessage() == "caption track unavailable"
+        item for item in caplog.records if item.getMessage() == "caption track unavailable"
     )
     assert unavailable_record.__dict__["reason"] == "track_fetch_failed"
 
@@ -415,18 +411,16 @@ async def test_caption_provider_log_identifies_failure_reason(
     """Log a stable reason while keeping provider details out of the event."""
     with (
         caplog.at_level(
-            logging.WARNING,
+            logging.DEBUG,
             logger=acquisition_service.__name__,
         ),
         pytest.raises(TranscriptionError),
     ):
-        await _transcription_service(
-            _FakeCaptionProvider([], error=provider_error)
-        ).acquire(_source())
+        await _transcription_service(_FakeCaptionProvider([], error=provider_error)).acquire(
+            _source(), _CANONICAL_URL
+        )
 
-    record = next(
-        item for item in caplog.records if item.getMessage() == expected_event
-    )
+    record = next(item for item in caplog.records if item.getMessage() == expected_event)
     assert record.__dict__["stage"] == "transcription"
     assert record.__dict__["reason"] == expected_reason
     assert str(provider_error) not in str(record.__dict__)
@@ -525,7 +519,7 @@ async def test_caption_listing_and_fetch_share_one_worker_thread(
     _install_caption_api(monkeypatch, [track])
 
     transcript = await _transcription_service(YouTubeCaptionProvider()).acquire(
-        _source()
+        _source(), _CANONICAL_URL
     )
 
     api = _FakeCaptionApi.instances[0]
@@ -581,7 +575,7 @@ async def test_caption_provider_failures_use_stable_transcription_error(
         TranscriptionError,
         match=r"^Transcript is unavailable for this video\.$",
     ) as error:
-        await _transcription_service(YouTubeCaptionProvider()).acquire(_source())
+        await _transcription_service(YouTubeCaptionProvider()).acquire(_source(), _CANONICAL_URL)
 
     assert _VIDEO_ID not in str(error.value)
     assert "malformed caption payload" not in str(error.value)
@@ -597,7 +591,7 @@ async def test_missing_caption_metadata_maps_to_stable_transcription_error(
         TranscriptionError,
         match=r"^Transcript is unavailable for this video\.$",
     ):
-        await _transcription_service(YouTubeCaptionProvider()).acquire(_source())
+        await _transcription_service(YouTubeCaptionProvider()).acquire(_source(), _CANONICAL_URL)
 
 
 async def test_malformed_caption_track_falls_through_to_valid_track(
@@ -613,7 +607,7 @@ async def test_malformed_caption_track_falls_through_to_valid_track(
     )
 
     transcript = await _transcription_service(YouTubeCaptionProvider()).acquire(
-        _source()
+        _source(), _CANONICAL_URL
     )
 
     assert transcript.text == "usable"
@@ -637,7 +631,7 @@ async def test_caption_provider_timeout_falls_back_to_whisper(
         audio_downloader=_FakeAudioDownloader(),
         transcriber=transcriber,
         temp_media_dir=tmp_path,
-    ).acquire(_source())
+    ).acquire(_source(), _CANONICAL_URL)
 
     assert transcript.method is TranscriptMethod.WHISPER
     assert transcript.text == "Recovered speech."
@@ -645,10 +639,10 @@ async def test_caption_provider_timeout_falls_back_to_whisper(
 
 class _FakeAudioDownloader:
     def __init__(self) -> None:
-        self.calls: list[tuple[Source, Path]] = []
+        self.calls: list[tuple[str, Path]] = []
 
-    def download(self, source: Source, destination: Path) -> Path:
-        self.calls.append((source, destination))
+    def download(self, source_url: str, destination: Path) -> Path:
+        self.calls.append((source_url, destination))
         audio_path = destination / "audio.webm"
         audio_path.write_bytes(b"audio")
         return audio_path
@@ -681,9 +675,7 @@ def _transcription_service(
         audio_downloader=(
             audio_downloader if audio_downloader is not None else _FakeAudioDownloader()
         ),
-        transcriber=(
-            transcriber if transcriber is not None else _UnavailableWhisperTranscriber()
-        ),
+        transcriber=(transcriber if transcriber is not None else _UnavailableWhisperTranscriber()),
         temp_media_dir=(
             temp_media_dir
             if temp_media_dir is not None
@@ -707,7 +699,7 @@ async def test_captionless_source_falls_back_to_whisper(tmp_path: Path) -> None:
         semaphore=asyncio.Semaphore(1),
     )
 
-    transcript = await service.acquire(_source())
+    transcript = await service.acquire(_source(), _CANONICAL_URL)
 
     assert transcript == Transcript(
         text="Hello from audio.",
@@ -719,13 +711,42 @@ async def test_captionless_source_falls_back_to_whisper(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+async def test_tiktok_whisper_download_uses_submitted_url(tmp_path: Path) -> None:
+    """Use the submitted TikTok URL instead of provider-normalized metadata."""
+    submitted_url = "https://vm.tiktok.com/ZMabcdef1/"
+    source = Source(
+        platform=Platform.TIKTOK,
+        video_id="1234567890123456789",
+        url=("https://www.tiktok.com/@normalized.creator/video/1234567890123456789"),
+        title="TikTok test video",
+        description="A TikTok source with a rewritten provider URL.",
+        channel="TikTok test channel",
+        duration_seconds=42,
+    )
+    downloader = _FakeAudioDownloader()
+    service = TranscriptionService(
+        provider=_FakeCaptionProvider([]),
+        audio_downloader=downloader,
+        transcriber=_FakeWhisperTranscriber(
+            WhisperResult(text="TikTok speech.", language="en", segment_count=1)
+        ),
+        temp_media_dir=tmp_path,
+        semaphore=asyncio.Semaphore(1),
+    )
+
+    transcript = await service.acquire(source, submitted_url)
+
+    assert transcript.method is TranscriptMethod.WHISPER
+    assert downloader.calls[0][0] == submitted_url
+
+
 class _TimeoutWhisperTranscriber:
     def transcribe(self, audio_path: Path) -> WhisperResult:
         raise Timeout("whisper timeout")
 
 
 class _PartialDownloadFailure:
-    def download(self, source: Source, destination: Path) -> Path:
+    def download(self, source_url: str, destination: Path) -> Path:
         partial_path = destination / "audio.part"
         partial_path.write_bytes(b"partial")
         raise _WhisperProviderFailure("download provider detail")
@@ -746,7 +767,7 @@ async def test_caption_timeout_then_whisper_failure_maps_to_502(
             audio_downloader=_FakeAudioDownloader(),
             transcriber=_UnavailableWhisperTranscriber(),
             temp_media_dir=tmp_path,
-        ).acquire(_source())
+        ).acquire(_source(), _CANONICAL_URL)
 
 
 async def test_caption_timeout_then_whisper_timeout_maps_to_504(
@@ -764,7 +785,7 @@ async def test_caption_timeout_then_whisper_timeout_maps_to_504(
             audio_downloader=_FakeAudioDownloader(),
             transcriber=_TimeoutWhisperTranscriber(),
             temp_media_dir=tmp_path,
-        ).acquire(_source())
+        ).acquire(_source(), _CANONICAL_URL)
 
 
 @pytest.mark.parametrize("text", ["", " \t\n"])
@@ -774,13 +795,11 @@ async def test_empty_whisper_output_maps_to_transcription_error(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Reject empty or whitespace-only Whisper output."""
-    transcriber = _FakeWhisperTranscriber(
-        WhisperResult(text=text, language="en", segment_count=1)
-    )
+    transcriber = _FakeWhisperTranscriber(WhisperResult(text=text, language="en", segment_count=1))
 
     with (
         caplog.at_level(
-            logging.WARNING,
+            logging.DEBUG,
             logger=acquisition_service.__name__,
         ),
         pytest.raises(
@@ -793,11 +812,9 @@ async def test_empty_whisper_output_maps_to_transcription_error(
             audio_downloader=_FakeAudioDownloader(),
             transcriber=transcriber,
             temp_media_dir=tmp_path,
-        ).acquire(_source())
+        ).acquire(_source(), _CANONICAL_URL)
 
-    record = next(
-        item for item in caplog.records if item.getMessage() == "whisper provider error"
-    )
+    record = next(item for item in caplog.records if item.getMessage() == "whisper provider error")
     assert record.__dict__["stage"] == "transcription"
     assert record.__dict__["reason"] == "empty_transcription_result"
 
@@ -819,7 +836,7 @@ async def test_zero_segment_whisper_output_maps_to_transcription_error(
             audio_downloader=_FakeAudioDownloader(),
             transcriber=transcriber,
             temp_media_dir=tmp_path,
-        ).acquire(_source())
+        ).acquire(_source(), _CANONICAL_URL)
 
 
 async def test_whisper_success_logs_audio_fields_and_cleans_media(
@@ -837,11 +854,9 @@ async def test_whisper_success_logs_audio_fields_and_cleans_media(
             audio_downloader=_FakeAudioDownloader(),
             transcriber=transcriber,
             temp_media_dir=tmp_path,
-        ).acquire(_source())
+        ).acquire(_source(), _CANONICAL_URL)
 
-    record = next(
-        item for item in caplog.records if item.getMessage() == "transcript acquired"
-    )
+    record = next(item for item in caplog.records if item.getMessage() == "transcript acquired")
     assert record.__dict__["transcript_text"] == "Hello from audio."
     assert record.__dict__["language"] == "en"
     assert record.__dict__["method"] == "whisper"
@@ -862,7 +877,7 @@ async def test_download_failure_removes_partial_request_media(tmp_path: Path) ->
             audio_downloader=_PartialDownloadFailure(),
             transcriber=_UnavailableWhisperTranscriber(),
             temp_media_dir=tmp_path,
-        ).acquire(_source())
+        ).acquire(_source(), _CANONICAL_URL)
 
     assert list(tmp_path.iterdir()) == []
 
@@ -878,7 +893,7 @@ async def test_transcription_failure_removes_completed_audio(tmp_path: Path) -> 
             audio_downloader=_FakeAudioDownloader(),
             transcriber=_UnavailableWhisperTranscriber(),
             temp_media_dir=tmp_path,
-        ).acquire(_source())
+        ).acquire(_source(), _CANONICAL_URL)
 
     assert list(tmp_path.iterdir()) == []
 
@@ -973,7 +988,7 @@ async def test_malformed_whisper_output_maps_to_transcription_error(
                 _transcription_settings(),
             ),
             temp_media_dir=tmp_path,
-        ).acquire(_source())
+        ).acquire(_source(), _CANONICAL_URL)
 
 
 class _FakeDownloadYoutubeDL:
@@ -1028,7 +1043,7 @@ def test_yt_dlp_audio_adapter_requests_native_audio_and_validates_path(
 
     monkeypatch.setattr(yt_dlp, "YoutubeDL", make_youtube_dl)
 
-    result = YtDlpAudioDownloader().download(_source(), request_directory)
+    result = YtDlpAudioDownloader().download(_CANONICAL_URL, request_directory)
 
     assert result == Path(prepared_path)
     assert fake.extract_calls == [(_CANONICAL_URL, True)]
@@ -1049,7 +1064,7 @@ def test_yt_dlp_audio_adapter_rejects_out_of_directory_path(
     monkeypatch.setattr(yt_dlp, "YoutubeDL", lambda options: fake)
 
     with pytest.raises(_WhisperProviderFailure):
-        YtDlpAudioDownloader().download(_source(), request_directory)
+        YtDlpAudioDownloader().download(_CANONICAL_URL, request_directory)
 
 
 def test_yt_dlp_audio_adapter_rejects_multi_entry_results(
@@ -1067,7 +1082,7 @@ def test_yt_dlp_audio_adapter_rejects_multi_entry_results(
     monkeypatch.setattr(yt_dlp, "YoutubeDL", lambda options: fake)
 
     with pytest.raises(_WhisperProviderFailure):
-        YtDlpAudioDownloader().download(_source(), request_directory)
+        YtDlpAudioDownloader().download(_CANONICAL_URL, request_directory)
 
 
 def test_yt_dlp_audio_adapter_preserves_typed_timeout(
@@ -1091,7 +1106,7 @@ def test_yt_dlp_audio_adapter_preserves_typed_timeout(
     monkeypatch.setattr(yt_dlp, "YoutubeDL", lambda options: fake)
 
     with pytest.raises(_WhisperProviderTimeout):
-        YtDlpAudioDownloader().download(_source(), request_directory)
+        YtDlpAudioDownloader().download(_CANONICAL_URL, request_directory)
 
 
 class _BlockingWhisperTranscriber:
@@ -1124,9 +1139,9 @@ async def test_whisper_fallback_queues_behind_one_semaphore(
         temp_media_dir=tmp_path,
     )
 
-    first = asyncio.create_task(service.acquire(_source()))
+    first = asyncio.create_task(service.acquire(_source(), _CANONICAL_URL))
     assert await asyncio.to_thread(transcriber.started.wait, 5)
-    second = asyncio.create_task(service.acquire(_source()))
+    second = asyncio.create_task(service.acquire(_source(), _CANONICAL_URL))
     await asyncio.sleep(0)
 
     assert len(transcriber.calls) == 1
@@ -1155,7 +1170,7 @@ async def test_cancellation_while_queued_starts_no_fallback(tmp_path: Path) -> N
         semaphore=semaphore,
     )
 
-    queued = asyncio.create_task(service.acquire(_source()))
+    queued = asyncio.create_task(service.acquire(_source(), _CANONICAL_URL))
     await asyncio.sleep(0)
     queued.cancel()
 
@@ -1179,7 +1194,7 @@ async def test_active_cancellation_waits_for_cleanup_before_next_worker(
         temp_media_dir=tmp_path,
     )
 
-    first = asyncio.create_task(service.acquire(_source()))
+    first = asyncio.create_task(service.acquire(_source(), _CANONICAL_URL))
     assert await asyncio.to_thread(transcriber.started.wait, 5)
     first.cancel()
     await asyncio.sleep(0)
@@ -1187,7 +1202,7 @@ async def test_active_cancellation_waits_for_cleanup_before_next_worker(
     assert not first.done()
     assert len(list(tmp_path.iterdir())) == 1
 
-    second = asyncio.create_task(service.acquire(_source()))
+    second = asyncio.create_task(service.acquire(_source(), _CANONICAL_URL))
     await asyncio.sleep(0)
     assert len(transcriber.calls) == 1
 
@@ -1229,9 +1244,7 @@ async def test_social_sources_bypass_captions_and_use_whisper(
 ) -> None:
     """Route every social Source directly to normalized Whisper acquisition."""
     source = _social_source(platform)
-    provider = _FakeCaptionProvider(
-        [_FakeCaptionTrack("en", False, ["must not be used"])]
-    )
+    provider = _FakeCaptionProvider([_FakeCaptionTrack("en", False, ["must not be used"])])
     downloader = _FakeAudioDownloader()
     transcriber = _FakeWhisperTranscriber(
         WhisperResult(text="  Social speech.  ", language="en", segment_count=1)
@@ -1242,7 +1255,7 @@ async def test_social_sources_bypass_captions_and_use_whisper(
         audio_downloader=downloader,
         transcriber=transcriber,
         temp_media_dir=tmp_path,
-    ).acquire(source)
+    ).acquire(source, source.url)
 
     assert transcript == Transcript(
         text="Social speech.",
@@ -1251,7 +1264,7 @@ async def test_social_sources_bypass_captions_and_use_whisper(
     )
     assert provider.calls == []
     assert len(downloader.calls) == 1
-    assert downloader.calls[0][0] == source
+    assert downloader.calls[0][0] == source.url
     assert len(transcriber.calls) == 1
 
 
@@ -1271,7 +1284,7 @@ async def test_social_success_logs_whisper_without_caption_event(
             audio_downloader=_FakeAudioDownloader(),
             transcriber=transcriber,
             temp_media_dir=tmp_path,
-        ).acquire(source)
+        ).acquire(source, source.url)
 
     messages = [record.getMessage() for record in caplog.records]
     assert "transcript acquired" in messages

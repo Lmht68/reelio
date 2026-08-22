@@ -45,9 +45,7 @@ def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.Movie:
 
 def _to_candidate_schema(candidate: Candidate) -> extraction_schemas.Candidate:
     movie_data = _to_movie_schema(candidate).model_dump()
-    return extraction_schemas.Candidate(
-        **movie_data, resolution_score=candidate.resolution_score
-    )
+    return extraction_schemas.Candidate(**movie_data, resolution_score=candidate.resolution_score)
 
 
 def _to_result_schema(result: MentionResult) -> extraction_schemas.Result:

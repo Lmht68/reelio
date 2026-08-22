@@ -91,9 +91,7 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert app_settings.environment is Environment.LOCAL
     assert app_settings.log_level == "INFO"
     assert transcription_settings.max_video_duration_seconds == 1800
-    assert (
-        transcription_settings.temp_media_dir == Path(tempfile.gettempdir()) / "reelio"
-    )
+    assert transcription_settings.temp_media_dir == Path(tempfile.gettempdir()) / "reelio"
     assert transcription_settings.whisper_model == "large-v3-turbo"
     assert transcription_settings.whisper_device == "cuda"
     assert transcription_settings.whisper_compute_type == "float16"

@@ -1,5 +1,7 @@
 """Deterministic tests for source validation and metadata acquisition."""
 
+from __future__ import annotations
+
 import logging
 import math
 from collections.abc import Callable, Mapping
@@ -8,9 +10,9 @@ from types import TracebackType
 from typing import cast
 
 import pytest
-import yt_dlp  # type: ignore[import-untyped]
+import yt_dlp
 from requests.exceptions import Timeout
-from yt_dlp.utils import DownloadError, YoutubeDLError  # type: ignore[import-untyped]
+from yt_dlp.utils import DownloadError, YoutubeDLError
 
 import reelio.extraction.services.transcription.inspection as transcription_inspection
 from reelio.extraction.exceptions import (
@@ -294,9 +296,7 @@ async def test_missing_duration_maps_to_metadata_provider_error() -> None:
     del metadata["duration"]
     extractor = _FakeExtractor(metadata)
 
-    with pytest.raises(
-        MetadataProviderError, match="Unable to retrieve source metadata"
-    ):
+    with pytest.raises(MetadataProviderError, match="Unable to retrieve source metadata"):
         await _service(extractor).inspect(_CANONICAL_URL)
 
 
@@ -441,9 +441,7 @@ def test_yt_dlp_adapter_rejects_non_mapping_results(
     fake_youtube_dl = _FakeYoutubeDL({}, ["not metadata"])
     _patch_youtube_dl(monkeypatch, fake_youtube_dl)
 
-    with pytest.raises(
-        MetadataProviderError, match="Unable to retrieve source metadata"
-    ):
+    with pytest.raises(MetadataProviderError, match="Unable to retrieve source metadata"):
         YtDlpMetadataExtractor().extract(_CANONICAL_URL)
 
 
@@ -468,18 +466,14 @@ async def test_metadata_provider_log_identifies_failure_reason(
 
     with (
         caplog.at_level(
-            logging.WARNING,
+            logging.DEBUG,
             logger=transcription_inspection.__name__,
         ),
         pytest.raises(MetadataProviderError),
     ):
         await _service(extractor).inspect(_CANONICAL_URL)
 
-    record = next(
-        item
-        for item in caplog.records
-        if item.getMessage() == "metadata provider error"
-    )
+    record = next(item for item in caplog.records if item.getMessage() == "metadata provider error")
     assert record.__dict__["stage"] == "transcription"
     assert record.__dict__["reason"] == expected_reason
 
@@ -511,7 +505,7 @@ async def test_inspection_error_log_identifies_failure_reason(
     """Log a stable reason for each public inspection error type."""
     with (
         caplog.at_level(
-            logging.WARNING,
+            logging.DEBUG,
             logger=transcription_inspection.__name__,
         ),
         pytest.raises(error_type),
@@ -540,9 +534,7 @@ async def test_debug_event_contains_normalized_source_fields(
         await _service(extractor).inspect(_CANONICAL_URL)
 
     record = next(
-        item
-        for item in caplog.records
-        if item.getMessage() == "source metadata normalized"
+        item for item in caplog.records if item.getMessage() == "source metadata normalized"
     )
     fields = record.__dict__
     assert fields["stage"] == "transcription"
@@ -570,9 +562,7 @@ async def test_debug_event_redacts_sensitive_submitted_query_values(
         await _service(extractor).inspect(submitted_url)
 
     record = next(
-        item
-        for item in caplog.records
-        if item.getMessage() == "source metadata normalized"
+        item for item in caplog.records if item.getMessage() == "source metadata normalized"
     )
     assert "secret-value" not in str(record.__dict__)
     assert "fragment-secret" not in str(record.__dict__)

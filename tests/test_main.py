@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from typing import cast
 
-import ctranslate2  # type: ignore[import-untyped]
+import ctranslate2
 import pytest
 from httpx import ASGITransport, AsyncClient
 

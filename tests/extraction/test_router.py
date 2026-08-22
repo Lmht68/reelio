@@ -398,13 +398,9 @@ async def test_concurrent_whisper_http_requests_queue_and_succeed(
     )
     _install_pipeline(app, pipeline)
 
-    first = asyncio.create_task(
-        client.post("/api/extract", json={"url": _CANONICAL_URL})
-    )
+    first = asyncio.create_task(client.post("/api/extract", json={"url": _CANONICAL_URL}))
     assert await asyncio.to_thread(transcriber.started.wait, 5)
-    second = asyncio.create_task(
-        client.post("/api/extract", json={"url": _CANONICAL_URL})
-    )
+    second = asyncio.create_task(client.post("/api/extract", json={"url": _CANONICAL_URL}))
     await asyncio.sleep(0)
 
     assert transcriber.calls == 1
@@ -463,9 +459,7 @@ async def test_extraction_errors_map_to_contract(
     )
 
     assert response.status_code == expected_status
-    assert response.json() == {
-        "error": {"code": expected_code, "message": str(exception)}
-    }
+    assert response.json() == {"error": {"code": expected_code, "message": str(exception)}}
 
 
 @pytest.mark.parametrize("payload", [{}, {"url": 123}, {"url": ""}])

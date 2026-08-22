@@ -11,9 +11,9 @@ from numbers import Real
 from typing import Final, Protocol, cast
 from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit, urlunsplit
 
-import yt_dlp  # type: ignore[import-untyped]
+import yt_dlp
 from requests.exceptions import Timeout
-from yt_dlp.utils import DownloadError  # type: ignore[import-untyped]
+from yt_dlp.utils import DownloadError
 
 from reelio.extraction.exceptions import (
     InvalidSourceError,
@@ -44,17 +44,13 @@ _YOUTUBE_HOSTS: Final[frozenset[str]] = frozenset(
         "youtu.be",
     }
 )
-_INSTAGRAM_HOSTS: Final[frozenset[str]] = frozenset(
-    {"instagram.com", "www.instagram.com"}
-)
+_INSTAGRAM_HOSTS: Final[frozenset[str]] = frozenset({"instagram.com", "www.instagram.com"})
 _FACEBOOK_HOSTS: Final[frozenset[str]] = frozenset(
     {"facebook.com", "www.facebook.com", "m.facebook.com"}
 )
 _FACEBOOK_SHORT_HOSTS: Final[frozenset[str]] = frozenset({"fb.watch"})
 _TIKTOK_HOSTS: Final[frozenset[str]] = frozenset({"www.tiktok.com"})
-_TIKTOK_SHORT_HOSTS: Final[frozenset[str]] = frozenset(
-    {"vm.tiktok.com", "vt.tiktok.com"}
-)
+_TIKTOK_SHORT_HOSTS: Final[frozenset[str]] = frozenset({"vm.tiktok.com", "vt.tiktok.com"})
 _X_HOSTS: Final[frozenset[str]] = frozenset(
     {
         "x.com",
@@ -84,9 +80,7 @@ _YOUTUBE_PATH_FORMS: Final[frozenset[str]] = frozenset({"shorts", "embed", "live
 _VIDEO_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_-]{11}")
 _SAFE_SEGMENT_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_-]+")
 _FACEBOOK_OWNER_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9._-]+")
-_FACEBOOK_ID_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"(?:[0-9]+|pfbid[A-Za-z0-9_-]+)"
-)
+_FACEBOOK_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?:[0-9]+|pfbid[A-Za-z0-9_-]+)")
 _TIKTOK_USER_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9._-]+")
 _TIKTOK_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9]+")
 _X_USER_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_]+")
@@ -146,7 +140,7 @@ _COLLECTION_TYPES: Final[frozenset[str]] = frozenset(
 _METADATA_YTDLP_OPTIONS: Final[dict[str, object]] = {
     "quiet": True,
     "no_warnings": True,
-    "noplaylist": True,
+    "noplaylist": False,
 }
 
 
@@ -545,11 +539,7 @@ def _tiktok_identity(host: str, path_segments: list[str]) -> str:
         if _TIKTOK_ID_PATTERN.fullmatch(path_segments[1]) is None:
             raise _invalid_source_error("invalid_tiktok_embed_id")
         return path_segments[1]
-    if (
-        len(path_segments) == 3
-        and path_segments[0].startswith("@")
-        and path_segments[1] == "video"
-    ):
+    if len(path_segments) == 3 and path_segments[0].startswith("@") and path_segments[1] == "video":
         user = path_segments[0][1:]
         video_id = path_segments[2]
         if _TIKTOK_USER_PATTERN.fullmatch(user) is None:
@@ -638,11 +628,7 @@ def _social_video_id(metadata: Mapping[str, object]) -> str:
     video_id = metadata.get("id", _MISSING)
     if video_id is _MISSING:
         raise _metadata_provider_error("missing_video_id")
-    if (
-        not isinstance(video_id, str)
-        or not video_id
-        or _contains_control_character(video_id)
-    ):
+    if not isinstance(video_id, str) or not video_id or _contains_control_character(video_id):
         raise _metadata_provider_error("invalid_video_id")
     return video_id
 
@@ -701,9 +687,7 @@ def _canonical_social_url(metadata: Mapping[str, object], platform: Platform) ->
         raise _invalid_source_error("cross_platform_redirect") from exc
     except InvalidSourceError:
         raise
-    return urlunsplit(
-        (parsed_url.scheme, parsed_url.netloc, parsed_url.path, parsed_url.query, "")
-    )
+    return urlunsplit((parsed_url.scheme, parsed_url.netloc, parsed_url.path, parsed_url.query, ""))
 
 
 def _platform_hosts(platform: Platform) -> frozenset[str]:
@@ -748,9 +732,7 @@ def _normalize_duration(metadata: Mapping[str, object]) -> int:
     duration_value = metadata.get("duration", _MISSING)
     if duration_value is _MISSING:
         raise _metadata_provider_error("missing_duration")
-    if isinstance(duration_value, bool) or not isinstance(
-        duration_value, (Real, Decimal)
-    ):
+    if isinstance(duration_value, bool) or not isinstance(duration_value, (Real, Decimal)):
         raise _metadata_provider_error("invalid_duration_type")
     try:
         if duration_value < 0:
@@ -766,9 +748,7 @@ def _validate_social_formats(metadata: Mapping[str, object]) -> None:
     formats = metadata.get("formats", _MISSING)
     if formats is _MISSING:
         raise _metadata_provider_error("missing_formats")
-    if not isinstance(formats, Sequence) or isinstance(
-        formats, (str, bytes, bytearray)
-    ):
+    if not isinstance(formats, Sequence) or isinstance(formats, (str, bytes, bytearray)):
         raise _metadata_provider_error("invalid_formats")
     if not formats:
         raise _invalid_source_error("empty_formats")
@@ -803,9 +783,7 @@ def _contains_malformed_percent_encoding(value: str) -> bool:
             continue
         if index + 2 >= len(value):
             return True
-        if not all(
-            digit in "0123456789abcdefABCDEF" for digit in value[index + 1 : index + 3]
-        ):
+        if not all(digit in "0123456789abcdefABCDEF" for digit in value[index + 1 : index + 3]):
             return True
     return False
 
