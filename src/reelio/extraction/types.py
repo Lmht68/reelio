@@ -1,7 +1,33 @@
 """Domain types shared by extraction services and the API adapter."""
 
+import unicodedata
 from dataclasses import dataclass
+from datetime import date
 from enum import StrEnum
+
+_MAX_FUTURE_RELEASE_YEARS = 2
+
+
+def maximum_movie_release_year() -> int:
+    """Return the latest accepted Movie Release Year.
+
+    Returns:
+        int: Current year plus the two-year confirmed-forthcoming horizon.
+    """
+    return date.today().year + _MAX_FUTURE_RELEASE_YEARS
+
+
+def normalize_movie_title(title: str) -> str:
+    """Produce the domain comparison form for a Canonical Movie Title.
+
+    Args:
+        title: Canonical or provider-backed title to normalize.
+
+    Returns:
+        str: NFC-normalized title with leading, trailing, and repeated
+        whitespace removed.
+    """
+    return " ".join(unicodedata.normalize("NFC", title).split())
 
 
 class Platform(StrEnum):
@@ -68,11 +94,11 @@ class Transcript:
 
 @dataclass
 class MovieMention:
-    """Contain the title and release year of a movie mention interpreted from a transcript.
+    """Contain a Movie Mention interpreted from complete Interpretation Material.
 
     Attributes:
-        title: Canonical movie title.
-        year: Release year.
+        title: Canonical Movie Title.
+        year: Movie Release Year.
     """
 
     title: str
@@ -113,9 +139,9 @@ class MentionResult:
     """Represent one interpreted mention and its resolution outcome.
 
     Attributes:
-        status: Resolution outcome for the mention.
-        movie_mention: Title and release year of the interpreted mention.
-        movie: Resolved movie, or ``None`` when no unique movie was selected.
+        status: Current resolution state of the Movie Mention.
+        movie_mention: Canonical title and Movie Release Year.
+        movie: Enriched Entity, or ``None`` before resolution or after no match.
     """
 
     status: ResultStatus

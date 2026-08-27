@@ -18,7 +18,7 @@ from reelio.extraction.service import ExtractionPipeline
 from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
-    MentionResult,
+    MovieMention,
     Platform,
     ResultStatus,
     Source,
@@ -68,6 +68,43 @@ class _FakeTranscriptionService:
         return self.transcript
 
 
+class _FakeInterpretationService:
+    def __init__(
+        self,
+        movie_mentions: list[MovieMention] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.movie_mentions = [] if movie_mentions is None else movie_mentions
+        self.error = error
+        self.calls: list[tuple[Source, Transcript]] = []
+        self.closed = False
+
+    async def interpret(
+        self,
+        source: Source,
+        transcript: Transcript,
+    ) -> list[MovieMention]:
+        self.calls.append((source, transcript))
+        if self.error is not None:
+            raise self.error
+        return self.movie_mentions
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _pipeline(
+    metadata_service: _FakeSourceMetadataService,
+    transcription_service: _FakeTranscriptionService,
+    interpretation_service: _FakeInterpretationService | None = None,
+) -> ExtractionPipeline:
+    return ExtractionPipeline(
+        metadata_service,
+        transcription_service,
+        interpretation_service or _FakeInterpretationService(),
+    )
+
+
 def _source() -> Source:
     return Source(
         platform=Platform.YOUTUBE,
@@ -88,13 +125,24 @@ def _transcript() -> Transcript:
     )
 
 
-async def test_pipeline_returns_real_source_and_transcript_with_placeholders() -> None:
-    """Combine inspected Source and acquired Transcript with placeholder results."""
+async def test_pipeline_integrates_fake_movie_interpretation_results() -> None:
+    """Combine Source, Transcript, and fake Movie Mentions as Unresolved Results."""
     source = _source()
     transcript = _transcript()
     metadata_service = _FakeSourceMetadataService(source)
     transcription_service = _FakeTranscriptionService(transcript)
-    pipeline = ExtractionPipeline(metadata_service, transcription_service)
+    interpretation_service = _FakeInterpretationService(
+        [
+            MovieMention(title="Dune: Part One", year=2021),
+            MovieMention(title="Che: Part One", year=2008),
+            MovieMention(title="Che: Part Two", year=2008),
+        ]
+    )
+    pipeline = _pipeline(
+        metadata_service,
+        transcription_service,
+        interpretation_service,
+    )
 
     result = await pipeline.run(_CANONICAL_URL)
 
@@ -102,15 +150,10 @@ async def test_pipeline_returns_real_source_and_transcript_with_placeholders() -
     assert result.transcript is transcript
     assert metadata_service.calls == [_CANONICAL_URL]
     assert transcription_service.calls == [(source, _CANONICAL_URL)]
-    assert [item.status for item in result.results] == [
-        ResultStatus.RESOLVED,
-        ResultStatus.UNRESOLVED,
-    ]
-    assert result.results[0].movie_mention.title == "Dune: Part Two"
-    assert result.results[0].movie is not None
-    assert result.results[0].movie.title == "Dune: Part Two"
-    assert result.results[1].movie_mention.title == "Che"
-    assert result.results[1].movie is None
+    assert interpretation_service.calls == [(source, transcript)]
+    assert [item.status for item in result.results] == [ResultStatus.UNRESOLVED] * 3
+    assert [item.movie_mention for item in result.results] == interpretation_service.movie_mentions
+    assert all(item.movie is None for item in result.results)
 
 
 async def test_pipeline_preserves_whisper_transcript_method() -> None:
@@ -120,7 +163,7 @@ async def test_pipeline_preserves_whisper_transcript_method() -> None:
         language="en",
         method=TranscriptMethod.WHISPER,
     )
-    pipeline = ExtractionPipeline(
+    pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(transcript),
     )
@@ -149,7 +192,7 @@ async def test_pipeline_is_platform_agnostic_for_social_whisper_sources() -> Non
     )
     metadata_service = _FakeSourceMetadataService(source)
     transcription_service = _FakeTranscriptionService(transcript)
-    pipeline = ExtractionPipeline(metadata_service, transcription_service)
+    pipeline = _pipeline(metadata_service, transcription_service)
 
     result = await pipeline.run(source.url)
 
@@ -173,7 +216,7 @@ async def test_pipeline_does_not_acquire_transcript_after_source_rejection(
     """Stop before transcription when Source inspection rejects the input."""
     metadata_service = _FakeSourceMetadataService(error=source_error)
     transcription_service = _FakeTranscriptionService(_transcript())
-    pipeline = ExtractionPipeline(metadata_service, transcription_service)
+    pipeline = _pipeline(metadata_service, transcription_service)
 
     with pytest.raises(type(source_error)) as error:
         await pipeline.run(_CANONICAL_URL)
@@ -195,7 +238,7 @@ async def test_pipeline_propagates_transcription_errors_unchanged(
     """Propagate transcription domain errors without HTTP-layer translation."""
     metadata_service = _FakeSourceMetadataService(_source())
     transcription_service = _FakeTranscriptionService(_transcript(), error=transcription_error)
-    pipeline = ExtractionPipeline(metadata_service, transcription_service)
+    pipeline = _pipeline(metadata_service, transcription_service)
 
     with pytest.raises(type(transcription_error)) as error:
         await pipeline.run(_CANONICAL_URL)
@@ -204,21 +247,18 @@ async def test_pipeline_propagates_transcription_errors_unchanged(
     assert transcription_service.calls == [(_source(), _CANONICAL_URL)]
 
 
-async def test_pipeline_result_keeps_resolved_and_unresolved_placeholder_results() -> None:
-    """Keep the existing resolved and unresolved placeholder result shapes."""
-    pipeline = ExtractionPipeline(
+async def test_pipeline_closes_interpretation_service() -> None:
+    """Delegate lifespan cleanup to the Movie Mention interpretation service."""
+    interpretation_service = _FakeInterpretationService()
+    pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
+        interpretation_service,
     )
 
-    result = await pipeline.run(_CANONICAL_URL)
+    await pipeline.aclose()
 
-    resolved, unresolved = result.results
-    assert isinstance(resolved, MentionResult)
-    assert resolved.movie_mention.title == "Dune: Part Two"
-    assert resolved.movie is not None
-    assert unresolved.movie_mention.title == "Che"
-    assert unresolved.movie is None
+    assert interpretation_service.closed is True
 
 
 @pytest.mark.parametrize(
@@ -242,7 +282,7 @@ async def test_pipeline_cleans_inspection_audio_after_transcript_stage(
         _transcript(),
         error=transcription_error,
     )
-    pipeline = ExtractionPipeline(metadata_service, transcription_service)
+    pipeline = _pipeline(metadata_service, transcription_service)
 
     if transcription_error is None:
         await pipeline.run(_CANONICAL_URL)
@@ -264,7 +304,7 @@ async def test_pipeline_preserves_transcription_error_when_cleanup_fails(
     audio_path = request_directory / "audio.m4a"
     audio_path.write_bytes(b"audio")
     transcription_error = TranscriptionError("Transcript is unavailable for this video.")
-    pipeline = ExtractionPipeline(
+    pipeline = _pipeline(
         _FakeSourceMetadataService(
             _source(),
             prepared_audio=PreparedAudio(audio_path, request_directory),

@@ -351,7 +351,7 @@ async def test_track_timeout_stops_ranked_fallback_and_uses_whisper(
 async def test_successful_acquisition_logs_required_fields(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Log complete successful Transcript metadata at DEBUG."""
+    """Log successful Transcript metadata without logging its complete text."""
     provider = _FakeCaptionProvider([_FakeCaptionTrack("en", False, ["Hello", "world."])])
 
     with caplog.at_level(logging.DEBUG, logger=acquisition_service.__name__):
@@ -359,7 +359,8 @@ async def test_successful_acquisition_logs_required_fields(
 
     record = next(item for item in caplog.records if item.getMessage() == "transcript acquired")
     assert record.__dict__["stage"] == "transcription"
-    assert record.__dict__["transcript_text"] == "Hello world."
+    assert "transcript_text" not in record.__dict__
+    assert "Hello world." not in caplog.text
     assert record.__dict__["language"] == "en"
     assert record.__dict__["method"] == "youtube_captions"
     assert record.__dict__["segment_count"] == 2
@@ -908,7 +909,7 @@ async def test_whisper_success_logs_audio_fields_and_cleans_media(
     caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
 ) -> None:
-    """Log the complete Whisper acquisition record before cleanup."""
+    """Log the Whisper acquisition record without logging its complete text."""
     transcriber = _FakeWhisperTranscriber(
         WhisperResult(text="Hello from audio.", language="en", segment_count=2)
     )
@@ -922,7 +923,8 @@ async def test_whisper_success_logs_audio_fields_and_cleans_media(
         ).acquire(_source(), _CANONICAL_URL)
 
     record = next(item for item in caplog.records if item.getMessage() == "transcript acquired")
-    assert record.__dict__["transcript_text"] == "Hello from audio."
+    assert "transcript_text" not in record.__dict__
+    assert "Hello from audio." not in caplog.text
     assert record.__dict__["language"] == "en"
     assert record.__dict__["method"] == "whisper"
     assert record.__dict__["segment_count"] == 2

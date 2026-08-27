@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings
 
 from reelio.config import AppConfig, Environment
 from reelio.extraction.services.enrichment.config import TMDBConfig
-from reelio.extraction.services.entities.config import LLMConfig, LLMProviderName
+from reelio.extraction.services.interpretation.config import InterpretationConfig
 from reelio.extraction.services.transcription.config import TranscriptionConfig
 
 
@@ -32,34 +32,19 @@ def test_tmdb_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
         _without_dotenv(TMDBConfig)
 
 
-def test_deepseek_provider_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Require the active DeepSeek key for the default provider."""
+def test_deepseek_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Require a DeepSeek key for Movie Mention interpretation."""
     monkeypatch.delenv("REELIO_DEEPSEEK_API_KEY", raising=False)
-    monkeypatch.delenv("REELIO_LLM_PROVIDER", raising=False)
 
     with pytest.raises(ValidationError, match="REELIO_DEEPSEEK_API_KEY"):
-        _without_dotenv(LLMConfig)
+        _without_dotenv(InterpretationConfig)
 
 
-def test_openai_provider_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Require the active OpenAI key when OpenAI is selected."""
-    monkeypatch.delenv("REELIO_DEEPSEEK_API_KEY", raising=False)
-    monkeypatch.delenv("REELIO_OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("REELIO_LLM_PROVIDER", raising=False)
-
-    with pytest.raises(ValidationError, match="REELIO_OPENAI_API_KEY"):
-        _without_dotenv(LLMConfig, provider=LLMProviderName.OPENAI)
-
-
-def test_inactive_provider_key_is_optional(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Allow an inactive provider key to be absent."""
-    monkeypatch.delenv("REELIO_OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("REELIO_LLM_PROVIDER", raising=False)
-
-    settings = _without_dotenv(LLMConfig, deepseek_api_key="x")
-
-    assert settings.provider is LLMProviderName.DEEPSEEK
-    assert settings.openai_api_key is None
+@pytest.mark.parametrize("api_key", ["", "   "])
+def test_deepseek_rejects_blank_api_key(api_key: str) -> None:
+    """Reject empty and whitespace-only DeepSeek credentials."""
+    with pytest.raises(ValidationError, match="must not be blank"):
+        _without_dotenv(InterpretationConfig, deepseek_api_key=api_key)
 
 
 def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -72,20 +57,25 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         "REELIO_WHISPER_MODEL",
         "REELIO_WHISPER_DEVICE",
         "REELIO_WHISPER_COMPUTE_TYPE",
-        "REELIO_LLM_PROVIDER",
         "REELIO_DEEPSEEK_BASE_URL",
         "REELIO_DEEPSEEK_MODEL",
-        "REELIO_OPENAI_API_KEY",
-        "REELIO_OPENAI_MODEL",
-        "REELIO_MAX_TRANSCRIPT_CHARS",
+        "REELIO_DEEPSEEK_REQUEST_TIMEOUT_SECONDS",
+        "REELIO_DEEPSEEK_TEMPERATURE",
+        "REELIO_DEEPSEEK_MAX_OUTPUT_TOKENS",
+        "REELIO_MAX_SOURCE_TITLE_CHARS",
         "REELIO_MAX_DESCRIPTION_CHARS",
+        "REELIO_MAX_TRANSCRIPT_LANGUAGE_CHARS",
+        "REELIO_MAX_TRANSCRIPT_CHARS",
         "REELIO_TMDB_BASE_URL",
     ):
         monkeypatch.delenv(variable, raising=False)
 
     app_settings = _without_dotenv(AppConfig)
     transcription_settings = _without_dotenv(TranscriptionConfig)
-    llm_settings = _without_dotenv(LLMConfig, deepseek_api_key="x")
+    interpretation_settings = _without_dotenv(
+        InterpretationConfig,
+        deepseek_api_key="x",
+    )
     tmdb_settings = _without_dotenv(TMDBConfig, api_key="x")
 
     assert app_settings.environment is Environment.LOCAL
@@ -100,10 +90,15 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert transcription_settings.whisper_temperature == 0.0
     assert transcription_settings.whisper_cond_on_prev_txt is True
     assert transcription_settings.whisper_initial_prompt == ""
-    assert llm_settings.deepseek_model == "deepseek-v4-flash"
-    assert llm_settings.openai_model == "gpt-4o-mini"
-    assert llm_settings.max_transcript_chars == 100_000
-    assert llm_settings.max_description_chars == 2_000
+    assert interpretation_settings.deepseek_base_url == "https://api.deepseek.com"
+    assert interpretation_settings.deepseek_model == "deepseek-v4-flash"
+    assert interpretation_settings.deepseek_request_timeout_seconds == 60.0
+    assert interpretation_settings.deepseek_temperature == 0.0
+    assert interpretation_settings.deepseek_max_output_tokens == 8_192
+    assert interpretation_settings.max_source_title_chars == 500
+    assert interpretation_settings.max_description_chars == 2_000
+    assert interpretation_settings.max_transcript_language_chars == 64
+    assert interpretation_settings.max_transcript_chars == 100_000
     assert tmdb_settings.base_url == "https://api.themoviedb.org/3"
 
 
@@ -137,12 +132,25 @@ def test_whisper_transcription_environment_overrides(
     assert settings.whisper_initial_prompt == "Use proper names."
 
 
-def test_invalid_provider_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Reject provider names outside the supported enum."""
-    monkeypatch.setenv("REELIO_LLM_PROVIDER", "anthropic")
+def test_deepseek_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Parse DeepSeek request and Interpretation Material limits."""
+    monkeypatch.setenv("REELIO_DEEPSEEK_REQUEST_TIMEOUT_SECONDS", "12.5")
+    monkeypatch.setenv("REELIO_DEEPSEEK_TEMPERATURE", "0.1")
+    monkeypatch.setenv("REELIO_DEEPSEEK_MAX_OUTPUT_TOKENS", "4096")
+    monkeypatch.setenv("REELIO_MAX_SOURCE_TITLE_CHARS", "100")
+    monkeypatch.setenv("REELIO_MAX_DESCRIPTION_CHARS", "1000")
+    monkeypatch.setenv("REELIO_MAX_TRANSCRIPT_LANGUAGE_CHARS", "20")
+    monkeypatch.setenv("REELIO_MAX_TRANSCRIPT_CHARS", "50000")
 
-    with pytest.raises(ValidationError):
-        _without_dotenv(LLMConfig, deepseek_api_key="x")
+    settings = _without_dotenv(InterpretationConfig, deepseek_api_key="x")
+
+    assert settings.deepseek_request_timeout_seconds == 12.5
+    assert settings.deepseek_temperature == 0.1
+    assert settings.deepseek_max_output_tokens == 4_096
+    assert settings.max_source_title_chars == 100
+    assert settings.max_description_chars == 1_000
+    assert settings.max_transcript_language_chars == 20
+    assert settings.max_transcript_chars == 50_000
 
 
 def test_invalid_log_level_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:

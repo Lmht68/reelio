@@ -784,7 +784,7 @@ async def test_inspection_error_log_identifies_failure_reason(
 async def test_debug_event_contains_normalized_source_fields(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Record normalized Source fields as structured DEBUG attributes."""
+    """Record normalized Source sizes without logging untrusted metadata text."""
     extractor = _FakeExtractor(
         _metadata(
             title="Logged title",
@@ -806,12 +806,15 @@ async def test_debug_event_contains_normalized_source_fields(
     assert fields["platform"] == "youtube"
     assert fields["video_id"] == _VIDEO_ID
     assert fields["canonical_url"] == _CANONICAL_URL
-    assert fields["title"] == "[REDACTED]"
+    assert "title" not in fields
     assert fields["title_length"] == len("Logged title")
-    assert fields["description"] == "[REDACTED]"
+    assert "description" not in fields
     assert fields["description_length"] == len("Logged description")
-    assert fields["channel"] == "[REDACTED]"
+    assert "channel" not in fields
     assert fields["channel_length"] == len("Logged channel")
+    assert "Logged title" not in caplog.text
+    assert "Logged description" not in caplog.text
+    assert "Logged channel" not in caplog.text
     assert fields["duration_seconds"] == 13
 
 

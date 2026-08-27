@@ -51,13 +51,10 @@ def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.MovieModel:
 
 
 def _to_result_schema(result: MentionResult) -> extraction_schemas.ResultModel:
-    movie_mention = (
-        _to_movie_mention_schema(result.movie_mention) if result.movie_mention is not None else None
-    )
     movie = _to_movie_schema(result.movie) if result.movie is not None else None
     return extraction_schemas.ResultModel(
         status=result.status,
-        movie_mention=movie_mention,
+        movie_mention=_to_movie_mention_schema(result.movie_mention),
         movie=movie,
     )
 
@@ -103,7 +100,7 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         },
         413: {
             "model": extraction_schemas.ErrorResponse,
-            "description": "Source exceeds the duration limit.",
+            "description": "Source duration or Interpretation Material exceeds its limit.",
         },
         500: {
             "model": extraction_schemas.ErrorResponse,

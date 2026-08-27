@@ -49,6 +49,13 @@ class DurationLimitExceededError(ExtractionError):
     status_code = 413
 
 
+class InterpretationInputTooLargeError(ExtractionError):
+    """Indicate that Interpretation Material exceeds a configured limit."""
+
+    code = "interpretation_input_too_large"
+    status_code = 413
+
+
 class MetadataProviderError(ExtractionError):
     """Indicate that source metadata could not be retrieved or normalized."""
 
@@ -63,11 +70,17 @@ class TranscriptionError(ExtractionError):
     status_code = 502
 
 
-class EntityExtractionError(ExtractionError):
-    """Indicate that mention interpretation failed."""
+class MovieMentionInterpretationError(ExtractionError):
+    """Indicate that Movie Mention interpretation failed."""
 
-    code = "entity_extraction_failed"
+    code = "movie_mention_interpretation_failed"
     status_code = 502
+
+
+class InvalidLLMResponseError(MovieMentionInterpretationError):
+    """Indicate that the LLM returned malformed or invalid structured output."""
+
+    code = "invalid_llm_response"
 
 
 class EnrichmentError(ExtractionError):

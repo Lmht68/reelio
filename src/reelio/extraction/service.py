@@ -1,20 +1,16 @@
-"""Orchestrate source inspection, transcription, and placeholder result stages."""
+"""Orchestrate Source inspection, transcription, and Movie Mention interpretation."""
 
-from dataclasses import replace
-from typing import Final, Protocol
+from typing import Protocol
 
 from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
-    EnrichedMovie,
     MentionResult,
     MovieMention,
     PipelineResult,
-    Platform,
     ResultStatus,
     Source,
     Transcript,
-    TranscriptMethod,
 )
 
 
@@ -33,6 +29,10 @@ class ExtractionPipelineProtocol(Protocol):
         Raises:
             ExtractionError: If a pipeline stage fails with a domain error.
         """
+        ...
+
+    async def aclose(self) -> None:
+        """Release lifespan-owned pipeline resources."""
         ...
 
 
@@ -57,34 +57,53 @@ class _TranscriptAcquirer(Protocol):
         ...
 
 
+class _MovieMentionInterpreter(Protocol):
+    """Interpret ordered Movie Mentions from one Source and Transcript."""
+
+    async def interpret(
+        self,
+        source: Source,
+        transcript: Transcript,
+    ) -> list[MovieMention]:
+        """Return canonical Movie Mentions in first-reference order."""
+        ...
+
+    async def aclose(self) -> None:
+        """Release interpretation provider resources."""
+        ...
+
+
 class ExtractionPipeline:
-    """Orchestrate implemented stages while later results remain placeholders."""
+    """Orchestrate the implemented movie extraction stages."""
 
     def __init__(
         self,
         source_metadata_service: _SourceMetadataInspector,
         transcription_service: _TranscriptAcquirer,
+        interpretation_service: _MovieMentionInterpreter,
     ) -> None:
         """Initialize the pipeline with explicit stage services.
 
         Args:
             source_metadata_service: Service that validates and inspects Sources.
             transcription_service: Service that acquires Transcripts.
+            interpretation_service: Service that interprets Movie Mentions.
         """
         self._source_metadata_service = source_metadata_service
         self._transcription_service = transcription_service
+        self._interpretation_service = interpretation_service
 
     async def run(self, url: str) -> PipelineResult:
-        """Inspect the Source, acquire its Transcript, and retain placeholders.
+        """Inspect a Source, acquire its Transcript, and interpret Movie Mentions.
 
         Args:
             url: Source URL submitted by the API caller.
 
         Returns:
-            PipelineResult: Real Source and Transcript with placeholder results.
+            PipelineResult: Source, Transcript, and Unresolved Results.
 
         Raises:
-            ExtractionError: If Source inspection or Transcript acquisition fails.
+            ExtractionError: If any pipeline stage fails with a domain error.
         """
         inspected = await self._source_metadata_service.inspect(url)
         try:
@@ -93,56 +112,26 @@ class ExtractionPipeline:
                 url,
                 inspected.prepared_audio,
             )
-            return replace(
-                _PLACEHOLDER_RESULT,
-                source=inspected.source,
-                transcript=transcript,
-            )
         finally:
             inspected.cleanup()
 
+        movie_mentions = await self._interpretation_service.interpret(
+            inspected.source,
+            transcript,
+        )
+        return PipelineResult(
+            source=inspected.source,
+            transcript=transcript,
+            results=[
+                MentionResult(
+                    status=ResultStatus.UNRESOLVED,
+                    movie_mention=movie_mention,
+                    movie=None,
+                )
+                for movie_mention in movie_mentions
+            ],
+        )
 
-_PLACEHOLDER_RESULT: Final[PipelineResult] = PipelineResult(
-    source=Source(
-        platform=Platform.YOUTUBE,
-        video_id="f4k3v1de0id",
-        url="https://www.youtube.com/watch?v=f4k3v1de0id",
-        title="Fake Dune discussion",
-        description="A deterministic transcript contract fixture.",
-        channel="Reelio test channel",
-        duration_seconds=120,
-    ),
-    transcript=Transcript(
-        text=(
-            "Dune Part Two blew me away, it reminds me of Che by Steven Soderbergh"
-        ),
-        language="en",
-        method=TranscriptMethod.YOUTUBE_CAPTIONS,
-    ),
-    results=[
-        MentionResult(
-            status=ResultStatus.RESOLVED,
-            movie_mention=MovieMention(title="Dune: Part Two", year=2024),
-            movie=EnrichedMovie(
-                title="Dune: Part Two",
-                year=2024,
-                directors=["Denis Villeneuve"],
-                description=(
-                    "Paul Atreides unites with Chani and the Fremen while seeking "
-                    "revenge against the conspirators who destroyed his family."
-                ),
-                poster_url=("https://image.tmdb.org/t/p/w500/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg"),
-                tmdb_id=693134,
-                tmdb_url="https://www.themoviedb.org/movie/693134",
-                imdb_id="tt15239678",
-                imdb_url="https://www.imdb.com/title/tt15239678",
-                tmdb_score=8.1,
-            ),
-        ),
-        MentionResult(
-            status=ResultStatus.UNRESOLVED,
-            movie_mention=MovieMention(title="Che", year=2008),
-            movie=None,
-        ),
-    ],
-)
+    async def aclose(self) -> None:
+        """Release lifespan-owned interpretation resources."""
+        await self._interpretation_service.aclose()

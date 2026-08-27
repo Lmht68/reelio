@@ -15,8 +15,14 @@ from reelio.main import create_app
 
 
 class _FakePipeline:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
     async def run(self, url: str) -> PipelineResult:
         raise AssertionError(f"unexpected pipeline call for {url}")
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
 
 
 def _transcription_settings(device: str) -> TranscriptionConfig:
@@ -70,10 +76,12 @@ async def test_injected_pipeline_factory_owns_one_pipeline_per_lifespan() -> Non
         assert calls == 1
 
     assert not hasattr(application.state, "extraction_pipeline")
+    assert pipeline.close_calls == 1
 
     async with application.router.lifespan_context(application):
         assert application.state.extraction_pipeline is pipeline
         assert calls == 2
+    assert pipeline.close_calls == 2
 
 
 def test_cuda_preflight_fails_before_model_construction(

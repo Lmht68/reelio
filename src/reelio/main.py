@@ -18,8 +18,14 @@ from reelio.extraction.service import ExtractionPipeline, ExtractionPipelineProt
 from reelio.extraction.services.enrichment.config import (  # noqa: F401
     tmdb_settings as _tmdb_settings,
 )
-from reelio.extraction.services.entities.config import (  # noqa: F401
-    llm_settings as _llm_settings,
+from reelio.extraction.services.interpretation.config import (
+    interpretation_settings as _interpretation_settings,
+)
+from reelio.extraction.services.interpretation.deepseek import (
+    create_deepseek_provider,
+)
+from reelio.extraction.services.interpretation.service import (
+    MovieMentionInterpretationService,
 )
 from reelio.extraction.services.transcription.acquisition import (
     YouTubeCaptionProvider,
@@ -61,9 +67,14 @@ async def _create_production_pipeline() -> ExtractionPipelineProtocol:
         temp_media_dir=_transcription_settings.temp_media_dir,
         semaphore=asyncio.Semaphore(1),
     )
+    interpretation_service = MovieMentionInterpretationService(
+        provider=create_deepseek_provider(_interpretation_settings),
+        settings=_interpretation_settings,
+    )
     return ExtractionPipeline(
         source_metadata_service=source_metadata_service,
         transcription_service=transcription_service,
+        interpretation_service=interpretation_service,
     )
 
 
@@ -77,8 +88,11 @@ async def _managed_lifespan(
     try:
         yield
     finally:
-        if hasattr(application.state, "extraction_pipeline"):
-            del application.state.extraction_pipeline
+        try:
+            await pipeline.aclose()
+        finally:
+            if hasattr(application.state, "extraction_pipeline"):
+                del application.state.extraction_pipeline
 
 
 @asynccontextmanager

@@ -13,10 +13,12 @@ from httpx import ASGITransport, AsyncClient
 from reelio.extraction.exceptions import (
     DurationLimitExceededError,
     EnrichmentError,
-    EntityExtractionError,
     ExtractionError,
+    InterpretationInputTooLargeError,
+    InvalidLLMResponseError,
     InvalidSourceError,
     MetadataProviderError,
+    MovieMentionInterpretationError,
     PipelineTimeoutError,
     SourceUnavailableError,
     TranscriptionError,
@@ -35,7 +37,13 @@ from reelio.extraction.services.transcription.service import (
     SourceMetadataService,
     TranscriptionService,
 )
-from reelio.extraction.types import PipelineResult, ResultStatus
+from reelio.extraction.types import (
+    MovieMention,
+    PipelineResult,
+    ResultStatus,
+    Source,
+    Transcript,
+)
 from reelio.main import app
 
 
@@ -53,6 +61,9 @@ class _RaisingPipeline:
 
     async def run(self, url: str) -> PipelineResult:
         raise self._exception
+
+    async def aclose(self) -> None:
+        return None
 
 
 _VIDEO_ID = "dQw4w9WgXcQ"
@@ -156,6 +167,33 @@ def _transcription_service(provider: _CaptionProvider) -> TranscriptionService:
     )
 
 
+class _FakeInterpretationService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Source, Transcript]] = []
+
+    async def interpret(
+        self,
+        source: Source,
+        transcript: Transcript,
+    ) -> list[MovieMention]:
+        self.calls.append((source, transcript))
+        return [MovieMention(title="Dune: Part One", year=2021)]
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _pipeline(
+    metadata_service: SourceMetadataService,
+    transcription_service: TranscriptionService,
+) -> ExtractionPipeline:
+    return ExtractionPipeline(
+        metadata_service,
+        transcription_service,
+        _FakeInterpretationService(),
+    )
+
+
 def _install_pipeline(application: FastAPI, pipeline: ExtractionPipelineProtocol) -> None:
     application.dependency_overrides[get_pipeline] = lambda: pipeline
 
@@ -163,7 +201,7 @@ def _install_pipeline(application: FastAPI, pipeline: ExtractionPipelineProtocol
 async def test_extract_returns_schema_valid_response(client: AsyncClient) -> None:
     """Return real source metadata and deterministic result statuses."""
     metadata_extractor = _MetadataExtractor()
-    pipeline = ExtractionPipeline(
+    pipeline = _pipeline(
         SourceMetadataService(
             extractor=metadata_extractor,
             settings=_settings(),
@@ -192,20 +230,11 @@ async def test_extract_returns_schema_valid_response(client: AsyncClient) -> Non
     assert payload.transcript.language == "en-GB"
     assert payload.transcript.method == "youtube_captions"
     assert payload.transcript.text == "Router caption text."
-    assert [result.status for result in payload.results] == [
-        ResultStatus.RESOLVED,
-        ResultStatus.UNRESOLVED,
-    ]
-
-    resolved, unresolved = payload.results
-    assert resolved.movie_mention is not None
-    assert resolved.movie_mention.title == "Dune: Part Two"
-    assert resolved.movie_mention.year == 2024
-    assert resolved.movie is not None
-    assert resolved.movie.title == "Dune: Part Two"
-    assert unresolved.movie_mention is not None
-    assert unresolved.movie_mention.title == "Che"
-    assert unresolved.movie_mention.year == 2008
+    assert len(payload.results) == 1
+    unresolved = payload.results[0]
+    assert unresolved.status is ResultStatus.UNRESOLVED
+    assert unresolved.movie_mention.title == "Dune: Part One"
+    assert unresolved.movie_mention.year == 2021
     assert unresolved.movie is None
 
 
@@ -213,7 +242,7 @@ async def test_extract_maps_unavailable_captions_to_502(
     client: AsyncClient,
 ) -> None:
     """Map a valid Source with no usable captions to Transcript Unavailable."""
-    pipeline = ExtractionPipeline(
+    pipeline = _pipeline(
         SourceMetadataService(
             extractor=_MetadataExtractor(),
             settings=_settings(),
@@ -241,7 +270,7 @@ async def test_extract_returns_whisper_transcript(
     tmp_path: Path,
 ) -> None:
     """Serialize a successful Whisper Transcript through the unchanged schema."""
-    pipeline = ExtractionPipeline(
+    pipeline = _pipeline(
         SourceMetadataService(
             extractor=_MetadataExtractor(),
             settings=_settings(),
@@ -340,7 +369,7 @@ async def test_social_sources_serialize_unchanged_response_schema(
             "formats": [{"vcodec": "avc1"}],
         }
     )
-    pipeline = ExtractionPipeline(
+    pipeline = _pipeline(
         SourceMetadataService(extractor=extractor, settings=_settings()),
         TranscriptionService(
             provider=_CaptionProvider([_CaptionTrack("en", ["must", "not", "run"])]),
@@ -380,7 +409,7 @@ async def test_concurrent_whisper_http_requests_queue_and_succeed(
 ) -> None:
     """Queue concurrent endpoint fallbacks behind one shared service semaphore."""
     transcriber = _BlockingWhisperTranscriber()
-    pipeline = ExtractionPipeline(
+    pipeline = _pipeline(
         SourceMetadataService(
             extractor=_MetadataExtractor(),
             settings=_settings(),
@@ -427,15 +456,25 @@ async def test_concurrent_whisper_http_requests_queue_and_succeed(
             "duration_limit_exceeded",
         ),
         (
+            InterpretationInputTooLargeError("interpretation input too large"),
+            413,
+            "entity_input_too_large",
+        ),
+        (
             MetadataProviderError("Unable to retrieve YouTube metadata."),
             502,
             "metadata_provider_failed",
         ),
         (TranscriptionError("transcription failed"), 502, "transcription_failed"),
         (
-            EntityExtractionError("entity extraction failed"),
+            MovieMentionInterpretationError("entity extraction failed"),
             502,
             "entity_extraction_failed",
+        ),
+        (
+            InvalidLLMResponseError("invalid provider response"),
+            502,
+            "invalid_llm_response",
         ),
         (EnrichmentError("enrichment failed"), 502, "enrichment_failed"),
         (PipelineTimeoutError("pipeline timed out"), 504, "pipeline_timeout"),
