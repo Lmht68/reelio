@@ -67,7 +67,7 @@ class ResultModel(BaseModel):
     """One interpreted mention and its resolution outcome."""
 
     status: ResultStatus
-    movie_mention: MovieMentionModel | None
+    movie_mention: MovieMentionModel
     movie: MovieModel | None
 
 

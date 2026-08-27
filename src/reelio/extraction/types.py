@@ -69,12 +69,12 @@ class Transcript:
 @dataclass
 class MovieMention:
     """Contain the title and release year of a movie mention interpreted from a transcript.
-    
+
     Attributes:
         title: Canonical movie title.
         year: Release year.
     """
-    
+
     title: str
     year: int
 
@@ -119,7 +119,7 @@ class MentionResult:
     """
 
     status: ResultStatus
-    movie_mention: MovieMention | None
+    movie_mention: MovieMention
     movie: EnrichedMovie | None
 
 

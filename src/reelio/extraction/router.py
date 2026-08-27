@@ -51,7 +51,9 @@ def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.MovieModel:
 
 
 def _to_result_schema(result: MentionResult) -> extraction_schemas.ResultModel:
-    movie_mention = _to_movie_mention_schema(result.movie_mention) if result.movie_mention is not None else None
+    movie_mention = (
+        _to_movie_mention_schema(result.movie_mention) if result.movie_mention is not None else None
+    )
     movie = _to_movie_schema(result.movie) if result.movie is not None else None
     return extraction_schemas.ResultModel(
         status=result.status,
@@ -87,8 +89,7 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
     description=(
         "Accept a public YouTube, Instagram, Facebook, TikTok, or X video URL "
         "and return the normalized Source, the Transcript with its acquisition "
-        "method, and one Resolved, Ambiguous, or Unresolved result per mentioned "
-        "movie."
+        "method, and one Resolved or Unresolved result per mentioned movie."
     ),
     response_description="Source, transcript, and per-mention results.",
     responses={
