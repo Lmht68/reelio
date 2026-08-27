@@ -6,9 +6,9 @@ from typing import Final, Protocol
 from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
-    Candidate,
     EnrichedMovie,
     MentionResult,
+    MovieMention,
     PipelineResult,
     Platform,
     ResultStatus,
@@ -114,8 +114,7 @@ _PLACEHOLDER_RESULT: Final[PipelineResult] = PipelineResult(
     ),
     transcript=Transcript(
         text=(
-            "Dune Part Two blew me away, and the original Dune still holds up, "
-            "but that 90s space movie everyone quotes was overrated."
+            "Dune Part Two blew me away, it reminds me of Che by Steven Soderbergh"
         ),
         language="en",
         method=TranscriptMethod.YOUTUBE_CAPTIONS,
@@ -123,10 +122,7 @@ _PLACEHOLDER_RESULT: Final[PipelineResult] = PipelineResult(
     results=[
         MentionResult(
             status=ResultStatus.RESOLVED,
-            mentioned_as=["Dune Part Two"],
-            evidence=["Dune Part Two blew me away"],
-            extraction_confidence=0.95,
-            resolution_confidence=0.85,
+            movie_mention=MovieMention(title="Dune: Part Two", year=2024),
             movie=EnrichedMovie(
                 title="Dune: Part Two",
                 year=2024,
@@ -142,74 +138,11 @@ _PLACEHOLDER_RESULT: Final[PipelineResult] = PipelineResult(
                 imdb_url="https://www.imdb.com/title/tt15239678",
                 tmdb_score=8.1,
             ),
-            candidates=[],
-        ),
-        MentionResult(
-            status=ResultStatus.AMBIGUOUS,
-            mentioned_as=["Dune"],
-            evidence=["the original Dune still holds up"],
-            extraction_confidence=0.9,
-            resolution_confidence=0.55,
-            movie=None,
-            candidates=[
-                Candidate(
-                    title="Dune",
-                    year=2021,
-                    directors=["Denis Villeneuve"],
-                    description=(
-                        "A gifted young man travels to the most dangerous planet "
-                        "in the universe to secure his family's future."
-                    ),
-                    poster_url=("https://image.tmdb.org/t/p/w500/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg"),
-                    tmdb_id=438631,
-                    tmdb_url="https://www.themoviedb.org/movie/438631",
-                    imdb_id="tt1160419",
-                    imdb_url="https://www.imdb.com/title/tt1160419",
-                    tmdb_score=8.0,
-                    resolution_score=0.55,
-                ),
-                Candidate(
-                    title="Dune",
-                    year=1984,
-                    directors=["David Lynch"],
-                    description=(
-                        "A noble family becomes embroiled in a war for control of "
-                        "a valuable desert planet."
-                    ),
-                    poster_url=("https://image.tmdb.org/t/p/w500/rK0ah8i2A4B5Yjz8b5dL5f4XQ3a.jpg"),
-                    tmdb_id=841,
-                    tmdb_url="https://www.themoviedb.org/movie/841",
-                    imdb_id="tt0087182",
-                    imdb_url="https://www.imdb.com/title/tt0087182",
-                    tmdb_score=6.3,
-                    resolution_score=0.45,
-                ),
-                Candidate(
-                    title="Jodorowsky's Dune",
-                    year=2013,
-                    directors=["Frank Pavich"],
-                    description=(
-                        "Filmmaker Alejandro Jodorowsky recounts his ambitious "
-                        "attempt to adapt Dune for the screen."
-                    ),
-                    poster_url=None,
-                    tmdb_id=241256,
-                    tmdb_url="https://www.themoviedb.org/movie/241256",
-                    imdb_id=None,
-                    imdb_url=None,
-                    tmdb_score=7.5,
-                    resolution_score=0.40,
-                ),
-            ],
         ),
         MentionResult(
             status=ResultStatus.UNRESOLVED,
-            mentioned_as=["that 90s space movie"],
-            evidence=["that 90s space movie everyone quotes was overrated"],
-            extraction_confidence=0.4,
-            resolution_confidence=None,
+            movie_mention=MovieMention(title="Che", year=2008),
             movie=None,
-            candidates=[],
         ),
     ],
 )

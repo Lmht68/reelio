@@ -7,9 +7,9 @@ from fastapi import APIRouter, Depends, Request, status
 from reelio.extraction import schemas as extraction_schemas
 from reelio.extraction.service import ExtractionPipelineProtocol
 from reelio.extraction.types import (
-    Candidate,
     EnrichedMovie,
     MentionResult,
+    MovieMention,
     PipelineResult,
 )
 
@@ -28,8 +28,15 @@ def get_pipeline(request: Request) -> ExtractionPipelineProtocol:
     return cast(ExtractionPipelineProtocol, request.app.state.extraction_pipeline)
 
 
-def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.Movie:
-    return extraction_schemas.Movie(
+def _to_movie_mention_schema(mention: MovieMention) -> extraction_schemas.MovieMentionModel:
+    return extraction_schemas.MovieMentionModel(
+        title=mention.title,
+        year=mention.year,
+    )
+
+
+def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.MovieModel:
+    return extraction_schemas.MovieModel(
         title=movie.title,
         year=movie.year,
         directors=movie.directors,
@@ -43,27 +50,19 @@ def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.Movie:
     )
 
 
-def _to_candidate_schema(candidate: Candidate) -> extraction_schemas.Candidate:
-    movie_data = _to_movie_schema(candidate).model_dump()
-    return extraction_schemas.Candidate(**movie_data, resolution_score=candidate.resolution_score)
-
-
-def _to_result_schema(result: MentionResult) -> extraction_schemas.Result:
+def _to_result_schema(result: MentionResult) -> extraction_schemas.ResultModel:
+    movie_mention = _to_movie_mention_schema(result.movie_mention) if result.movie_mention is not None else None
     movie = _to_movie_schema(result.movie) if result.movie is not None else None
-    return extraction_schemas.Result(
+    return extraction_schemas.ResultModel(
         status=result.status,
-        mentioned_as=result.mentioned_as,
-        evidence=result.evidence,
-        extraction_confidence=result.extraction_confidence,
-        resolution_confidence=result.resolution_confidence,
+        movie_mention=movie_mention,
         movie=movie,
-        candidates=[_to_candidate_schema(candidate) for candidate in result.candidates],
     )
 
 
 def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
     return extraction_schemas.ExtractResponse(
-        source=extraction_schemas.Source(
+        source=extraction_schemas.SourceModel(
             platform=result.source.platform,
             video_id=result.source.video_id,
             url=result.source.url,
@@ -72,7 +71,7 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
             channel=result.source.channel,
             duration_seconds=result.source.duration_seconds,
         ),
-        transcript=extraction_schemas.Transcript(
+        transcript=extraction_schemas.TranscriptModel(
             text=result.transcript.text,
             language=result.transcript.language,
             method=result.transcript.method,

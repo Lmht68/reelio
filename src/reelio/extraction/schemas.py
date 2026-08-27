@@ -21,7 +21,7 @@ class ExtractRequest(BaseModel):
     )
 
 
-class Source(BaseModel):
+class SourceModel(BaseModel):
     """Canonical source identity and video metadata returned to the caller."""
 
     platform: Platform
@@ -33,7 +33,7 @@ class Source(BaseModel):
     duration_seconds: int
 
 
-class Transcript(BaseModel):
+class TranscriptModel(BaseModel):
     """Transcript text and acquisition metadata returned to the caller."""
 
     text: str
@@ -41,11 +41,11 @@ class Transcript(BaseModel):
     method: TranscriptMethod
 
 
-class Movie(BaseModel):
+class MovieModel(BaseModel):
     """Provider-enriched movie metadata in an extraction response."""
 
     title: str
-    year: int | None
+    year: int
     directors: list[str]
     description: str
     poster_url: str | None
@@ -56,30 +56,27 @@ class Movie(BaseModel):
     tmdb_score: float = Field(ge=0, le=10)
 
 
-class Candidate(Movie):
-    """Enriched movie candidate with its resolver score."""
+class MovieMentionModel(BaseModel):
+    """Title and release year of a movie mention interpreted from a transcript."""
 
-    resolution_score: float = Field(ge=0, le=1)
+    title: str
+    year: int
 
 
-class Result(BaseModel):
+class ResultModel(BaseModel):
     """One interpreted mention and its resolution outcome."""
 
     status: ResultStatus
-    mentioned_as: list[str] = Field(min_length=1)
-    evidence: list[str] = Field(min_length=1)
-    extraction_confidence: float = Field(ge=0, le=1)
-    resolution_confidence: float | None = Field(ge=0, le=1)
-    movie: Movie | None
-    candidates: list[Candidate] = Field(default_factory=list, max_length=3)
+    movie_mention: MovieMentionModel | None
+    movie: MovieModel | None
 
 
 class ExtractResponse(BaseModel):
     """Successful extraction response containing source and movie results."""
 
-    source: Source
-    transcript: Transcript
-    results: list[Result]
+    source: SourceModel
+    transcript: TranscriptModel
+    results: list[ResultModel]
 
 
 class ErrorDetail(BaseModel):

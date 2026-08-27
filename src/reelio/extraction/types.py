@@ -25,7 +25,6 @@ class ResultStatus(StrEnum):
     """Resolution outcomes for an interpreted mention."""
 
     RESOLVED = "resolved"
-    AMBIGUOUS = "ambiguous"
     UNRESOLVED = "unresolved"
 
 
@@ -68,12 +67,25 @@ class Transcript:
 
 
 @dataclass
+class MovieMention:
+    """Contain the title and release year of a movie mention interpreted from a transcript.
+    
+    Attributes:
+        title: Canonical movie title.
+        year: Release year.
+    """
+    
+    title: str
+    year: int
+
+
+@dataclass
 class EnrichedMovie:
     """Contain provider-verified metadata for a movie entity.
 
     Attributes:
         title: Canonical movie title.
-        year: Release year when the provider supplies one.
+        year: Release year.
         directors: Provider-verified director names.
         description: Short provider-supplied movie description.
         poster_url: Provider image URL when available.
@@ -85,7 +97,7 @@ class EnrichedMovie:
     """
 
     title: str
-    year: int | None
+    year: int
     directors: list[str]
     description: str
     poster_url: str | None
@@ -97,37 +109,18 @@ class EnrichedMovie:
 
 
 @dataclass
-class Candidate(EnrichedMovie):
-    """Contain an enriched movie candidate and its resolution score.
-
-    Attributes:
-        resolution_score: Resolver score on a zero-to-one scale.
-    """
-
-    resolution_score: float
-
-
-@dataclass
 class MentionResult:
     """Represent one interpreted mention and its resolution outcome.
 
     Attributes:
         status: Resolution outcome for the mention.
-        mentioned_as: Phrases used for the same mention.
-        evidence: Source passages supporting the mention.
-        extraction_confidence: LLM confidence on a zero-to-one scale.
-        resolution_confidence: Resolver confidence, or ``None`` when unresolved.
+        movie_mention: Title and release year of the interpreted mention.
         movie: Resolved movie, or ``None`` when no unique movie was selected.
-        candidates: Enriched alternatives for an ambiguous mention.
     """
 
     status: ResultStatus
-    mentioned_as: list[str]
-    evidence: list[str]
-    extraction_confidence: float
-    resolution_confidence: float | None
+    movie_mention: MovieMention | None
     movie: EnrichedMovie | None
-    candidates: list[Candidate]
 
 
 @dataclass

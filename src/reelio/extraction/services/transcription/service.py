@@ -28,7 +28,6 @@ _METADATA_PROVIDER_MESSAGE = "Unable to retrieve source metadata."
 _METADATA_TIMEOUT_MESSAGE = "Source metadata acquisition timed out."
 _TRANSCRIPT_UNAVAILABLE_MESSAGE = "Transcript is unavailable for this video."
 _TRANSCRIPT_TIMEOUT_MESSAGE = "Transcript acquisition timed out."
-_REDACTED_LOG_VALUE = "[REDACTED]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,11 +140,8 @@ class SourceMetadataService:
                 "platform": source.platform.value,
                 "video_id": source.video_id,
                 "canonical_url": source.url,
-                "title": _REDACTED_LOG_VALUE,
                 "title_length": len(source.title),
-                "description": _REDACTED_LOG_VALUE,
                 "description_length": len(source.description),
-                "channel": _REDACTED_LOG_VALUE,
                 "channel_length": len(source.channel),
                 "duration_seconds": source.duration_seconds,
             },

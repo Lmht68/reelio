@@ -619,7 +619,6 @@ def acquire_transcript(
             "transcript acquired",
             extra={
                 "stage": "transcription",
-                "transcript_text": transcript_text,
                 "language": language,
                 "method": method.value,
                 "segment_count": segment_count,
@@ -767,7 +766,6 @@ def _transcribe_audio(
         "transcript acquired",
         extra={
             "stage": "transcription",
-            "transcript_text": transcript_text,
             "language": result.language,
             "method": method.value,
             "segment_count": result.segment_count,
