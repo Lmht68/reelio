@@ -104,13 +104,13 @@ async def test_pipeline_returns_real_source_and_transcript_with_placeholders() -
     assert transcription_service.calls == [(source, _CANONICAL_URL)]
     assert [item.status for item in result.results] == [
         ResultStatus.RESOLVED,
-        ResultStatus.AMBIGUOUS,
         ResultStatus.UNRESOLVED,
     ]
+    assert result.results[0].movie_mention.title == "Dune: Part Two"
     assert result.results[0].movie is not None
     assert result.results[0].movie.title == "Dune: Part Two"
-    assert result.results[1].candidates[0].title == "Dune"
-    assert result.results[2].mentioned_as == ["that 90s space movie"]
+    assert result.results[1].movie_mention.title == "Che"
+    assert result.results[1].movie is None
 
 
 async def test_pipeline_preserves_whisper_transcript_method() -> None:
@@ -204,8 +204,8 @@ async def test_pipeline_propagates_transcription_errors_unchanged(
     assert transcription_service.calls == [(_source(), _CANONICAL_URL)]
 
 
-async def test_pipeline_result_keeps_each_placeholder_result_branch() -> None:
-    """Keep the existing resolved, ambiguous, and unresolved result shapes."""
+async def test_pipeline_result_keeps_resolved_and_unresolved_placeholder_results() -> None:
+    """Keep the existing resolved and unresolved placeholder result shapes."""
     pipeline = ExtractionPipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
@@ -213,14 +213,12 @@ async def test_pipeline_result_keeps_each_placeholder_result_branch() -> None:
 
     result = await pipeline.run(_CANONICAL_URL)
 
-    resolved, ambiguous, unresolved = result.results
+    resolved, unresolved = result.results
     assert isinstance(resolved, MentionResult)
+    assert resolved.movie_mention.title == "Dune: Part Two"
     assert resolved.movie is not None
-    assert resolved.candidates == []
-    assert ambiguous.movie is None
-    assert len(ambiguous.candidates) == 3
+    assert unresolved.movie_mention.title == "Che"
     assert unresolved.movie is None
-    assert unresolved.candidates == []
 
 
 @pytest.mark.parametrize(

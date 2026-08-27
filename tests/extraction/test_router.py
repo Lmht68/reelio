@@ -161,7 +161,7 @@ def _install_pipeline(application: FastAPI, pipeline: ExtractionPipelineProtocol
 
 
 async def test_extract_returns_schema_valid_response(client: AsyncClient) -> None:
-    """Return real source metadata and all deterministic result branches."""
+    """Return real source metadata and deterministic result statuses."""
     metadata_extractor = _MetadataExtractor()
     pipeline = ExtractionPipeline(
         SourceMetadataService(
@@ -192,27 +192,21 @@ async def test_extract_returns_schema_valid_response(client: AsyncClient) -> Non
     assert payload.transcript.language == "en-GB"
     assert payload.transcript.method == "youtube_captions"
     assert payload.transcript.text == "Router caption text."
-    assert {result.status for result in payload.results} == {
+    assert [result.status for result in payload.results] == [
         ResultStatus.RESOLVED,
-        ResultStatus.AMBIGUOUS,
         ResultStatus.UNRESOLVED,
-    }
-    assert all(len(result.mentioned_as) >= 1 for result in payload.results)
-    assert all(len(result.evidence) >= 1 for result in payload.results)
+    ]
 
-    ambiguous = next(
-        result for result in payload.results if result.status is ResultStatus.AMBIGUOUS
-    )
-    assert ambiguous.movie is None
-    assert len(ambiguous.candidates) == 3
-    assert len({candidate.resolution_score for candidate in ambiguous.candidates}) == 3
-
-    unresolved = next(
-        result for result in payload.results if result.status is ResultStatus.UNRESOLVED
-    )
-    assert unresolved.resolution_confidence is None
+    resolved, unresolved = payload.results
+    assert resolved.movie_mention is not None
+    assert resolved.movie_mention.title == "Dune: Part Two"
+    assert resolved.movie_mention.year == 2024
+    assert resolved.movie is not None
+    assert resolved.movie.title == "Dune: Part Two"
+    assert unresolved.movie_mention is not None
+    assert unresolved.movie_mention.title == "Che"
+    assert unresolved.movie_mention.year == 2008
     assert unresolved.movie is None
-    assert unresolved.candidates == []
 
 
 async def test_extract_maps_unavailable_captions_to_502(
@@ -517,7 +511,8 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
 
     request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
     assert request_schema == {"$ref": "#/components/schemas/ExtractRequest"}
-    source_properties = document["components"]["schemas"]["Source"]["properties"]
+    schemas = document["components"]["schemas"]
+    source_properties = schemas["SourceModel"]["properties"]
     assert {
         "platform",
         "video_id",
@@ -527,6 +522,15 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "channel",
         "duration_seconds",
     } <= set(source_properties)
+    result_schema = schemas["ResultModel"]
+    assert {"status", "movie_mention", "movie"} <= set(result_schema["required"])
+    assert result_schema["properties"]["movie_mention"] == {
+        "$ref": "#/components/schemas/MovieMentionModel"
+    }
+    movie_mention_schema = schemas["MovieMentionModel"]
+    assert {"title", "year"} <= set(movie_mention_schema["required"])
+    movie_schema = schemas["MovieModel"]
+    assert {"year", "tmdb_score"} <= set(movie_schema["required"])
     assert set(document["components"]["schemas"]["Platform"]["enum"]) == {
         "youtube",
         "instagram",
