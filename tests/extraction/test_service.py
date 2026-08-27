@@ -9,6 +9,7 @@ import pytest
 import reelio.extraction.services.transcription.inspection as transcription_inspection
 from reelio.extraction.exceptions import (
     DurationLimitExceededError,
+    EnrichmentError,
     InvalidSourceError,
     PipelineTimeoutError,
     SourceUnavailableError,
@@ -24,6 +25,12 @@ from reelio.extraction.types import (
     Source,
     Transcript,
     TranscriptMethod,
+)
+from tests.extraction.fakes import (
+    FakeInterpretationService as _FakeInterpretationService,
+)
+from tests.extraction.fakes import (
+    FakeMovieResolver as _FakeMovieResolver,
 )
 
 _VIDEO_ID = "dQw4w9WgXcQ"
@@ -68,40 +75,17 @@ class _FakeTranscriptionService:
         return self.transcript
 
 
-class _FakeInterpretationService:
-    def __init__(
-        self,
-        movie_mentions: list[MovieMention] | None = None,
-        error: Exception | None = None,
-    ) -> None:
-        self.movie_mentions = [] if movie_mentions is None else movie_mentions
-        self.error = error
-        self.calls: list[tuple[Source, Transcript]] = []
-        self.closed = False
-
-    async def interpret(
-        self,
-        source: Source,
-        transcript: Transcript,
-    ) -> list[MovieMention]:
-        self.calls.append((source, transcript))
-        if self.error is not None:
-            raise self.error
-        return self.movie_mentions
-
-    async def aclose(self) -> None:
-        self.closed = True
-
-
 def _pipeline(
     metadata_service: _FakeSourceMetadataService,
     transcription_service: _FakeTranscriptionService,
     interpretation_service: _FakeInterpretationService | None = None,
+    movie_resolver: _FakeMovieResolver | None = None,
 ) -> ExtractionPipeline:
     return ExtractionPipeline(
         metadata_service,
         transcription_service,
         interpretation_service or _FakeInterpretationService(),
+        movie_resolver or _FakeMovieResolver(),
     )
 
 
@@ -138,10 +122,12 @@ async def test_pipeline_integrates_fake_movie_interpretation_results() -> None:
             MovieMention(title="Che: Part Two", year=2008),
         ]
     )
+    movie_resolver = _FakeMovieResolver()
     pipeline = _pipeline(
         metadata_service,
         transcription_service,
         interpretation_service,
+        movie_resolver,
     )
 
     result = await pipeline.run(_CANONICAL_URL)
@@ -151,6 +137,7 @@ async def test_pipeline_integrates_fake_movie_interpretation_results() -> None:
     assert metadata_service.calls == [_CANONICAL_URL]
     assert transcription_service.calls == [(source, _CANONICAL_URL)]
     assert interpretation_service.calls == [(source, transcript)]
+    assert movie_resolver.calls == [tuple(interpretation_service.movie_mentions)]
     assert [item.status for item in result.results] == [ResultStatus.UNRESOLVED] * 3
     assert [item.movie_mention for item in result.results] == interpretation_service.movie_mentions
     assert all(item.movie is None for item in result.results)
@@ -247,18 +234,41 @@ async def test_pipeline_propagates_transcription_errors_unchanged(
     assert transcription_service.calls == [(_source(), _CANONICAL_URL)]
 
 
-async def test_pipeline_closes_interpretation_service() -> None:
-    """Delegate lifespan cleanup to the Movie Mention interpretation service."""
+async def test_pipeline_propagates_resolution_errors_unchanged() -> None:
+    """Propagate TMDB resolution failures without changing their domain policy."""
+    resolution_error = EnrichmentError("TMDB candidate resolution failed.")
+    movie_resolver = _FakeMovieResolver(error=resolution_error)
+    pipeline = _pipeline(
+        _FakeSourceMetadataService(_source()),
+        _FakeTranscriptionService(_transcript()),
+        _FakeInterpretationService([MovieMention(title="Dune: Part One", year=2021)]),
+        movie_resolver,
+    )
+
+    with pytest.raises(EnrichmentError) as error:
+        await pipeline.run(_CANONICAL_URL)
+
+    assert error.value is resolution_error
+    assert movie_resolver.calls == [
+        (MovieMention(title="Dune: Part One", year=2021),),
+    ]
+
+
+async def test_pipeline_closes_interpretation_and_resolution_modules() -> None:
+    """Delegate lifespan cleanup to interpretation and resolution modules."""
     interpretation_service = _FakeInterpretationService()
+    movie_resolver = _FakeMovieResolver()
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
         interpretation_service,
+        movie_resolver,
     )
 
     await pipeline.aclose()
 
     assert interpretation_service.closed is True
+    assert movie_resolver.closed is True
 
 
 @pytest.mark.parametrize(

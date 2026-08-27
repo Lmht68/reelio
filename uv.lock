@@ -1466,6 +1466,7 @@ dependencies = [
     { name = "cachetools" },
     { name = "fastapi", extra = ["standard"] },
     { name = "faster-whisper" },
+    { name = "httpx" },
     { name = "openai" },
     { name = "pydantic-settings" },
     { name = "youtube-transcript-api" },
@@ -1474,7 +1475,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -1488,6 +1488,7 @@ requires-dist = [
     { name = "cachetools", specifier = ">=7.1.6" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.139.2" },
     { name = "faster-whisper", specifier = ">=1.2.1" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "openai", specifier = ">=2.50.0" },
     { name = "pydantic-settings", specifier = ">=2.14.2" },
     { name = "youtube-transcript-api", specifier = ">=1.2.4" },
@@ -1496,7 +1497,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx", specifier = ">=0.28.1" },
     { name = "mypy", specifier = ">=2.3.0" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },

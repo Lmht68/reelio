@@ -38,13 +38,19 @@ from reelio.extraction.services.transcription.service import (
     TranscriptionService,
 )
 from reelio.extraction.types import (
+    EnrichedMovie,
+    MentionResult,
     MovieMention,
     PipelineResult,
     ResultStatus,
-    Source,
-    Transcript,
 )
 from reelio.main import app
+from tests.extraction.fakes import (
+    FakeInterpretationService as _FakeInterpretationService,
+)
+from tests.extraction.fakes import (
+    FakeMovieResolver as _FakeMovieResolver,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -167,30 +173,36 @@ def _transcription_service(provider: _CaptionProvider) -> TranscriptionService:
     )
 
 
-class _FakeInterpretationService:
-    def __init__(self) -> None:
-        self.calls: list[tuple[Source, Transcript]] = []
-
-    async def interpret(
-        self,
-        source: Source,
-        transcript: Transcript,
-    ) -> list[MovieMention]:
-        self.calls.append((source, transcript))
-        return [MovieMention(title="Dune: Part One", year=2021)]
-
-    async def aclose(self) -> None:
-        return None
-
-
 def _pipeline(
     metadata_service: SourceMetadataService,
     transcription_service: TranscriptionService,
 ) -> ExtractionPipeline:
+    movie_mention = MovieMention(title="Dune: Part One", year=2021)
+    movie = EnrichedMovie(
+        title=movie_mention.title,
+        year=movie_mention.year,
+        directors=["Denis Villeneuve"],
+        description="Paul Atreides faces his destiny on Arrakis.",
+        poster_url="https://image.tmdb.org/t/p/w500/dune.jpg",
+        tmdb_id=438631,
+        tmdb_url="https://www.themoviedb.org/movie/438631",
+        imdb_id="tt1160419",
+        imdb_url="https://www.imdb.com/title/tt1160419/",
+        tmdb_score=7.8,
+    )
     return ExtractionPipeline(
         metadata_service,
         transcription_service,
-        _FakeInterpretationService(),
+        _FakeInterpretationService([movie_mention]),
+        _FakeMovieResolver(
+            [
+                MentionResult(
+                    status=ResultStatus.RESOLVED,
+                    movie_mention=movie_mention,
+                    movie=movie,
+                )
+            ]
+        ),
     )
 
 
@@ -231,11 +243,13 @@ async def test_extract_returns_schema_valid_response(client: AsyncClient) -> Non
     assert payload.transcript.method == "youtube_captions"
     assert payload.transcript.text == "Router caption text."
     assert len(payload.results) == 1
-    unresolved = payload.results[0]
-    assert unresolved.status is ResultStatus.UNRESOLVED
-    assert unresolved.movie_mention.title == "Dune: Part One"
-    assert unresolved.movie_mention.year == 2021
-    assert unresolved.movie is None
+    resolved = payload.results[0]
+    assert resolved.status is ResultStatus.RESOLVED
+    assert resolved.movie_mention.title == "Dune: Part One"
+    assert resolved.movie_mention.year == 2021
+    assert resolved.movie is not None
+    assert resolved.movie.tmdb_id == 438631
+    assert resolved.movie.directors == ["Denis Villeneuve"]
 
 
 async def test_extract_maps_unavailable_captions_to_502(
@@ -458,7 +472,7 @@ async def test_concurrent_whisper_http_requests_queue_and_succeed(
         (
             InterpretationInputTooLargeError("interpretation input too large"),
             413,
-            "entity_input_too_large",
+            "interpretation_input_too_large",
         ),
         (
             MetadataProviderError("Unable to retrieve YouTube metadata."),
@@ -467,9 +481,9 @@ async def test_concurrent_whisper_http_requests_queue_and_succeed(
         ),
         (TranscriptionError("transcription failed"), 502, "transcription_failed"),
         (
-            MovieMentionInterpretationError("entity extraction failed"),
+            MovieMentionInterpretationError("movie mention interpretation failed"),
             502,
-            "entity_extraction_failed",
+            "movie_mention_interpretation_failed",
         ),
         (
             InvalidLLMResponseError("invalid provider response"),

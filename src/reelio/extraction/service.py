@@ -1,5 +1,6 @@
-"""Orchestrate Source inspection, transcription, and Movie Mention interpretation."""
+"""Orchestrate Source-to-Enriched-Entity extraction."""
 
+from collections.abc import Sequence
 from typing import Protocol
 
 from reelio.extraction.services.transcription.inspection import PreparedAudio
@@ -8,7 +9,6 @@ from reelio.extraction.types import (
     MentionResult,
     MovieMention,
     PipelineResult,
-    ResultStatus,
     Source,
     Transcript,
 )
@@ -73,14 +73,30 @@ class _MovieMentionInterpreter(Protocol):
         ...
 
 
+class _MovieResolver(Protocol):
+    """Resolve and enrich ordered Movie Mentions against provider candidates."""
+
+    async def resolve(
+        self,
+        movie_mentions: Sequence[MovieMention],
+    ) -> list[MentionResult]:
+        """Return one Resolved or Unresolved Result per Movie Mention."""
+        ...
+
+    async def aclose(self) -> None:
+        """Release resolution provider resources."""
+        ...
+
+
 class ExtractionPipeline:
-    """Orchestrate the implemented movie extraction stages."""
+    """Orchestrate Source-to-Enriched-Entity extraction stages."""
 
     def __init__(
         self,
         source_metadata_service: _SourceMetadataInspector,
         transcription_service: _TranscriptAcquirer,
         interpretation_service: _MovieMentionInterpreter,
+        movie_resolver: _MovieResolver,
     ) -> None:
         """Initialize the pipeline with explicit stage services.
 
@@ -88,19 +104,21 @@ class ExtractionPipeline:
             source_metadata_service: Service that validates and inspects Sources.
             transcription_service: Service that acquires Transcripts.
             interpretation_service: Service that interprets Movie Mentions.
+            movie_resolver: Module that resolves and enriches Movie Mentions.
         """
         self._source_metadata_service = source_metadata_service
         self._transcription_service = transcription_service
         self._interpretation_service = interpretation_service
+        self._movie_resolver = movie_resolver
 
     async def run(self, url: str) -> PipelineResult:
-        """Inspect a Source, acquire its Transcript, and interpret Movie Mentions.
+        """Produce Resolved or Unresolved Results for one submitted Source.
 
         Args:
             url: Source URL submitted by the API caller.
 
         Returns:
-            PipelineResult: Source, Transcript, and Unresolved Results.
+            PipelineResult: Source, Transcript, and per-mention resolution Results.
 
         Raises:
             ExtractionError: If any pipeline stage fails with a domain error.
@@ -119,19 +137,16 @@ class ExtractionPipeline:
             inspected.source,
             transcript,
         )
+        results = await self._movie_resolver.resolve(movie_mentions)
         return PipelineResult(
             source=inspected.source,
             transcript=transcript,
-            results=[
-                MentionResult(
-                    status=ResultStatus.UNRESOLVED,
-                    movie_mention=movie_mention,
-                    movie=None,
-                )
-                for movie_mention in movie_mentions
-            ],
+            results=results,
         )
 
     async def aclose(self) -> None:
-        """Release lifespan-owned interpretation resources."""
-        await self._interpretation_service.aclose()
+        """Release lifespan-owned interpretation and resolution resources."""
+        try:
+            await self._interpretation_service.aclose()
+        finally:
+            await self._movie_resolver.aclose()

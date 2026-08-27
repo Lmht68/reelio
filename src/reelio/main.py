@@ -15,9 +15,8 @@ from reelio.extraction.exceptions import (
 )
 from reelio.extraction.router import router as extraction_router
 from reelio.extraction.service import ExtractionPipeline, ExtractionPipelineProtocol
-from reelio.extraction.services.enrichment.config import (  # noqa: F401
-    tmdb_settings as _tmdb_settings,
-)
+from reelio.extraction.services.enrichment.config import tmdb_settings as _tmdb_settings
+from reelio.extraction.services.enrichment.tmdb import create_tmdb_movie_resolver
 from reelio.extraction.services.interpretation.config import (
     interpretation_settings as _interpretation_settings,
 )
@@ -71,10 +70,12 @@ async def _create_production_pipeline() -> ExtractionPipelineProtocol:
         provider=create_deepseek_provider(_interpretation_settings),
         settings=_interpretation_settings,
     )
+    movie_resolver = create_tmdb_movie_resolver(_tmdb_settings)
     return ExtractionPipeline(
         source_metadata_service=source_metadata_service,
         transcription_service=transcription_service,
         interpretation_service=interpretation_service,
+        movie_resolver=movie_resolver,
     )
 
 

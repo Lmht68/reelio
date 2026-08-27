@@ -67,6 +67,8 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         "REELIO_MAX_TRANSCRIPT_LANGUAGE_CHARS",
         "REELIO_MAX_TRANSCRIPT_CHARS",
         "REELIO_TMDB_BASE_URL",
+        "REELIO_TMDB_IMAGE_BASE_URL",
+        "REELIO_TMDB_REQUEST_TIMEOUT_SECONDS",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -100,6 +102,21 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert interpretation_settings.max_transcript_language_chars == 64
     assert interpretation_settings.max_transcript_chars == 100_000
     assert tmdb_settings.base_url == "https://api.themoviedb.org/3"
+    assert tmdb_settings.image_base_url == "https://image.tmdb.org/t/p/w500"
+    assert tmdb_settings.request_timeout_seconds == 10.0
+
+
+def test_tmdb_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Parse TMDB endpoint, image, and timeout settings."""
+    monkeypatch.setenv("REELIO_TMDB_BASE_URL", "https://tmdb.test/3")
+    monkeypatch.setenv("REELIO_TMDB_IMAGE_BASE_URL", "https://images.test/w342")
+    monkeypatch.setenv("REELIO_TMDB_REQUEST_TIMEOUT_SECONDS", "4.5")
+
+    settings = _without_dotenv(TMDBConfig, api_key="x")
+
+    assert settings.base_url == "https://tmdb.test/3"
+    assert settings.image_base_url == "https://images.test/w342"
+    assert settings.request_timeout_seconds == 4.5
 
 
 def test_video_duration_environment_override(
