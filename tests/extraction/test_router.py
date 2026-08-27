@@ -24,7 +24,7 @@ from reelio.extraction.exceptions import (
 )
 from reelio.extraction.router import get_pipeline
 from reelio.extraction.schemas import ExtractResponse
-from reelio.extraction.service import ExtractionPipeline, Pipeline
+from reelio.extraction.service import ExtractionPipeline, ExtractionPipelineProtocol
 from reelio.extraction.services.transcription.acquisition import (
     WhisperResult,
     _WhisperProviderFailure,
@@ -156,7 +156,7 @@ def _transcription_service(provider: _CaptionProvider) -> TranscriptionService:
     )
 
 
-def _install_pipeline(application: FastAPI, pipeline: Pipeline) -> None:
+def _install_pipeline(application: FastAPI, pipeline: ExtractionPipelineProtocol) -> None:
     application.dependency_overrides[get_pipeline] = lambda: pipeline
 
 

@@ -5,7 +5,7 @@ from typing import Annotated, cast
 from fastapi import APIRouter, Depends, Request, status
 
 from reelio.extraction import schemas as extraction_schemas
-from reelio.extraction.service import Pipeline
+from reelio.extraction.service import ExtractionPipelineProtocol
 from reelio.extraction.types import (
     Candidate,
     EnrichedMovie,
@@ -16,16 +16,16 @@ from reelio.extraction.types import (
 router = APIRouter(prefix="/api", tags=["extraction"])
 
 
-def get_pipeline(request: Request) -> Pipeline:
+def get_pipeline(request: Request) -> ExtractionPipelineProtocol:
     """Provide the lifespan-owned extraction pipeline.
 
     Args:
         request: Current request whose application owns the pipeline.
 
     Returns:
-        Pipeline: The composed extraction pipeline.
+        ExtractionPipelineProtocol: The composed extraction pipeline.
     """
-    return cast(Pipeline, request.app.state.extraction_pipeline)
+    return cast(ExtractionPipelineProtocol, request.app.state.extraction_pipeline)
 
 
 def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.Movie:
@@ -121,13 +121,13 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
 )
 async def extract(
     payload: extraction_schemas.ExtractRequest,
-    pipeline: Annotated[Pipeline, Depends(get_pipeline)],
+    pipeline: Annotated[ExtractionPipelineProtocol, Depends(get_pipeline)],
 ) -> extraction_schemas.ExtractResponse:
     """Extract structured movie mentions from a submitted source URL.
 
     Args:
         payload: Validated extraction request containing the source URL.
-        pipeline: Pipeline implementation supplied by FastAPI dependency injection.
+        pipeline: ExtractionPipelineProtocol implementation supplied by FastAPI dependency injection.
 
     Returns:
         ExtractResponse: Canonical source, transcript, and mention results.

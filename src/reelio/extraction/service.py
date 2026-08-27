@@ -18,7 +18,7 @@ from reelio.extraction.types import (
 )
 
 
-class Pipeline(Protocol):
+class ExtractionPipelineProtocol(Protocol):
     """Define the end-to-end extraction pipeline boundary."""
 
     async def run(self, url: str) -> PipelineResult:

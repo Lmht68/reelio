@@ -14,7 +14,7 @@ from reelio.extraction.exceptions import (
     unhandled_error_handler,
 )
 from reelio.extraction.router import router as extraction_router
-from reelio.extraction.service import ExtractionPipeline, Pipeline
+from reelio.extraction.service import ExtractionPipeline, ExtractionPipelineProtocol
 from reelio.extraction.services.enrichment.config import (  # noqa: F401
     tmdb_settings as _tmdb_settings,
 )
@@ -38,10 +38,10 @@ from reelio.logging import configure_logging
 from reelio.ops import router as ops_router
 
 _DOCS_ENVIRONMENTS = {Environment.LOCAL, Environment.STAGING}
-_PipelineFactory = Callable[[], Awaitable[Pipeline]]
+_PipelineFactory = Callable[[], Awaitable[ExtractionPipelineProtocol]]
 
 
-async def _create_production_pipeline() -> Pipeline:
+async def _create_production_pipeline() -> ExtractionPipelineProtocol:
     """Load production dependencies and compose one extraction pipeline."""
     transcriber = await asyncio.to_thread(
         load_whisper_transcriber,
