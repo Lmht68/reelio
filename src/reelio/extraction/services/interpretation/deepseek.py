@@ -10,7 +10,7 @@ from reelio.extraction.exceptions import (
     MovieMentionInterpretationError,
     PipelineTimeoutError,
 )
-from reelio.extraction.services.interpretation.config import InterpretationConfig
+from reelio.extraction.services.interpretation.config import DeepSeekConfig
 from reelio.extraction.services.interpretation.types import LLMMessage
 
 _PROVIDER_ERROR_MESSAGE = "Movie Mention interpretation provider failed."
@@ -18,17 +18,27 @@ _PROVIDER_TIMEOUT_MESSAGE = "Movie Mention interpretation timed out."
 
 
 class DeepSeekProvider:
-    """Generate JSON movie interpretations through a reusable DeepSeek client."""
+    """Generate JSON Movie Mention interpretations through DeepSeek."""
 
-    def __init__(self, client: AsyncOpenAI, settings: InterpretationConfig) -> None:
+    def __init__(self, client: AsyncOpenAI, settings: DeepSeekConfig) -> None:
         """Initialize the adapter with a lifespan-owned client and settings.
 
         Args:
-            client: OpenAI-compatible asynchronous DeepSeek client.
-            settings: Validated model and generation settings.
+            client: OpenAI SDK client configured for DeepSeek.
+            settings: Validated DeepSeek request settings.
         """
         self._client = client
         self._settings = settings
+
+    @property
+    def provider_name(self) -> str:
+        """Return the provider identity safe for structured logging."""
+        return "deepseek"
+
+    @property
+    def model_name(self) -> str:
+        """Return the configured model identity safe for structured logging."""
+        return self._settings.model
 
     async def complete(self, messages: Sequence[LLMMessage]) -> str:
         """Return one DeepSeek JSON completion.
@@ -49,11 +59,11 @@ class DeepSeekProvider:
         )
         try:
             response = await self._client.chat.completions.create(
-                model=self._settings.deepseek_model,
+                model=self._settings.model,
                 messages=provider_messages,
                 response_format={"type": "json_object"},
-                temperature=self._settings.deepseek_temperature,
-                max_tokens=self._settings.deepseek_max_output_tokens,
+                temperature=self._settings.temperature,
+                max_tokens=self._settings.max_output_tokens,
                 extra_body={"thinking": {"type": "disabled"}},
             )
         except APITimeoutError as exc:
@@ -70,18 +80,19 @@ class DeepSeekProvider:
         await self._client.close()
 
 
-def create_deepseek_provider(settings: InterpretationConfig) -> DeepSeekProvider:
+def create_deepseek_provider(settings: DeepSeekConfig) -> DeepSeekProvider:
     """Create a reusable DeepSeek adapter from validated application settings.
 
     Args:
-        settings: DeepSeek credentials, endpoint, timeout, and model options.
+        settings: DeepSeek credentials, endpoint, and generation options.
 
     Returns:
         DeepSeekProvider: Provider adapter owning one asynchronous client.
     """
     client = AsyncOpenAI(
-        api_key=settings.deepseek_api_key.get_secret_value(),
-        base_url=settings.deepseek_base_url,
-        timeout=settings.deepseek_request_timeout_seconds,
+        api_key=settings.api_key.get_secret_value(),
+        base_url=settings.base_url,
+        timeout=settings.request_timeout_seconds,
+        max_retries=settings.max_retries,
     )
     return DeepSeekProvider(client, settings)

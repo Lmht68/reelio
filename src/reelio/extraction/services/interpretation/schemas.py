@@ -1,4 +1,4 @@
-"""Strict DeepSeek response schemas for Movie Mention interpretation."""
+"""Strict response schemas for Movie Mention interpretation."""
 
 import unicodedata
 
@@ -10,7 +10,7 @@ _EARLIEST_MOVIE_YEAR = 1888
 
 
 class InterpretedMovie(BaseModel):
-    """Validate one canonical movie title and release year from DeepSeek."""
+    """Validate one canonical movie title and release year."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -23,7 +23,7 @@ class InterpretedMovie(BaseModel):
         """Normalize serialization whitespace without changing title semantics.
 
         Args:
-            value: Canonical title returned by DeepSeek.
+            value: Canonical title returned by the provider.
 
         Returns:
             str: NFC-normalized title with collapsed whitespace.
@@ -44,7 +44,7 @@ class InterpretedMovie(BaseModel):
         """Reject implausible future release years.
 
         Args:
-            value: Release year returned by DeepSeek.
+            value: Release year returned by the provider.
 
         Returns:
             int: The validated release year.
@@ -59,7 +59,7 @@ class InterpretedMovie(BaseModel):
 
 
 class MovieInterpretationResponse(BaseModel):
-    """Validate the complete structured response returned by DeepSeek."""
+    """Validate the complete structured Movie Mention response."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 

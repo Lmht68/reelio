@@ -25,12 +25,22 @@ from reelio.extraction.types import MovieMention, Source, Transcript
 logger = logging.getLogger(__name__)
 
 _INPUT_LIMIT_MESSAGE = "Interpretation Material exceeds the configured limit."
-_INVALID_RESPONSE_MESSAGE = "DeepSeek returned an invalid Movie Mention response."
+_INVALID_RESPONSE_MESSAGE = "The LLM returned an invalid Movie Mention response."
 _STAGE = "movie_mention_interpretation"
 
 
 class MovieMentionProvider(Protocol):
     """Define the provider boundary used by Movie Mention interpretation."""
+
+    @property
+    def provider_name(self) -> str:
+        """Return the provider identity safe for structured logging."""
+        ...
+
+    @property
+    def model_name(self) -> str:
+        """Return the model identity safe for structured logging."""
+        ...
 
     async def complete(self, messages: Sequence[LLMMessage]) -> str:
         """Return structured response content for trusted-role messages.
@@ -64,7 +74,7 @@ class MovieMentionInterpretationService:
 
         Args:
             provider: Provider-neutral structured completion adapter.
-            settings: Interpretation input and DeepSeek response settings.
+            settings: Interpretation Material size limits.
         """
         self._provider = provider
         self._settings = settings
@@ -87,7 +97,7 @@ class MovieMentionInterpretationService:
         Raises:
             InterpretationInputTooLargeError: If any Interpretation Material field
                 exceeds its configured limit.
-            InvalidLLMResponseError: If DeepSeek returns malformed or invalid JSON.
+            InvalidLLMResponseError: If the provider returns malformed or invalid JSON.
             MovieMentionInterpretationError: If the provider request fails.
             PipelineTimeoutError: If the provider request times out.
         """
@@ -113,6 +123,8 @@ class MovieMentionInterpretationService:
                 extra={
                     "stage": _STAGE,
                     "reason": exc.code,
+                    "provider": self._provider.provider_name,
+                    "model": self._provider.model_name,
                     "duration_ms": _duration_ms(started_at),
                 },
             )
@@ -126,6 +138,8 @@ class MovieMentionInterpretationService:
                 extra={
                     "stage": _STAGE,
                     "reason": "invalid_provider_response",
+                    "provider": self._provider.provider_name,
+                    "model": self._provider.model_name,
                     "duration_ms": _duration_ms(started_at),
                 },
             )

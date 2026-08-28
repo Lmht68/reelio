@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -18,10 +18,11 @@ from reelio.extraction.service import ExtractionPipeline, ExtractionPipelineProt
 from reelio.extraction.services.enrichment.config import tmdb_settings as _tmdb_settings
 from reelio.extraction.services.enrichment.tmdb import create_tmdb_movie_resolver
 from reelio.extraction.services.interpretation.config import (
-    interpretation_settings as _interpretation_settings,
+    InterpretationConfig,
+    LLMProviderSelectionConfig,
 )
-from reelio.extraction.services.interpretation.deepseek import (
-    create_deepseek_provider,
+from reelio.extraction.services.interpretation.factory import (
+    create_movie_mention_provider,
 )
 from reelio.extraction.services.interpretation.service import (
     MovieMentionInterpretationService,
@@ -48,35 +49,42 @@ _PipelineFactory = Callable[[], Awaitable[ExtractionPipelineProtocol]]
 
 async def _create_production_pipeline() -> ExtractionPipelineProtocol:
     """Load production dependencies and compose one extraction pipeline."""
-    transcriber = await asyncio.to_thread(
-        load_whisper_transcriber,
-        _transcription_settings,
-    )
-    source_metadata_service = SourceMetadataService(
-        extractor=YtDlpMetadataExtractor(
-            max_duration_seconds=_transcription_settings.max_video_duration_seconds,
+    interpretation_settings = InterpretationConfig()
+    llm_provider_selection = LLMProviderSelectionConfig()  # type: ignore[call-arg]
+    async with AsyncExitStack() as cleanup:
+        llm_provider = create_movie_mention_provider(llm_provider_selection)
+        cleanup.push_async_callback(llm_provider.aclose)
+        transcriber = await asyncio.to_thread(
+            load_whisper_transcriber,
+            _transcription_settings,
+        )
+        source_metadata_service = SourceMetadataService(
+            extractor=YtDlpMetadataExtractor(
+                max_duration_seconds=_transcription_settings.max_video_duration_seconds,
+                temp_media_dir=_transcription_settings.temp_media_dir,
+            ),
+            settings=_transcription_settings,
+        )
+        transcription_service = TranscriptionService(
+            provider=YouTubeCaptionProvider(),
+            audio_downloader=YtDlpAudioDownloader(),
+            transcriber=transcriber,
             temp_media_dir=_transcription_settings.temp_media_dir,
-        ),
-        settings=_transcription_settings,
-    )
-    transcription_service = TranscriptionService(
-        provider=YouTubeCaptionProvider(),
-        audio_downloader=YtDlpAudioDownloader(),
-        transcriber=transcriber,
-        temp_media_dir=_transcription_settings.temp_media_dir,
-        semaphore=asyncio.Semaphore(1),
-    )
-    interpretation_service = MovieMentionInterpretationService(
-        provider=create_deepseek_provider(_interpretation_settings),
-        settings=_interpretation_settings,
-    )
-    movie_resolver = create_tmdb_movie_resolver(_tmdb_settings)
-    return ExtractionPipeline(
-        source_metadata_service=source_metadata_service,
-        transcription_service=transcription_service,
-        interpretation_service=interpretation_service,
-        movie_resolver=movie_resolver,
-    )
+            semaphore=asyncio.Semaphore(1),
+        )
+        interpretation_service = MovieMentionInterpretationService(
+            provider=llm_provider,
+            settings=interpretation_settings,
+        )
+        movie_resolver = create_tmdb_movie_resolver(_tmdb_settings)
+        pipeline = ExtractionPipeline(
+            source_metadata_service=source_metadata_service,
+            transcription_service=transcription_service,
+            interpretation_service=interpretation_service,
+            movie_resolver=movie_resolver,
+        )
+        cleanup.pop_all()
+        return pipeline
 
 
 @asynccontextmanager

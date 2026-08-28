@@ -1,14 +1,20 @@
 """Application composition and documentation lifecycle tests."""
 
 from collections.abc import Callable
-from typing import cast
+from typing import NoReturn, cast
 
 import ctranslate2
 import pytest
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 
 import reelio.extraction.services.transcription.acquisition as transcription_service
+import reelio.main as main_module
 from reelio.config import Environment, app_settings
+from reelio.extraction.services.interpretation.config import (
+    LLMProvider,
+    LLMProviderSelectionConfig,
+)
 from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.types import PipelineResult
 from reelio.main import create_app
@@ -20,6 +26,27 @@ class _FakePipeline:
 
     async def run(self, url: str) -> PipelineResult:
         raise AssertionError(f"unexpected pipeline call for {url}")
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+class _FakeProvider:
+    def __init__(self) -> None:
+        self.provider_name = "openai"
+        self.model_name = "gpt-5-mini"
+        self.close_calls = 0
+
+    async def complete(self, messages: object) -> str:
+        raise AssertionError(f"unexpected provider completion: {messages}")
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+class _FakeMovieResolver:
+    def __init__(self) -> None:
+        self.close_calls = 0
 
     async def aclose(self) -> None:
         self.close_calls += 1
@@ -154,6 +181,80 @@ async def test_pipeline_factory_failure_aborts_lifespan() -> None:
     context = application.router.lifespan_context(application)
 
     with pytest.raises(RuntimeError, match="model load failed"):
+        await context.__aenter__()
+
+    assert not hasattr(application.state, "extraction_pipeline")
+
+
+async def test_production_lifespan_closes_one_selected_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Construct one selected provider and close it when production stops."""
+    monkeypatch.setenv("REELIO_LLM_PROVIDER", "openai")
+    provider = _FakeProvider()
+    resolver = _FakeMovieResolver()
+    provider_factory_calls = 0
+
+    def create_provider(selection: LLMProviderSelectionConfig) -> _FakeProvider:
+        nonlocal provider_factory_calls
+        provider_factory_calls += 1
+        assert selection.llm_provider is LLMProvider.OPENAI
+        return provider
+
+    monkeypatch.setattr(main_module, "create_movie_mention_provider", create_provider)
+    monkeypatch.setattr(main_module, "load_whisper_transcriber", lambda settings: object())
+    monkeypatch.setattr(
+        main_module,
+        "create_tmdb_movie_resolver",
+        lambda settings: resolver,
+    )
+    application = create_app()
+
+    async with application.router.lifespan_context(application):
+        assert provider_factory_calls == 1
+
+    assert provider.close_calls == 1
+    assert resolver.close_calls == 1
+
+
+async def test_production_lifespan_closes_provider_after_partial_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Close a selected provider when a later production dependency fails."""
+    monkeypatch.setenv("REELIO_LLM_PROVIDER", "openai")
+    provider = _FakeProvider()
+
+    def create_provider(selection: LLMProviderSelectionConfig) -> _FakeProvider:
+        assert selection.llm_provider is LLMProvider.OPENAI
+        return provider
+
+    def fail_whisper_load(settings: TranscriptionConfig) -> NoReturn:
+        raise RuntimeError("Whisper load failed")
+
+    monkeypatch.setattr(
+        main_module,
+        "create_movie_mention_provider",
+        create_provider,
+    )
+    monkeypatch.setattr(main_module, "load_whisper_transcriber", fail_whisper_load)
+    application = create_app()
+    context = application.router.lifespan_context(application)
+
+    with pytest.raises(RuntimeError, match="Whisper load failed"):
+        await context.__aenter__()
+    assert provider.close_calls == 1
+    assert not hasattr(application.state, "extraction_pipeline")
+
+
+async def test_production_lifespan_rejects_unsupported_provider_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail startup before making an extraction pipeline for an unknown provider."""
+    monkeypatch.setenv("REELIO_LLM_PROVIDER", "unsupported")
+    application = create_app()
+    context = application.router.lifespan_context(application)
+
+    with pytest.raises(ValidationError):
         await context.__aenter__()
 
     assert not hasattr(application.state, "extraction_pipeline")

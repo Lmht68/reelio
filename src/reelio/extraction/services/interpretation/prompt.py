@@ -6,7 +6,7 @@ from reelio.extraction.types import maximum_movie_release_year
 
 
 def build_system_prompt() -> str:
-    """Build the trusted DeepSeek instructions for movie interpretation.
+    """Build trusted instructions for Movie Mention interpretation.
 
     Returns:
         str: System instructions containing the current valid release-year horizon.

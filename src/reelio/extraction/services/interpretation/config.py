@@ -1,12 +1,30 @@
-"""DeepSeek configuration for Movie Mention interpretation."""
+"""Configuration models for Movie Mention interpretation."""
 
-from pydantic import Field, SecretStr, field_validator
+from enum import StrEnum
+from typing import Annotated
+
+from openai.types.shared_params import ReasoningEffort
+from pydantic import AfterValidator, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class InterpretationConfig(BaseSettings):
-    """Validate DeepSeek credentials, request options, and input limits."""
+class LLMProvider(StrEnum):
+    """Identify an LLM provider supported for Movie Mention interpretation."""
 
+    OPENAI = "openai"
+    DEEPSEEK = "deepseek"
+
+
+def _reject_blank_api_key(value: SecretStr) -> SecretStr:
+    if not value.get_secret_value().strip():
+        raise ValueError("API key must not be blank")
+    return value
+
+
+type _NonBlankSecret = Annotated[SecretStr, AfterValidator(_reject_blank_api_key)]
+
+
+class _ReelioSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="REELIO_",
         env_file=".env",
@@ -14,37 +32,44 @@ class InterpretationConfig(BaseSettings):
         populate_by_name=True,
     )
 
-    deepseek_api_key: SecretStr = Field(validation_alias="REELIO_DEEPSEEK_API_KEY")
-    deepseek_base_url: str = Field(
-        default="https://api.deepseek.com",
-        min_length=1,
-    )
-    deepseek_model: str = Field(default="deepseek-v4-flash", min_length=1)
-    deepseek_request_timeout_seconds: float = Field(default=60.0, gt=0)
-    deepseek_temperature: float = Field(default=0.0, ge=0, le=2)
-    deepseek_max_output_tokens: int = Field(default=8_192, gt=0)
+
+class LLMProviderSelectionConfig(_ReelioSettings):
+    """Validate the LLM provider selected for Movie Mention interpretation."""
+
+    llm_provider: LLMProvider = Field(validation_alias="REELIO_LLM_PROVIDER")
+
+
+class InterpretationConfig(_ReelioSettings):
+    """Validate Interpretation Material limits."""
+
     max_source_title_chars: int = Field(default=500, gt=0)
     max_description_chars: int = Field(default=2_000, gt=0)
     max_transcript_language_chars: int = Field(default=64, gt=0)
     max_transcript_chars: int = Field(default=100_000, gt=0)
 
-    @field_validator("deepseek_api_key")
-    @classmethod
-    def reject_blank_api_key(cls, value: SecretStr) -> SecretStr:
-        """Reject an empty or whitespace-only DeepSeek API key.
 
-        Args:
-            value: Secret value loaded from application settings.
-
-        Returns:
-            SecretStr: The validated API key.
-
-        Raises:
-            ValueError: If the API key contains no non-whitespace characters.
-        """
-        if not value.get_secret_value().strip():
-            raise ValueError("REELIO_DEEPSEEK_API_KEY must not be blank")
-        return value
+class _ProviderRequestConfig(_ReelioSettings):
+    request_timeout_seconds: float = Field(default=60.0, gt=0)
+    max_output_tokens: int = Field(default=8_192, gt=0)
+    max_retries: int = Field(default=2, ge=0)
 
 
-interpretation_settings = InterpretationConfig()  # type: ignore[call-arg]
+class OpenAIConfig(_ProviderRequestConfig):
+    """Validate OpenAI credentials and request options."""
+
+    model_config = SettingsConfigDict(env_prefix="REELIO_OPENAI_")
+
+    api_key: _NonBlankSecret = Field(validation_alias="REELIO_OPENAI_API_KEY")
+    model: str = Field(default="gpt-5-nano", min_length=1)
+    reasoning_effort: ReasoningEffort = "low"
+
+
+class DeepSeekConfig(_ProviderRequestConfig):
+    """Validate DeepSeek credentials and request options."""
+
+    model_config = SettingsConfigDict(env_prefix="REELIO_DEEPSEEK_")
+
+    api_key: _NonBlankSecret = Field(validation_alias="REELIO_DEEPSEEK_API_KEY")
+    base_url: str = Field(default="https://api.deepseek.com", min_length=1)
+    model: str = Field(default="deepseek-v4-flash", min_length=1)
+    temperature: float = Field(default=0.0, ge=0, le=2)
