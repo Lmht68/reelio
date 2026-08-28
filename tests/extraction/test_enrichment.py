@@ -117,6 +117,48 @@ async def test_resolver_selects_first_title_and_year_match_and_enriches() -> Non
     assert client.is_closed is True
 
 
+async def test_resolver_matches_provider_alternative_title() -> None:
+    """Resolve a Movie Mention through a provider alternative title."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 1,
+                            "title": "Le Fabuleux Destin d'Amélie Poulain",
+                            "original_title": "Le Fabuleux Destin d'Amélie Poulain",
+                            "release_date": "2001-04-25",
+                        }
+                    ]
+                },
+            )
+
+        assert request.url.path == "/3/movie/1"
+        assert request.url.params["append_to_response"] == "credits,alternative_titles"
+        return httpx.Response(
+            200,
+            json={
+                "id": 1,
+                "title": "Le Fabuleux Destin d'Amélie Poulain",
+                "release_date": "2001-04-25",
+                "alternative_titles": {"titles": [{"title": "Amélie"}]},
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBMovieResolver(client, "https://image.tmdb.org/t/p/w500")
+
+    results = await resolver.resolve([MovieMention(title="Amélie", year=2001)])
+
+    assert results[0].status is ResultStatus.RESOLVED
+    assert results[0].movie is not None
+    assert results[0].movie.tmdb_id == 1
+    await resolver.aclose()
+
+
 async def test_resolver_searches_first_page_only_before_returning_unresolved() -> None:
     """Inspect only the first candidate page before returning an unresolved result."""
     requested_pages: list[str] = []

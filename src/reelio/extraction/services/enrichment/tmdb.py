@@ -151,7 +151,7 @@ class TMDBMovieResolver:
 
             if not primary_titles_matched:
                 if not any(
-                    normalize_movie_title(alternative_title) == normalized_mention_title
+                    normalize_movie_title(alternative_title.title) == normalized_mention_title
                     for alternative_title in movie.alternative_titles.titles
                 ):
                     continue
