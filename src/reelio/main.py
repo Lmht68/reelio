@@ -70,7 +70,7 @@ async def _create_production_pipeline() -> ExtractionPipelineProtocol:
             audio_downloader=YtDlpAudioDownloader(),
             transcriber=transcriber,
             temp_media_dir=_transcription_settings.temp_media_dir,
-            semaphore=asyncio.Semaphore(1),
+            semaphore=asyncio.Semaphore(_transcription_settings.whisper_max_concurrent),
         )
         interpretation_service = MovieMentionInterpretationService(
             provider=llm_provider,
