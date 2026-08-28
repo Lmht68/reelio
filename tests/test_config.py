@@ -189,7 +189,8 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert transcription_settings.whisper_vad_filter is True
     assert transcription_settings.whisper_temperature == 0.0
     assert transcription_settings.whisper_cond_on_prev_txt is True
-    assert transcription_settings.whisper_initial_prompt == ""
+    assert transcription_settings.whisper_initial_prompt == "This transcript may mention movies, TV shows, directors, actors, songs, albums, artists, bands, books, and authors. Transcribe proper names accurately."
+    assert transcription_settings.whisper_max_concurrent == 1
     assert openai_settings.model == "gpt-5-nano"
     assert openai_settings.reasoning_effort == "low"
     assert openai_settings.request_timeout_seconds == 60.0
@@ -242,7 +243,7 @@ def test_whisper_transcription_environment_overrides(
     monkeypatch.setenv("REELIO_WHISPER_VAD_FILTER", "false")
     monkeypatch.setenv("REELIO_WHISPER_TEMPERATURE", "0.25")
     monkeypatch.setenv("REELIO_WHISPER_COND_ON_PREV_TXT", "false")
-    monkeypatch.setenv("REELIO_WHISPER_INITIAL_PROMPT", "Use proper names.")
+    monkeypatch.setenv("REELIO_WHISPER_MAX_CONCURRENT", "3")
 
     settings = _without_dotenv(TranscriptionConfig)
 
@@ -250,7 +251,7 @@ def test_whisper_transcription_environment_overrides(
     assert settings.whisper_vad_filter is False
     assert settings.whisper_temperature == 0.25
     assert settings.whisper_cond_on_prev_txt is False
-    assert settings.whisper_initial_prompt == "Use proper names."
+    assert settings.whisper_max_concurrent == 3
 
 
 def test_openai_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
