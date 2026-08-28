@@ -28,7 +28,7 @@ def _client(handler: httpx.AsyncBaseTransport) -> httpx.AsyncClient:
 
 
 async def test_resolver_selects_first_title_and_year_match_and_enriches() -> None:
-    """Match provider alternatives in candidate order and attach verified metadata."""
+    """Select the first title-and-year match from the first search page."""
     requested_paths: list[str] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
@@ -36,17 +36,28 @@ async def test_resolver_selects_first_title_and_year_match_and_enriches() -> Non
         if request.url.path == "/3/search/movie":
             assert request.url.params["query"] == "Amélie"
             assert request.url.params["year"] == "2001"
+            assert request.url.params["page"] == "1"
             return httpx.Response(
                 200,
                 json={
                     "results": [
-                        {"id": 1, "release_date": "2001-01-01"},
-                        {"id": 2, "release_date": "2001-04-25"},
+                        {
+                            "id": 1,
+                            "title": "A Different Film",
+                            "original_title": "A Different Film",
+                            "release_date": "2001-01-01",
+                        },
+                        {
+                            "id": 2,
+                            "title": "Le Fabuleux Destin d'Amélie Poulain",
+                            "original_title": "Amélie",
+                            "release_date": "2001-04-25",
+                        },
                     ],
-                    "total_pages": 1,
                 },
             )
         if request.url.path == "/3/movie/1":
+            assert request.url.params["append_to_response"] == "credits,alternative_titles"
             return httpx.Response(
                 200,
                 json={
@@ -56,8 +67,9 @@ async def test_resolver_selects_first_title_and_year_match_and_enriches() -> Non
                     "alternative_titles": {"titles": []},
                 },
             )
+
         assert request.url.path == "/3/movie/2"
-        assert request.url.params["append_to_response"] == "credits,alternative_titles"
+        assert request.url.params["append_to_response"] == "credits"
         return httpx.Response(
             200,
             json={
@@ -74,9 +86,6 @@ async def test_resolver_selects_first_title_and_year_match_and_enriches() -> Non
                         {"name": "Jean-Pierre Jeunet", "job": "Director"},
                         {"name": "Bruno Delbonnel", "job": "Director of Photography"},
                     ]
-                },
-                "alternative_titles": {
-                    "titles": [{"title": "Amélie"}],
                 },
             },
         )
@@ -108,24 +117,22 @@ async def test_resolver_selects_first_title_and_year_match_and_enriches() -> Non
     assert client.is_closed is True
 
 
-async def test_resolver_searches_later_pages_before_returning_unresolved() -> None:
-    """Inspect every ordered candidate page before leaving a Movie Mention unresolved."""
+async def test_resolver_searches_first_page_only_before_returning_unresolved() -> None:
+    """Inspect only the first candidate page before returning an unresolved result."""
     requested_pages: list[str] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/3/search/movie":
-            page = request.url.params["page"]
-            requested_pages.append(page)
-            if page == "1":
-                return httpx.Response(
-                    200,
-                    json={
-                        "results": [{"id": 1, "release_date": "1999-01-01"}],
-                        "total_pages": 2,
-                    },
-                )
-            return httpx.Response(200, json={"results": [], "total_pages": 2})
-        raise AssertionError(f"unexpected details request: {request.url.path}")
+        assert request.url.path == "/3/search/movie"
+        page = request.url.params["page"]
+        requested_pages.append(page)
+        assert page == "1"
+        return httpx.Response(
+            200,
+            json={
+                "results": [{"id": 1, "release_date": "1999-01-01"}],
+                "total_pages": 2,
+            },
+        )
 
     client = _client(httpx.MockTransport(handle))
     resolver = TMDBMovieResolver(client, "https://image.tmdb.org/t/p/w500")
@@ -133,7 +140,7 @@ async def test_resolver_searches_later_pages_before_returning_unresolved() -> No
 
     results = await resolver.resolve([movie_mention])
 
-    assert requested_pages == ["1", "2"]
+    assert requested_pages == ["1"]
     assert results[0].status is ResultStatus.UNRESOLVED
     assert results[0].movie_mention is movie_mention
     assert results[0].movie is None
