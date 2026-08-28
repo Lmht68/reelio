@@ -8,18 +8,21 @@ from datetime import date
 from types import SimpleNamespace
 from typing import cast
 
+import httpx
 import pytest
-from openai import AsyncOpenAI
+from openai import APIError, APITimeoutError, AsyncOpenAI
 
 import reelio.extraction.services.interpretation.deepseek as deepseek_adapter
 from reelio.extraction.exceptions import (
     InterpretationInputTooLargeError,
     InvalidLLMResponseError,
     MovieMentionInterpretationError,
+    PipelineTimeoutError,
 )
 from reelio.extraction.services.interpretation.config import (
     DeepSeekConfig,
     InterpretationConfig,
+    LLMProvider,
 )
 from reelio.extraction.services.interpretation.deepseek import (
     DeepSeekProvider,
@@ -39,6 +42,11 @@ from reelio.extraction.types import (
 )
 
 
+class _ProviderLogRecord(logging.LogRecord):
+    provider: str
+    model: str
+
+
 class _FakeProvider:
     def __init__(
         self,
@@ -49,7 +57,7 @@ class _FakeProvider:
         self.error = error
         self.calls: list[tuple[LLMMessage, ...]] = []
         self.closed = False
-        self.provider_name = "fake"
+        self.provider_name = LLMProvider.DEEPSEEK
         self.model_name = "fake-model"
 
     async def complete(self, messages: Sequence[LLMMessage]) -> str:
@@ -65,20 +73,23 @@ class _FakeProvider:
 
 
 class _FakeCompletions:
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str, error: APIError | None = None) -> None:
         self.content = content
+        self.error = error
         self.kwargs: dict[str, object] | None = None
 
     async def create(self, **kwargs: object) -> SimpleNamespace:
         self.kwargs = kwargs
+        if self.error is not None:
+            raise self.error
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=self.content))]
         )
 
 
 class _FakeOpenAIClient:
-    def __init__(self, content: str) -> None:
-        self.completions = _FakeCompletions(content)
+    def __init__(self, content: str, error: APIError | None = None) -> None:
+        self.completions = _FakeCompletions(content, error)
         self.chat = SimpleNamespace(completions=self.completions)
         self.closed = False
 
@@ -467,8 +478,9 @@ async def test_logs_never_include_transcript_or_raw_invalid_response(
     assert raw_response not in log_text
     assert "response validation failed" in log_text
     assert len(caplog.records) == 1
-    assert caplog.records[0].provider == "fake"
-    assert caplog.records[0].model == "fake-model"
+    record = cast(_ProviderLogRecord, caplog.records[0])
+    assert record.provider == "deepseek"
+    assert record.model == "fake-model"
 
 
 def test_deepseek_provider_constructor_uses_configured_client_options(
@@ -492,7 +504,7 @@ def test_deepseek_provider_constructor_uses_configured_client_options(
         )
     )
 
-    assert provider.provider_name == "deepseek"
+    assert provider.provider_name is LLMProvider.DEEPSEEK
     assert client_options == [
         {
             "api_key": "test-key",
@@ -522,6 +534,35 @@ async def test_deepseek_adapter_sends_json_options_and_closes_client() -> None:
         "max_tokens": 8_192,
         "extra_body": {"thinking": {"type": "disabled"}},
     }
-    assert provider.provider_name == "deepseek"
+    assert provider.provider_name is LLMProvider.DEEPSEEK
     assert provider.model_name == "deepseek-v4-flash"
     assert fake_client.closed is True
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_error"),
+    [
+        (
+            APITimeoutError(httpx.Request("POST", "https://api.deepseek.com/chat/completions")),
+            PipelineTimeoutError,
+        ),
+        (
+            APIError(
+                "provider error",
+                httpx.Request("POST", "https://api.deepseek.com/chat/completions"),
+                body=None,
+            ),
+            MovieMentionInterpretationError,
+        ),
+    ],
+)
+async def test_deepseek_adapter_maps_sdk_failures(
+    error: APIError,
+    expected_error: type[Exception],
+) -> None:
+    """Translate DeepSeek SDK exceptions to provider-neutral extraction failures."""
+    fake_client = _FakeOpenAIClient("", error)
+    provider = DeepSeekProvider(cast(AsyncOpenAI, fake_client), _deepseek_settings())
+
+    with pytest.raises(expected_error):
+        await provider.complete([])

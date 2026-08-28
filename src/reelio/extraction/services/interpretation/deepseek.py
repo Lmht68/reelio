@@ -10,7 +10,10 @@ from reelio.extraction.exceptions import (
     MovieMentionInterpretationError,
     PipelineTimeoutError,
 )
-from reelio.extraction.services.interpretation.config import DeepSeekConfig
+from reelio.extraction.services.interpretation.config import (
+    DeepSeekConfig,
+    LLMProvider,
+)
 from reelio.extraction.services.interpretation.types import LLMMessage
 
 _PROVIDER_ERROR_MESSAGE = "Movie Mention interpretation provider failed."
@@ -31,9 +34,9 @@ class DeepSeekProvider:
         self._settings = settings
 
     @property
-    def provider_name(self) -> str:
+    def provider_name(self) -> LLMProvider:
         """Return the provider identity safe for structured logging."""
-        return "deepseek"
+        return LLMProvider.DEEPSEEK
 
     @property
     def model_name(self) -> str:

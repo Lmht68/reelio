@@ -1,22 +1,39 @@
 """Selected Movie Mention provider factory tests."""
 
+from collections.abc import Callable, Sequence
+from typing import cast
+
 import pytest
 
 import reelio.extraction.services.interpretation.factory as provider_factory
 from reelio.extraction.services.interpretation.config import (
     DeepSeekConfig,
-    OpenAIConfig,
+    LLMProvider,
     LLMProviderSelectionConfig,
+    OpenAIConfig,
 )
+from reelio.extraction.services.interpretation.types import LLMMessage
 
 
 class _FakeProvider:
-    async def complete(self, messages: object) -> str:
+    provider_name = LLMProvider.OPENAI
+    model_name = "test-model"
+
+    async def complete(self, messages: Sequence[LLMMessage]) -> str:
         """Reject unexpected completion calls during factory tests."""
         raise AssertionError("unexpected provider completion")
 
     async def aclose(self) -> None:
         """Release no resources for factory tests."""
+
+
+def _selection() -> LLMProviderSelectionConfig:
+    """Load provider selection from the test environment."""
+    settings_type = cast(
+        Callable[..., LLMProviderSelectionConfig],
+        LLMProviderSelectionConfig,
+    )
+    return settings_type(_env_file=None)
 
 
 def test_factory_constructs_only_selected_openai_provider(
@@ -25,6 +42,7 @@ def test_factory_constructs_only_selected_openai_provider(
     """Ignore invalid DeepSeek settings when OpenAI is selected at startup."""
     monkeypatch.setenv("REELIO_LLM_PROVIDER", "openai")
     monkeypatch.setenv("REELIO_OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("REELIO_OPENAI_MODEL", "gpt-5-nano")
     monkeypatch.setenv("REELIO_DEEPSEEK_REQUEST_TIMEOUT_SECONDS", "not-a-number")
     provider = _FakeProvider()
     captured_settings: list[OpenAIConfig] = []
@@ -40,10 +58,10 @@ def test_factory_constructs_only_selected_openai_provider(
         lambda settings: pytest.fail(f"unexpected DeepSeek configuration: {settings}"),
     )
 
-    selected_provider = provider_factory.create_movie_mention_provider(LLMProviderSelectionConfig())
+    selected_provider = provider_factory.create_movie_mention_provider(_selection())
 
     assert selected_provider is provider
-    assert captured_settings[0].model == "gpt-5-mini"
+    assert captured_settings[0].model == "gpt-5-nano"
 
 
 def test_factory_constructs_only_selected_deepseek_provider(
@@ -67,7 +85,7 @@ def test_factory_constructs_only_selected_deepseek_provider(
         lambda settings: pytest.fail(f"unexpected OpenAI configuration: {settings}"),
     )
 
-    selected_provider = provider_factory.create_movie_mention_provider(LLMProviderSelectionConfig())
+    selected_provider = provider_factory.create_movie_mention_provider(_selection())
 
     assert selected_provider is provider
     assert captured_settings[0].model == "deepseek-v4-flash"
@@ -91,4 +109,4 @@ def test_factory_does_not_fallback_after_selected_provider_failure(
     )
 
     with pytest.raises(RuntimeError, match="OpenAI construction failed"):
-        provider_factory.create_movie_mention_provider(LLMProviderSelectionConfig())
+        provider_factory.create_movie_mention_provider(_selection())

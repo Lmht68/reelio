@@ -33,8 +33,8 @@ class _FakePipeline:
 
 class _FakeProvider:
     def __init__(self) -> None:
-        self.provider_name = "openai"
-        self.model_name = "gpt-5-mini"
+        self.provider_name = LLMProvider.OPENAI
+        self.model_name = "gpt-5-nano"
         self.close_calls = 0
 
     async def complete(self, messages: object) -> str:

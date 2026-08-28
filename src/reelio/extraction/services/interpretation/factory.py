@@ -5,8 +5,8 @@ from typing import assert_never
 from reelio.extraction.services.interpretation.config import (
     DeepSeekConfig,
     LLMProvider,
-    OpenAIConfig,
     LLMProviderSelectionConfig,
+    OpenAIConfig,
 )
 from reelio.extraction.services.interpretation.deepseek import create_deepseek_provider
 from reelio.extraction.services.interpretation.openai import create_openai_provider

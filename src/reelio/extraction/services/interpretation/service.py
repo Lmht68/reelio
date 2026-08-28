@@ -13,7 +13,10 @@ from reelio.extraction.exceptions import (
     MovieMentionInterpretationError,
     PipelineTimeoutError,
 )
-from reelio.extraction.services.interpretation.config import InterpretationConfig
+from reelio.extraction.services.interpretation.config import (
+    InterpretationConfig,
+    LLMProvider,
+)
 from reelio.extraction.services.interpretation.prompt import (
     build_interpretation_material,
     build_system_prompt,
@@ -33,7 +36,7 @@ class MovieMentionProvider(Protocol):
     """Define the provider boundary used by Movie Mention interpretation."""
 
     @property
-    def provider_name(self) -> str:
+    def provider_name(self) -> LLMProvider:
         """Return the provider identity safe for structured logging."""
         ...
 
@@ -123,7 +126,7 @@ class MovieMentionInterpretationService:
                 extra={
                     "stage": _STAGE,
                     "reason": exc.code,
-                    "provider": self._provider.provider_name,
+                    "provider": self._provider.provider_name.value,
                     "model": self._provider.model_name,
                     "duration_ms": _duration_ms(started_at),
                 },
@@ -138,7 +141,7 @@ class MovieMentionInterpretationService:
                 extra={
                     "stage": _STAGE,
                     "reason": "invalid_provider_response",
-                    "provider": self._provider.provider_name,
+                    "provider": self._provider.provider_name.value,
                     "model": self._provider.model_name,
                     "duration_ms": _duration_ms(started_at),
                 },

@@ -15,8 +15,8 @@ from reelio.extraction.services.interpretation.config import (
     DeepSeekConfig,
     InterpretationConfig,
     LLMProvider,
-    OpenAIConfig,
     LLMProviderSelectionConfig,
+    OpenAIConfig,
 )
 from reelio.extraction.services.transcription.config import TranscriptionConfig
 
@@ -126,7 +126,7 @@ def test_openai_configuration_ignores_inactive_deepseek_settings(
 
     settings = _without_dotenv(OpenAIConfig, api_key="openai-key")
 
-    assert settings.model == "gpt-5-mini"
+    assert settings.model == "gpt-5-nano"
 
 
 def test_deepseek_configuration_ignores_inactive_openai_settings(
@@ -190,7 +190,7 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert transcription_settings.whisper_temperature == 0.0
     assert transcription_settings.whisper_cond_on_prev_txt is True
     assert transcription_settings.whisper_initial_prompt == ""
-    assert openai_settings.model == "gpt-5-mini"
+    assert openai_settings.model == "gpt-5-nano"
     assert openai_settings.reasoning_effort == "low"
     assert openai_settings.request_timeout_seconds == 60.0
     assert openai_settings.max_output_tokens == 8_192

@@ -11,7 +11,7 @@ from reelio.extraction.exceptions import (
     MovieMentionInterpretationError,
     PipelineTimeoutError,
 )
-from reelio.extraction.services.interpretation.config import OpenAIConfig
+from reelio.extraction.services.interpretation.config import LLMProvider, OpenAIConfig
 from reelio.extraction.services.interpretation.schemas import MovieInterpretationResponse
 from reelio.extraction.services.interpretation.types import LLMMessage
 
@@ -35,9 +35,9 @@ class OpenAIProvider:
         self._settings = settings
 
     @property
-    def provider_name(self) -> str:
+    def provider_name(self) -> LLMProvider:
         """Return the provider identity safe for structured logging."""
-        return "openai"
+        return LLMProvider.OPENAI
 
     @property
     def model_name(self) -> str:

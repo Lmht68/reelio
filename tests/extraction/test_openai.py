@@ -13,7 +13,7 @@ from reelio.extraction.exceptions import (
     MovieMentionInterpretationError,
     PipelineTimeoutError,
 )
-from reelio.extraction.services.interpretation.config import OpenAIConfig
+from reelio.extraction.services.interpretation.config import LLMProvider, OpenAIConfig
 from reelio.extraction.services.interpretation.openai import (
     OpenAIProvider,
     create_openai_provider,
@@ -75,7 +75,7 @@ def test_openai_provider_constructor_uses_configured_client_options(
         )
     )
 
-    assert provider.provider_name == "openai"
+    assert provider.provider_name is LLMProvider.OPENAI
     assert client_options == [
         {
             "api_key": "test-key",
@@ -99,7 +99,7 @@ async def test_openai_adapter_sends_strict_responses_request_and_closes_client()
 
     assert content == response_json
     assert fake_responses.kwargs == {
-        "model": "gpt-5-mini",
+        "model": "gpt-5-nano",
         "input": [{"role": "system", "content": "Return JSON"}],
         "reasoning": {"effort": "low"},
         "max_output_tokens": 8_192,
@@ -113,8 +113,8 @@ async def test_openai_adapter_sends_strict_responses_request_and_closes_client()
             }
         },
     }
-    assert provider.provider_name == "openai"
-    assert provider.model_name == "gpt-5-mini"
+    assert provider.provider_name is LLMProvider.OPENAI
+    assert provider.model_name == "gpt-5-nano"
     assert fake_client.closed is True
 
 
