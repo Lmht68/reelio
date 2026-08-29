@@ -46,7 +46,12 @@ class _CrewMember(_TMDBModel):
     job: str
 
 
+class _CastMember(_TMDBModel):
+    name: str
+
+
 class _Credits(_TMDBModel):
+    cast: list[_CastMember] = Field(default_factory=list)
     crew: list[_CrewMember] = Field(default_factory=list)
 
 
@@ -205,6 +210,7 @@ class TMDBMovieResolver:
         movie_mention: MovieMention,
         movie: _MovieDetails,
     ) -> EnrichedMovie:
+        cast_members = [member.name for member in movie.credits.cast[:5]]
         directors = list(
             dict.fromkeys(member.name for member in movie.credits.crew if member.job == "Director")
         )
@@ -215,6 +221,7 @@ class TMDBMovieResolver:
         return EnrichedMovie(
             title=movie_mention.title,
             year=movie_mention.year,
+            cast=cast_members,
             directors=directors,
             description=movie.overview,
             poster_url=poster_url,

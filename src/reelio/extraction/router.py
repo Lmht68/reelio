@@ -39,6 +39,7 @@ def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.MovieModel:
     return extraction_schemas.MovieModel(
         title=movie.title,
         year=movie.year,
+        cast=movie.cast,
         directors=movie.directors,
         description=movie.description,
         poster_url=movie.poster_url,

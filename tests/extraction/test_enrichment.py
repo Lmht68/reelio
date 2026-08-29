@@ -81,11 +81,19 @@ async def test_resolver_selects_first_title_and_year_match_and_enriches() -> Non
                 "imdb_id": "tt0211915",
                 "vote_average": 7.9,
                 "credits": {
+                    "cast": [
+                        {"name": "Audrey Tautou"},
+                        {"name": "Mathieu Kassovitz"},
+                        {"name": "Rufus"},
+                        {"name": "Lorella Cravotta"},
+                        {"name": "Serge Merlin"},
+                        {"name": "Jamel Debbouze"},
+                    ],
                     "crew": [
                         {"name": "Jean-Pierre Jeunet", "job": "Director"},
                         {"name": "Jean-Pierre Jeunet", "job": "Director"},
                         {"name": "Bruno Delbonnel", "job": "Director of Photography"},
-                    ]
+                    ],
                 },
             },
         )
@@ -105,6 +113,13 @@ async def test_resolver_selects_first_title_and_year_match_and_enriches() -> Non
     assert result.movie is not None
     assert result.movie.title == "Amélie"
     assert result.movie.year == 2001
+    assert result.movie.cast == [
+        "Audrey Tautou",
+        "Mathieu Kassovitz",
+        "Rufus",
+        "Lorella Cravotta",
+        "Serge Merlin",
+    ]
     assert result.movie.directors == ["Jean-Pierre Jeunet"]
     assert result.movie.description == "A Parisian woman quietly improves the lives around her."
     assert result.movie.poster_url == "https://image.tmdb.org/t/p/w500/amelie.jpg"

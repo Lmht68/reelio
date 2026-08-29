@@ -46,6 +46,7 @@ class MovieModel(BaseModel):
 
     title: str
     year: int
+    cast: list[str]
     directors: list[str]
     description: str
     poster_url: str | None

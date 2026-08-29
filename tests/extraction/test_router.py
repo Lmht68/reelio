@@ -181,6 +181,13 @@ def _pipeline(
     movie = EnrichedMovie(
         title=movie_mention.title,
         year=movie_mention.year,
+        cast=[
+            "Timothée Chalamet",
+            "Rebecca Ferguson",
+            "Oscar Isaac",
+            "Josh Brolin",
+            "Stellan Skarsgård",
+        ],
         directors=["Denis Villeneuve"],
         description="Paul Atreides faces his destiny on Arrakis.",
         poster_url="https://image.tmdb.org/t/p/w500/dune.jpg",
@@ -249,6 +256,13 @@ async def test_extract_returns_schema_valid_response(client: AsyncClient) -> Non
     assert resolved.movie_mention.year == 2021
     assert resolved.movie is not None
     assert resolved.movie.tmdb_id == 438631
+    assert resolved.movie.cast == [
+        "Timothée Chalamet",
+        "Rebecca Ferguson",
+        "Oscar Isaac",
+        "Josh Brolin",
+        "Stellan Skarsgård",
+    ]
     assert resolved.movie.directors == ["Denis Villeneuve"]
 
 

@@ -112,6 +112,7 @@ class EnrichedMovie:
     Attributes:
         title: Canonical movie title.
         year: Release year.
+        cast: Up to five provider-ordered cast member names.
         directors: Provider-verified director names.
         description: Short provider-supplied movie description.
         poster_url: Provider image URL when available.
@@ -124,6 +125,7 @@ class EnrichedMovie:
 
     title: str
     year: int
+    cast: list[str]
     directors: list[str]
     description: str
     poster_url: str | None
