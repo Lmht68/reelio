@@ -141,7 +141,6 @@ The API uses these error classes:
 
 All supported settings and their defaults are documented in [`.env.example`](.env.example).
 
-- `REELIO_ENVIRONMENT` accepts `local`, `staging`, or `production`, and defaults to `local`.
 - `REELIO_LOG_LEVEL` defaults to `INFO`.
 - `REELIO_LLM_PROVIDER` is required and accepts only the exact lowercase values `openai` and `deepseek`.
 - OpenAI uses `gpt-5-nano` by default and supports model, reasoning effort, timeout, output-token, and retry overrides.
@@ -183,7 +182,3 @@ src/reelio/
         ├── interpretation/         OpenAI and DeepSeek Movie Mention providers
         └── enrichment/             TMDB candidate resolution and enrichment
 ```
-
-The domain vocabulary and current product boundaries are recorded in [`CONTEXT.md`](CONTEXT.md).
-
-Provider-specific architecture decisions are recorded in [`docs/adr/0002-native-llm-provider-adapters.md`](docs/adr/0002-native-llm-provider-adapters.md).
