@@ -2,7 +2,10 @@
 
 import json
 
-from reelio.extraction.types import maximum_movie_release_year
+from reelio.extraction.types import (
+    MINIMUM_SCREEN_WORK_MENTION_YEAR,
+    maximum_screen_work_mention_year,
+)
 
 
 def build_system_prompt() -> str:
@@ -11,7 +14,7 @@ def build_system_prompt() -> str:
     Returns:
         str: System instructions containing the current valid release-year horizon.
     """
-    maximum_release_year = maximum_movie_release_year()
+    maximum_mention_year = maximum_screen_work_mention_year()
     return f"""You perform Movie Mention interpretation, not literal title extraction.
         Identify every movie referenced explicitly or implicitly in the supplied Interpretation Material.
         Return JSON only with exactly this shape: {{"movies":[{{"title":"Full canonical movie title","year":2021}}]}}.
@@ -30,7 +33,7 @@ def build_system_prompt() -> str:
         - Use the complete official English on-screen title, including subtitles, part numbers, punctuation, and disambiguating wording.
         - If no official English on-screen title exists, use the official US English release title.
         - Use the year of the earliest official public premiere, including a recognized film-festival premiere.
-        - Accept years from 1888 through {maximum_release_year}; future movies must be confirmed and scheduled, not hypothetical.
+        - Accept years from {MINIMUM_SCREEN_WORK_MENTION_YEAR} through {maximum_mention_year}; future movies must be confirmed and scheduled, not hypothetical.
         - Preserve first-reference order. Expand grouped references at their first position in canonical release or part order.
         - Expand duologies, trilogies, explicitly referenced series, and collective works into their intended separately released movies.
         - Do not expand an entire franchise when only one installment is intended.

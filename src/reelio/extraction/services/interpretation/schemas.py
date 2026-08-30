@@ -4,9 +4,11 @@ import unicodedata
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from reelio.extraction.types import maximum_movie_release_year, normalize_movie_title
-
-_EARLIEST_MOVIE_YEAR = 1888
+from reelio.extraction.types import (
+    MINIMUM_SCREEN_WORK_MENTION_YEAR,
+    maximum_screen_work_mention_year,
+    normalize_screen_work_title,
+)
 
 
 class InterpretedMovie(BaseModel):
@@ -15,7 +17,7 @@ class InterpretedMovie(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     title: str = Field(min_length=1)
-    year: int = Field(ge=_EARLIEST_MOVIE_YEAR)
+    year: int = Field(ge=MINIMUM_SCREEN_WORK_MENTION_YEAR)
 
     @field_validator("title")
     @classmethod
@@ -31,7 +33,7 @@ class InterpretedMovie(BaseModel):
         Raises:
             ValueError: If the normalized title is empty or contains control characters.
         """
-        normalized_title = normalize_movie_title(value)
+        normalized_title = normalize_screen_work_title(value)
         if not normalized_title:
             raise ValueError("title must contain non-whitespace characters")
         if any(unicodedata.category(character) == "Cc" for character in normalized_title):
@@ -52,7 +54,7 @@ class InterpretedMovie(BaseModel):
         Raises:
             ValueError: If the year is more than two years in the future.
         """
-        maximum_release_year = maximum_movie_release_year()
+        maximum_release_year = maximum_screen_work_mention_year()
         if value > maximum_release_year:
             raise ValueError(f"year must be no later than {maximum_release_year}")
         return value

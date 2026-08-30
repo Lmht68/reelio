@@ -189,7 +189,10 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert transcription_settings.whisper_vad_filter is True
     assert transcription_settings.whisper_temperature == 0.0
     assert transcription_settings.whisper_cond_on_prev_txt is True
-    assert transcription_settings.whisper_initial_prompt == "This transcript may mention movies, TV shows, directors, actors, songs, albums, artists, bands, books, and authors. Transcribe proper names accurately."
+    assert (
+        transcription_settings.whisper_initial_prompt
+        == "This transcript may mention movies, TV shows, directors, actors, songs, albums, artists, bands, books, and authors. Transcribe proper names accurately."
+    )
     assert transcription_settings.whisper_max_concurrent == 1
     assert openai_settings.model == "gpt-5-nano"
     assert openai_settings.reasoning_effort == "low"

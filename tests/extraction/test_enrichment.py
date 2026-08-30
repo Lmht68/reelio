@@ -50,7 +50,7 @@ async def test_resolver_selects_first_title_and_year_match_and_enriches() -> Non
                         {
                             "id": 2,
                             "title": "Le Fabuleux Destin d'Amélie Poulain",
-                            "original_title": "Amélie",
+                            "original_title": "  Ame\u0301lie  ",
                             "release_date": "2001-04-25",
                         },
                     ],

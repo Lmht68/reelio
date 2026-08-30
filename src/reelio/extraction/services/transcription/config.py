@@ -28,7 +28,9 @@ class TranscriptionConfig(BaseSettings):
     whisper_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
     whisper_cond_on_prev_txt: bool = Field(default=True)
     whisper_max_concurrent: int = Field(default=1, gt=0)
-    whisper_initial_prompt: str = Field(default="This transcript may mention movies, TV shows, directors, actors, songs, albums, artists, bands, books, and authors. Transcribe proper names accurately.")
+    whisper_initial_prompt: str = Field(
+        default="This transcript may mention movies, TV shows, directors, actors, songs, albums, artists, bands, books, and authors. Transcribe proper names accurately."
+    )
 
 
 transcription_settings = TranscriptionConfig()

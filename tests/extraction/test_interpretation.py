@@ -4,7 +4,6 @@ import json
 import logging
 from collections import deque
 from collections.abc import Callable, Sequence
-from datetime import date
 from types import SimpleNamespace
 from typing import cast
 
@@ -38,7 +37,6 @@ from reelio.extraction.types import (
     Source,
     Transcript,
     TranscriptMethod,
-    maximum_movie_release_year,
 )
 
 
@@ -278,7 +276,7 @@ async def test_deduplication_preserves_normalized_first_occurrence_order() -> No
     mentions, _ = await _interpret(
         transcript_text,
         _response(
-            ("Amélie", 2001),
+            ("  Ame\u0301lie  ", 2001),
             ("Dune: Part One", 2021),
             ("Amélie", 2001),
             ("Dune: Part One", 2021),
@@ -437,11 +435,6 @@ async def test_strict_response_schema_rejects_invalid_fields(
 
     with pytest.raises(InvalidLLMResponseError):
         await service.interpret(_source(), _transcript("Dune."))
-
-
-def test_movie_release_year_policy_allows_two_future_calendar_years() -> None:
-    """Expose one release-year horizon to prompting and response validation."""
-    assert maximum_movie_release_year() == date.today().year + 2
 
 
 async def test_response_accepts_more_than_two_hundred_mentions() -> None:

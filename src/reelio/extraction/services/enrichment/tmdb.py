@@ -15,7 +15,7 @@ from reelio.extraction.types import (
     MentionResult,
     MovieMention,
     ResultStatus,
-    normalize_movie_title,
+    normalize_screen_work_title,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,7 +117,7 @@ class TMDBMovieResolver:
         await self._client.aclose()
 
     async def _resolve_one(self, movie_mention: MovieMention) -> MentionResult:
-        normalized_mention_title = normalize_movie_title(movie_mention.title)
+        normalized_mention_title = normalize_screen_work_title(movie_mention.title)
         search_response = await self._get_model(
             "search/movie",
             {
@@ -138,7 +138,7 @@ class TMDBMovieResolver:
                 continue
 
             primary_titles_matched = any(
-                normalize_movie_title(title) == normalized_mention_title
+                normalize_screen_work_title(title) == normalized_mention_title
                 for title in (candidate.title, candidate.original_title)
             )
             # Dont need to check alternative titles if the main title matches
@@ -156,7 +156,7 @@ class TMDBMovieResolver:
 
             if not primary_titles_matched:
                 if not any(
-                    normalize_movie_title(alternative_title.title) == normalized_mention_title
+                    normalize_screen_work_title(alternative_title.title) == normalized_mention_title
                     for alternative_title in movie.alternative_titles.titles
                 ):
                     continue

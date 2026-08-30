@@ -1,27 +1,28 @@
-"""Domain types shared by extraction services and the API adapter."""
+"""Domain types and Screen Work identity primitives for Canonical Movie or TV Series titles."""
 
 import unicodedata
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
 
-_MAX_FUTURE_RELEASE_YEARS = 2
+MINIMUM_SCREEN_WORK_MENTION_YEAR = 1888
+_MAX_FUTURE_SCREEN_WORK_MENTION_YEARS = 2
 
 
-def maximum_movie_release_year() -> int:
-    """Return the latest accepted Movie Release Year.
+def maximum_screen_work_mention_year() -> int:
+    """Return the latest accepted Screen Work Mention year.
 
     Returns:
         int: Current year plus the two-year confirmed-forthcoming horizon.
     """
-    return date.today().year + _MAX_FUTURE_RELEASE_YEARS
+    return date.today().year + _MAX_FUTURE_SCREEN_WORK_MENTION_YEARS
 
 
-def normalize_movie_title(title: str) -> str:
-    """Produce the domain comparison form for a Canonical Movie Title.
+def normalize_screen_work_title(title: str) -> str:
+    """Produce the domain comparison form for a Canonical Movie or TV Series title.
 
     Args:
-        title: Canonical or provider-backed title to normalize.
+        title: Canonical or provider-backed Movie or TV Series title to normalize.
 
     Returns:
         str: NFC-normalized title with leading, trailing, and repeated
