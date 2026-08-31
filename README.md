@@ -1,6 +1,6 @@
 # Reelio
 
-Reelio is a FastAPI service that extracts movie mentions from public social-media videos, verifies them against TMDB, and returns enriched metadata and links.
+Reelio is a FastAPI service that extracts Movie and TV Series Mentions from public social-media videos, verifies them against TMDB, and returns grouped enriched results.
 
 ## Overview
 
@@ -11,13 +11,14 @@ The extraction pipeline:
 3. Acquires a normalized transcript from YouTube captions when available and falls back to local Faster-Whisper when needed.
 4. Uses Faster-Whisper directly for non-YouTube sources.
 5. Sends bounded source metadata and transcript material to the selected LLM provider.
-6. Validates the structured LLM response, removes duplicate mentions, and preserves first-reference order.
-7. Searches TMDB and resolves a mention only when its canonical title or provider alternative title matches together with the release year.
-8. Returns one `resolved` or `unresolved` result per interpreted movie mention.
+6. Validates the structured LLM response, deduplicates mentions independently per kind, and preserves first-reference order within each kind.
+7. Searches TMDB's Movie and TV endpoints and resolves a Mention only when its canonical title or a provider alternative title matches together with its release or first air year.
+8. Returns grouped `movies` and `tv_series` result lists, resolving each Mention to enriched metadata or `null` independently within its kind.
 
 Movie results can include the title, release year, cast, directors, description, poster URL, TMDB and IMDb identifiers and links, and the TMDB score.
+TV Series results can include the title, first air year, optional final air year, aggregate cast, Creators, description, poster URL, TMDB and IMDb identifiers and links, and the TMDB score.
 
-Movie Mention interpretation supports two explicitly selected providers:
+Screen Work Mention interpretation supports two explicitly selected providers:
 
 - OpenAI uses the Responses API, strict Structured Outputs generated from the application response model, and `store=false`.
 - DeepSeek uses Chat Completions with JSON-object output and disabled thinking.
@@ -84,7 +85,7 @@ Successful response:
 {"status": "ok"}
 ```
 
-### Extract movie mentions
+### Extract movie and TV series mentions
 
 ```http
 POST /api/extract
@@ -103,9 +104,86 @@ The response contains:
 
 - `source`: The canonical platform, external video ID, URL, title, description, channel, and duration.
 - `transcript`: The normalized transcript text, detected language, and acquisition method.
-- `results`: One result for every deduplicated Movie Mention in first-reference order.
-- `results[].movie_mention`: The canonical movie title and release year interpreted by the LLM.
-- `results[].movie`: TMDB-backed enrichment for a resolved mention, or `null` for an unresolved mention.
+- `results`: A grouped object with two always-present lists, `movies` and `tv_series`.
+  Each list is deduplicated independently and preserves first-reference order within its kind.
+  There is no cross-kind ordering.
+- `results.movies[].movie_mention`: The canonical Movie title and release year interpreted by the LLM.
+- `results.movies[].movie`: TMDB-backed enrichment for a resolved Mention, or `null` for an unresolved Mention.
+- `results.tv_series[].tv_series_mention`: The canonical TV Series title and first air year interpreted by the LLM.
+- `results.tv_series[].tv_series`: TMDB-backed enrichment for a resolved Mention, or `null` for an unresolved Mention.
+  `first_air_year` is the verified TV First Air Year.
+  A `null` `last_air_year` means the final air year is unavailable, not that the TV Series continues.
+  `creators` comes only from TMDB's `created_by` list and retains first-provider order after duplicate names are removed.
+  `cast` is the first five TMDB aggregate-cast names in provider order, with no role filtering or person deduplication.
+  TMDB and IMDb identifiers and links are included when available, along with the TMDB score.
+- Any TMDB provider HTTP, timeout, or required-response validation failure fails the complete request rather than returning partial category results.
+
+Compact success example:
+
+```json
+{
+  "source": {
+    "platform": "youtube",
+    "video_id": "dQw4w9WgXcQ",
+    "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "title": "Screen Work review",
+    "description": "A review mentioning a Movie and a TV Series.",
+    "channel": "Example channel",
+    "duration_seconds": 42
+  },
+  "transcript": {
+    "text": "Dune: Part One and The Last of Us are excellent.",
+    "language": "en",
+    "method": "youtube_captions"
+  },
+  "results": {
+    "movies": [
+      {
+        "status": "resolved",
+        "movie_mention": {"title": "Dune: Part One", "year": 2021},
+        "movie": {
+          "title": "Dune: Part One",
+          "year": 2021,
+          "cast": ["Timothée Chalamet"],
+          "directors": ["Denis Villeneuve"],
+          "description": "Paul Atreides faces his destiny on Arrakis.",
+          "poster_url": "https://image.tmdb.org/t/p/w500/dune.jpg",
+          "tmdb_id": 438631,
+          "tmdb_url": "https://www.themoviedb.org/movie/438631",
+          "imdb_id": "tt1160419",
+          "imdb_url": "https://www.imdb.com/title/tt1160419/",
+          "tmdb_score": 7.8
+        }
+      }
+    ],
+    "tv_series": [
+      {
+        "status": "resolved",
+        "tv_series_mention": {"title": "The Last of Us", "year": 2023},
+        "tv_series": {
+          "title": "The Last of Us",
+          "first_air_year": 2023,
+          "last_air_year": null,
+          "cast": ["Pedro Pascal", "Bella Ramsey"],
+          "creators": ["Craig Mazin", "Neil Druckmann"],
+          "description": "A smuggler escorts a teenager across a ruined America.",
+          "poster_url": "https://image.tmdb.org/t/p/w500/the-last-of-us.jpg",
+          "tmdb_id": 100088,
+          "tmdb_url": "https://www.themoviedb.org/tv/100088",
+          "imdb_id": "tt3581920",
+          "imdb_url": "https://www.imdb.com/title/tt3581920/",
+          "tmdb_score": 8.6
+        }
+      },
+      {
+        "status": "unresolved",
+        "tv_series_mention": {"title": "Unknown TV Series", "year": 2024},
+        "tv_series": null
+      }
+    ]
+  }
+}
+```
 
 Equivalent `curl` request:
 
@@ -134,7 +212,7 @@ The API uses these error classes:
 | `404` | Source is unavailable, private, or not found. |
 | `413` | Source duration or interpretation material exceeds its configured limit. |
 | `500` | Unexpected internal failure. |
-| `502` | Metadata, transcription, LLM, or TMDB provider failure. |
+| `502` | Metadata, transcription, LLM, or TMDB provider failure. Any TMDB failure fails the complete request. |
 | `504` | External provider timeout. |
 
 ## Configuration
@@ -179,6 +257,6 @@ src/reelio/
     ├── types.py                    Extraction domain types
     └── services/
         ├── transcription/          Metadata inspection and transcript acquisition
-        ├── interpretation/         OpenAI and DeepSeek Movie Mention providers
+        ├── interpretation/         OpenAI and DeepSeek Screen Work Mention providers
         └── enrichment/             TMDB candidate resolution and enrichment
 ```
