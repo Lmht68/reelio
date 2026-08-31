@@ -8,6 +8,7 @@ from reelio.extraction import schemas as extraction_schemas
 from reelio.extraction.service import ExtractionPipelineProtocol
 from reelio.extraction.types import (
     EnrichedMovie,
+    EnrichedTVSeries,
     MovieMention,
     MovieResult,
     PipelineResult,
@@ -21,7 +22,7 @@ _EXTRACT_RESPONSE_EXAMPLE = {
         "video_id": "dQw4w9WgXcQ",
         "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
         "title": "Screen Work review",
-        "description": "A review mentioning a Movie and a TV Series.",
+        "description": "A review mentioning Movies and TV Series.",
         "channel": "Example channel",
         "duration_seconds": 42,
     },
@@ -48,14 +49,37 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                     "imdb_url": "https://www.imdb.com/title/tt1160419/",
                     "tmdb_score": 7.8,
                 },
-            }
+            },
+            {
+                "status": "unresolved",
+                "movie_mention": {"title": "Unknown Movie", "year": 2024},
+                "movie": None,
+            },
         ],
         "tv_series": [
             {
-                "status": "unresolved",
+                "status": "resolved",
                 "tv_series_mention": {"title": "The Last of Us", "year": 2023},
+                "tv_series": {
+                    "title": "The Last of Us",
+                    "first_air_year": 2023,
+                    "last_air_year": 2025,
+                    "cast": ["Pedro Pascal", "Bella Ramsey"],
+                    "creators": ["Craig Mazin", "Neil Druckmann"],
+                    "description": "A smuggler escorts a teenager across a ruined America.",
+                    "poster_url": "https://image.tmdb.org/t/p/w500/the-last-of-us.jpg",
+                    "tmdb_id": 100088,
+                    "tmdb_url": "https://www.themoviedb.org/tv/100088",
+                    "imdb_id": "tt3581920",
+                    "imdb_url": "https://www.imdb.com/title/tt3581920/",
+                    "tmdb_score": 8.6,
+                },
+            },
+            {
+                "status": "unresolved",
+                "tv_series_mention": {"title": "Unknown TV Series", "year": 2024},
                 "tv_series": None,
-            }
+            },
         ],
     },
 }
@@ -108,6 +132,25 @@ def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.MovieModel:
     )
 
 
+def _to_tv_series_schema(
+    tv_series: EnrichedTVSeries,
+) -> extraction_schemas.TVSeriesModel:
+    return extraction_schemas.TVSeriesModel(
+        title=tv_series.title,
+        first_air_year=tv_series.first_air_year,
+        last_air_year=tv_series.last_air_year,
+        cast=tv_series.cast,
+        creators=tv_series.creators,
+        description=tv_series.description,
+        poster_url=tv_series.poster_url,
+        tmdb_id=tv_series.tmdb_id,
+        tmdb_url=tv_series.tmdb_url,
+        imdb_id=tv_series.imdb_id,
+        imdb_url=tv_series.imdb_url,
+        tmdb_score=tv_series.tmdb_score,
+    )
+
+
 def _to_movie_result_schema(
     result: MovieResult,
 ) -> extraction_schemas.MovieResultModel:
@@ -122,10 +165,11 @@ def _to_movie_result_schema(
 def _to_tv_series_result_schema(
     result: TVSeriesResult,
 ) -> extraction_schemas.TVSeriesResultModel:
+    tv_series = _to_tv_series_schema(result.tv_series) if result.tv_series is not None else None
     return extraction_schemas.TVSeriesResultModel(
         status=result.status,
         tv_series_mention=_to_tv_series_mention_schema(result.tv_series_mention),
-        tv_series=None,
+        tv_series=tv_series,
     )
 
 
@@ -161,8 +205,11 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         "Accept a public YouTube, Instagram, Facebook, TikTok, or X video URL and "
         "return the normalized Source, the Transcript with its acquisition method, "
         "and grouped Movie and TV Series results. Each list preserves first-reference "
-        "order within its kind; TV Series are unresolved with null enrichment in "
-        "issue 02, and there is no cross-kind ordering."
+        "order within its kind, with no cross-kind ordering. Resolved TV Series report "
+        "their TV First Air Year, an optional final air year where null means "
+        "unavailable rather than proof of continuation, Creators from TMDB created_by, "
+        "and up to five aggregate cast names in provider order without role filtering "
+        "or person deduplication. Any TMDB provider failure fails the complete request."
     ),
     response_description="Source, transcript, and grouped Screen Work Results.",
     responses={
@@ -190,7 +237,10 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         },
         502: {
             "model": extraction_schemas.ErrorResponse,
-            "description": "Metadata, transcript, LLM, or TMDB provider failure.",
+            "description": (
+                "Metadata, transcript, LLM, or TMDB provider failure. Any TMDB "
+                "provider failure fails the complete request."
+            ),
         },
         504: {
             "model": extraction_schemas.ErrorResponse,

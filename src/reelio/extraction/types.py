@@ -167,6 +167,39 @@ class EnrichedMovie:
 
 
 @dataclass
+class EnrichedTVSeries:
+    """Contain provider-verified metadata for a TV Series entity.
+
+    Attributes:
+        title: Canonical TV Series title.
+        first_air_year: Verified first air year.
+        last_air_year: Final air year when available from a completed series.
+        cast: Up to five provider-ordered aggregate cast member names.
+        creators: Provider-verified creator names.
+        description: Short provider-supplied TV Series description.
+        poster_url: Provider image URL when available.
+        tmdb_id: TMDB TV Series identifier.
+        tmdb_url: Canonical TMDB TV Series URL.
+        imdb_id: Provider-verified IMDb identifier when available.
+        imdb_url: Canonical IMDb URL when an IMDb identifier exists.
+        tmdb_score: TMDB vote average on a zero-to-ten scale.
+    """
+
+    title: str
+    first_air_year: int
+    last_air_year: int | None
+    cast: list[str]
+    creators: list[str]
+    description: str
+    poster_url: str | None
+    tmdb_id: int
+    tmdb_url: str
+    imdb_id: str | None
+    imdb_url: str | None
+    tmdb_score: float
+
+
+@dataclass
 class MovieResult:
     """Represent one Movie Mention and its resolution outcome.
 
@@ -185,17 +218,15 @@ class MovieResult:
 class TVSeriesResult:
     """Represent one TV Series Mention and its resolution outcome.
 
-    TV Series enrichment is intentionally unavailable in this issue.
-
     Attributes:
         status: Current resolution state of the TV Series Mention.
         tv_series_mention: Canonical title and TV First Air Year.
-        tv_series: Always ``None`` until TV Series enrichment is introduced.
+        tv_series: Enriched TV Series, or ``None`` when unresolved.
     """
 
     status: ResultStatus
     tv_series_mention: TVSeriesMention
-    tv_series: None
+    tv_series: EnrichedTVSeries | None
 
 
 @dataclass

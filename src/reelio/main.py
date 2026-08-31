@@ -16,7 +16,7 @@ from reelio.extraction.exceptions import (
 from reelio.extraction.router import router as extraction_router
 from reelio.extraction.service import ExtractionPipeline, ExtractionPipelineProtocol
 from reelio.extraction.services.enrichment.config import tmdb_settings as _tmdb_settings
-from reelio.extraction.services.enrichment.tmdb import create_tmdb_movie_resolver
+from reelio.extraction.services.enrichment.tmdb import create_tmdb_screen_work_resolver
 from reelio.extraction.services.interpretation.config import (
     InterpretationConfig,
     LLMProviderSelectionConfig,
@@ -45,6 +45,19 @@ from reelio.ops import router as ops_router
 
 _DOCS_ENVIRONMENTS = {Environment.LOCAL, Environment.STAGING}
 _PipelineFactory = Callable[[], Awaitable[ExtractionPipelineProtocol]]
+
+
+class _ReelioFastAPI(FastAPI):
+    """Generate the extraction OpenAPI contract with explicit null examples."""
+
+    def openapi(self) -> dict[str, object]:
+        """Generate the cached OpenAPI document with the unresolved TV example."""
+        openapi_schema = super().openapi()
+        response_example = openapi_schema["paths"]["/api/extract"]["post"]["responses"]["200"][
+            "content"
+        ]["application/json"]["example"]
+        response_example["results"]["tv_series"][1]["tv_series"] = None
+        return openapi_schema
 
 
 async def _create_production_pipeline() -> ExtractionPipelineProtocol:
@@ -76,12 +89,12 @@ async def _create_production_pipeline() -> ExtractionPipelineProtocol:
             provider=llm_provider,
             settings=interpretation_settings,
         )
-        movie_resolver = create_tmdb_movie_resolver(_tmdb_settings)
+        screen_work_resolver = create_tmdb_screen_work_resolver(_tmdb_settings)
         pipeline = ExtractionPipeline(
             source_metadata_service=source_metadata_service,
             transcription_service=transcription_service,
             interpretation_service=interpretation_service,
-            movie_resolver=movie_resolver,
+            screen_work_resolver=screen_work_resolver,
         )
         cleanup.pop_all()
         return pipeline
@@ -140,7 +153,7 @@ def create_app(pipeline_factory: _PipelineFactory | None = None) -> FastAPI:
         FastAPI: The composed application instance.
     """
     configure_logging(app_settings.log_level)
-    application = FastAPI(
+    application = _ReelioFastAPI(
         title="Reelio API",
         version="0.1.0",
         default_response_class=JSONResponse,
@@ -151,6 +164,7 @@ def create_app(pipeline_factory: _PipelineFactory | None = None) -> FastAPI:
     application.include_router(extraction_router)
     application.add_exception_handler(ExtractionError, extraction_error_handler)
     application.add_exception_handler(Exception, unhandled_error_handler)
+
     return application
 
 

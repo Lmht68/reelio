@@ -24,16 +24,18 @@ from reelio.extraction.types import (
     Platform,
     ResultStatus,
     ScreenWorkMentions,
+    ScreenWorkResults,
     Source,
     Transcript,
     TranscriptMethod,
     TVSeriesMention,
+    TVSeriesResult,
 )
 from tests.extraction.fakes import (
     FakeInterpretationService as _FakeInterpretationService,
 )
 from tests.extraction.fakes import (
-    FakeMovieResolver as _FakeMovieResolver,
+    FakeScreenWorkResolver as _FakeScreenWorkResolver,
 )
 
 _VIDEO_ID = "dQw4w9WgXcQ"
@@ -82,13 +84,13 @@ def _pipeline(
     metadata_service: _FakeSourceMetadataService,
     transcription_service: _FakeTranscriptionService,
     interpretation_service: _FakeInterpretationService | None = None,
-    movie_resolver: _FakeMovieResolver | None = None,
+    screen_work_resolver: _FakeScreenWorkResolver | None = None,
 ) -> ExtractionPipeline:
     return ExtractionPipeline(
         metadata_service,
         transcription_service,
         interpretation_service or _FakeInterpretationService(),
-        movie_resolver or _FakeMovieResolver(),
+        screen_work_resolver or _FakeScreenWorkResolver(),
     )
 
 
@@ -112,19 +114,20 @@ def _transcript() -> Transcript:
     )
 
 
-async def test_pipeline_returns_empty_grouped_results_and_calls_movie_resolver_once() -> None:
-    """Resolve an empty Movie sequence and return both required result lists."""
+async def test_pipeline_returns_empty_grouped_results_and_calls_resolver_once() -> None:
+    """Pass empty grouped Mentions to the resolver once and return both result lists."""
     source = _source()
     transcript = _transcript()
     metadata_service = _FakeSourceMetadataService(source)
     transcription_service = _FakeTranscriptionService(transcript)
-    interpretation_service = _FakeInterpretationService(ScreenWorkMentions(movies=[], tv_series=[]))
-    movie_resolver = _FakeMovieResolver()
+    screen_work_mentions = ScreenWorkMentions(movies=[], tv_series=[])
+    interpretation_service = _FakeInterpretationService(screen_work_mentions)
+    screen_work_resolver = _FakeScreenWorkResolver()
     pipeline = _pipeline(
         metadata_service,
         transcription_service,
         interpretation_service,
-        movie_resolver,
+        screen_work_resolver,
     )
 
     result = await pipeline.run(_CANONICAL_URL)
@@ -134,13 +137,13 @@ async def test_pipeline_returns_empty_grouped_results_and_calls_movie_resolver_o
     assert metadata_service.calls == [_CANONICAL_URL]
     assert transcription_service.calls == [(source, _CANONICAL_URL)]
     assert interpretation_service.calls == [(source, transcript)]
-    assert movie_resolver.calls == [()]
+    assert screen_work_resolver.calls == [screen_work_mentions]
     assert result.results.movies == []
     assert result.results.tv_series == []
 
 
 async def test_pipeline_returns_ordered_movie_results_unchanged() -> None:
-    """Pass only Movie Mentions to the resolver and preserve its result objects."""
+    """Pass grouped Movie Mentions through and preserve returned result objects."""
     movie_mentions = [
         MovieMention(title="Dune: Part One", year=2021),
         MovieMention(title="Che: Part One", year=2008),
@@ -149,46 +152,46 @@ async def test_pipeline_returns_ordered_movie_results_unchanged() -> None:
         MovieResult(ResultStatus.UNRESOLVED, movie_mentions[0], None),
         MovieResult(ResultStatus.UNRESOLVED, movie_mentions[1], None),
     ]
-    interpretation_service = _FakeInterpretationService(
-        ScreenWorkMentions(movies=movie_mentions, tv_series=[])
-    )
-    movie_resolver = _FakeMovieResolver(results=movie_results)
+    screen_work_mentions = ScreenWorkMentions(movies=movie_mentions, tv_series=[])
+    screen_work_results = ScreenWorkResults(movies=movie_results, tv_series=[])
+    interpretation_service = _FakeInterpretationService(screen_work_mentions)
+    screen_work_resolver = _FakeScreenWorkResolver(results=screen_work_results)
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
         interpretation_service,
-        movie_resolver,
+        screen_work_resolver,
     )
 
     result = await pipeline.run(_CANONICAL_URL)
 
-    assert movie_resolver.calls == [tuple(movie_mentions)]
+    assert screen_work_resolver.calls == [screen_work_mentions]
+    assert result.results is screen_work_results
     assert result.results.movies == movie_results
     assert result.results.movies[0] is movie_results[0]
     assert result.results.movies[1] is movie_results[1]
     assert result.results.tv_series == []
 
 
-async def test_pipeline_projects_tv_only_mentions_without_movie_resolution_input() -> None:
-    """Return ordered unresolved TV Series Results while resolving an empty Movie list."""
+async def test_pipeline_returns_tv_only_results_from_grouped_resolver() -> None:
+    """Pass TV-only Mentions to the grouped resolver without pipeline placeholders."""
     tv_series_mentions = [
         TVSeriesMention(title="The Last of Us", year=2023),
         TVSeriesMention(title="Arcane", year=2021),
     ]
-    interpretation_service = _FakeInterpretationService(
-        ScreenWorkMentions(movies=[], tv_series=tv_series_mentions)
-    )
-    movie_resolver = _FakeMovieResolver()
+    screen_work_mentions = ScreenWorkMentions(movies=[], tv_series=tv_series_mentions)
+    interpretation_service = _FakeInterpretationService(screen_work_mentions)
+    screen_work_resolver = _FakeScreenWorkResolver()
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
         interpretation_service,
-        movie_resolver,
+        screen_work_resolver,
     )
 
     result = await pipeline.run(_CANONICAL_URL)
 
-    assert movie_resolver.calls == [()]
+    assert screen_work_resolver.calls == [screen_work_mentions]
     assert result.results.movies == []
     assert [item.status for item in result.results.tv_series] == [
         ResultStatus.UNRESOLVED,
@@ -201,31 +204,34 @@ async def test_pipeline_projects_tv_only_mentions_without_movie_resolution_input
 
 
 async def test_pipeline_groups_mixed_interpretation_results() -> None:
-    """Keep Movie and TV Series ordering independent in one pipeline result."""
+    """Keep Movie and TV Series ordering independent in grouped resolver results."""
     movie_mention = MovieMention(title="Dune: Part One", year=2021)
     tv_series_mention = TVSeriesMention(title="The Last of Us", year=2023)
     movie_result = MovieResult(ResultStatus.UNRESOLVED, movie_mention, None)
-    interpretation_service = _FakeInterpretationService(
-        ScreenWorkMentions(
-            movies=[movie_mention],
-            tv_series=[tv_series_mention],
-        )
+    tv_series_result = TVSeriesResult(ResultStatus.UNRESOLVED, tv_series_mention, None)
+    screen_work_mentions = ScreenWorkMentions(
+        movies=[movie_mention],
+        tv_series=[tv_series_mention],
     )
-    movie_resolver = _FakeMovieResolver(results=[movie_result])
+    screen_work_results = ScreenWorkResults(
+        movies=[movie_result],
+        tv_series=[tv_series_result],
+    )
+    interpretation_service = _FakeInterpretationService(screen_work_mentions)
+    screen_work_resolver = _FakeScreenWorkResolver(results=screen_work_results)
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
         interpretation_service,
-        movie_resolver,
+        screen_work_resolver,
     )
 
     result = await pipeline.run(_CANONICAL_URL)
 
-    assert movie_resolver.calls == [(movie_mention,)]
+    assert screen_work_resolver.calls == [screen_work_mentions]
+    assert result.results is screen_work_results
     assert result.results.movies == [movie_result]
-    assert result.results.tv_series[0].status is ResultStatus.UNRESOLVED
-    assert result.results.tv_series[0].tv_series_mention is tv_series_mention
-    assert result.results.tv_series[0].tv_series is None
+    assert result.results.tv_series == [tv_series_result]
 
 
 async def test_pipeline_preserves_whisper_transcript_method() -> None:
@@ -322,43 +328,40 @@ async def test_pipeline_propagates_transcription_errors_unchanged(
 async def test_pipeline_propagates_resolution_errors_unchanged() -> None:
     """Propagate TMDB resolution failures without changing their domain policy."""
     resolution_error = EnrichmentError("TMDB candidate resolution failed.")
-    movie_resolver = _FakeMovieResolver(error=resolution_error)
+    screen_work_mentions = ScreenWorkMentions(
+        movies=[MovieMention(title="Dune: Part One", year=2021)],
+        tv_series=[TVSeriesMention(title="The Last of Us", year=2023)],
+    )
+    screen_work_resolver = _FakeScreenWorkResolver(error=resolution_error)
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
-        _FakeInterpretationService(
-            ScreenWorkMentions(
-                movies=[MovieMention(title="Dune: Part One", year=2021)],
-                tv_series=[],
-            )
-        ),
-        movie_resolver,
+        _FakeInterpretationService(screen_work_mentions),
+        screen_work_resolver,
     )
 
     with pytest.raises(EnrichmentError) as error:
         await pipeline.run(_CANONICAL_URL)
 
     assert error.value is resolution_error
-    assert movie_resolver.calls == [
-        (MovieMention(title="Dune: Part One", year=2021),),
-    ]
+    assert screen_work_resolver.calls == [screen_work_mentions]
 
 
 async def test_pipeline_closes_interpretation_and_resolution_modules() -> None:
     """Delegate lifespan cleanup to interpretation and resolution modules."""
     interpretation_service = _FakeInterpretationService()
-    movie_resolver = _FakeMovieResolver()
+    screen_work_resolver = _FakeScreenWorkResolver()
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
         interpretation_service,
-        movie_resolver,
+        screen_work_resolver,
     )
 
     await pipeline.aclose()
 
     assert interpretation_service.closed is True
-    assert movie_resolver.closed is True
+    assert screen_work_resolver.closed is True
 
 
 @pytest.mark.parametrize(

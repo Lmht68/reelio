@@ -72,19 +72,55 @@ class MovieResultModel(BaseModel):
     movie: MovieModel | None
 
 
+class TVSeriesModel(BaseModel):
+    """Provider-enriched TV Series metadata in an extraction response."""
+
+    title: str
+    first_air_year: int = Field(description="TV First Air Year.")
+    last_air_year: int | None = Field(
+        description=(
+            "Final air year when available. Null means unavailable rather than proof "
+            "that the TV Series continues."
+        )
+    )
+    cast: list[str] = Field(
+        description=(
+            "First five aggregate cast names in provider response order without role "
+            "filtering or person deduplication."
+        )
+    )
+    creators: list[str] = Field(
+        description=(
+            "Creator names from TMDB created_by, preserving provider order after "
+            "duplicate-name removal."
+        )
+    )
+    description: str
+    poster_url: str | None
+    tmdb_id: int
+    tmdb_url: str
+    imdb_id: str | None
+    imdb_url: str | None
+    tmdb_score: float = Field(
+        ge=0,
+        le=10,
+        description="TMDB vote average on a zero-to-ten scale.",
+    )
+
+
 class TVSeriesMentionModel(BaseModel):
     """Title and first air year of a TV Series Mention from a transcript."""
 
     title: str
-    year: int
+    year: int = Field(description="TV First Air Year.")
 
 
 class TVSeriesResultModel(BaseModel):
-    """One unresolved TV Series Mention and its temporary null enrichment."""
+    """One interpreted TV Series Mention and its resolution outcome."""
 
     status: ResultStatus
     tv_series_mention: TVSeriesMentionModel
-    tv_series: None
+    tv_series: TVSeriesModel | None
 
 
 class ScreenWorkResultsModel(BaseModel):

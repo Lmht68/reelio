@@ -1,8 +1,7 @@
-"""Resolve and enrich Movie Mentions through TMDB."""
+"""Resolve and enrich grouped Screen Work Mentions through TMDB."""
 
 import asyncio
 import logging
-from collections.abc import Sequence
 from typing import cast
 
 import httpx
@@ -12,9 +11,14 @@ from reelio.extraction.exceptions import EnrichmentError, PipelineTimeoutError
 from reelio.extraction.services.enrichment.config import TMDBConfig
 from reelio.extraction.types import (
     EnrichedMovie,
+    EnrichedTVSeries,
     MovieMention,
     MovieResult,
     ResultStatus,
+    ScreenWorkMentions,
+    ScreenWorkResults,
+    TVSeriesMention,
+    TVSeriesResult,
     normalize_screen_work_title,
 )
 
@@ -29,15 +33,15 @@ class _TMDBModel(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
-class _SearchCandidate(_TMDBModel):
+class _MovieSearchCandidate(_TMDBModel):
     id: int
     title: str = ""
     original_title: str = ""
     release_date: str = ""
 
 
-class _SearchResponse(_TMDBModel):
-    results: list[_SearchCandidate] = Field(default_factory=list)
+class _MovieSearchResponse(_TMDBModel):
+    results: list[_MovieSearchCandidate] = Field(default_factory=list)
     total_pages: int = Field(default=0, ge=0)
 
 
@@ -50,7 +54,7 @@ class _CastMember(_TMDBModel):
     name: str
 
 
-class _Credits(_TMDBModel):
+class _MovieCredits(_TMDBModel):
     cast: list[_CastMember] = Field(default_factory=list)
     crew: list[_CrewMember] = Field(default_factory=list)
 
@@ -59,7 +63,7 @@ class _AlternativeTitle(_TMDBModel):
     title: str
 
 
-class _AlternativeTitles(_TMDBModel):
+class _MovieAlternativeTitles(_TMDBModel):
     titles: list[_AlternativeTitle] = Field(default_factory=list)
 
 
@@ -71,12 +75,54 @@ class _MovieDetails(_TMDBModel):
     poster_path: str | None = None
     imdb_id: str | None = None
     vote_average: float = Field(default=0.0, ge=0, le=10)
-    credits: _Credits = Field(default_factory=_Credits)
-    alternative_titles: _AlternativeTitles = Field(default_factory=_AlternativeTitles)
+    credits: _MovieCredits = Field(default_factory=_MovieCredits)
+    alternative_titles: _MovieAlternativeTitles = Field(default_factory=_MovieAlternativeTitles)
 
 
-class TMDBMovieResolver:
-    """Resolve ordered Movie Mentions and attach TMDB-backed metadata."""
+class _TVSearchCandidate(_TMDBModel):
+    id: int
+    name: str = ""
+    original_name: str = ""
+    first_air_date: str = ""
+
+
+class _TVSearchResponse(_TMDBModel):
+    results: list[_TVSearchCandidate] = Field(default_factory=list)
+    total_pages: int = Field(default=0, ge=0)
+
+
+class _Creator(_TMDBModel):
+    name: str
+
+
+class _TVAlternativeTitles(_TMDBModel):
+    titles: list[_AlternativeTitle] = Field(default_factory=list)
+
+
+class _TVAggregateCredits(_TMDBModel):
+    cast: list[_CastMember] = Field(default_factory=list)
+
+
+class _TVExternalIDs(_TMDBModel):
+    imdb_id: str | None = None
+
+
+class _TVSeriesDetails(_TMDBModel):
+    id: int
+    name: str
+    aggregate_credits: _TVAggregateCredits
+    external_ids: _TVExternalIDs
+    status: str = ""
+    last_air_date: str | None = None
+    created_by: list[_Creator] = Field(default_factory=list)
+    overview: str = ""
+    poster_path: str | None = None
+    vote_average: float = Field(default=0.0, ge=0, le=10)
+    alternative_titles: _TVAlternativeTitles = Field(default_factory=_TVAlternativeTitles)
+
+
+class TMDBScreenWorkResolver:
+    """Resolve ordered Movies and TV Series and attach TMDB-backed metadata."""
 
     def __init__(
         self,
@@ -94,29 +140,44 @@ class TMDBMovieResolver:
 
     async def resolve(
         self,
-        movie_mentions: Sequence[MovieMention],
-    ) -> list[MovieResult]:
-        """Resolve and enrich Movie Mentions while preserving their order.
+        screen_work_mentions: ScreenWorkMentions,
+    ) -> ScreenWorkResults:
+        """Resolve grouped Screen Work Mentions while preserving per-kind order.
 
         Args:
-            movie_mentions: Canonical Movie Mentions in first-reference order.
+            screen_work_mentions: Canonical mentions grouped by Screen Work kind.
 
         Returns:
-            list[MovieResult]: One Resolved or Unresolved Result per Movie Mention.
+            ScreenWorkResults: Resolved or unresolved Results grouped by kind.
 
         Raises:
             EnrichmentError: If TMDB fails or returns an invalid response.
             PipelineTimeoutError: If a TMDB request times out.
         """
-        if not movie_mentions:
-            return []
-        return list(await asyncio.gather(*(self._resolve_one(item) for item in movie_mentions)))
+        movie_results, tv_series_results = await asyncio.gather(
+            asyncio.gather(
+                *(
+                    self._resolve_movie(movie_mention)
+                    for movie_mention in screen_work_mentions.movies
+                )
+            ),
+            asyncio.gather(
+                *(
+                    self._resolve_tv_series(tv_series_mention)
+                    for tv_series_mention in screen_work_mentions.tv_series
+                )
+            ),
+        )
+        return ScreenWorkResults(
+            movies=movie_results,
+            tv_series=tv_series_results,
+        )
 
     async def aclose(self) -> None:
         """Close the lifespan-owned TMDB client and its connection pool."""
         await self._client.aclose()
 
-    async def _resolve_one(self, movie_mention: MovieMention) -> MovieResult:
+    async def _resolve_movie(self, movie_mention: MovieMention) -> MovieResult:
         normalized_mention_title = normalize_screen_work_title(movie_mention.title)
         search_response = await self._get_model(
             "search/movie",
@@ -127,12 +188,12 @@ class TMDBMovieResolver:
                 "year": movie_mention.year,
                 "page": 1,
             },
-            _SearchResponse,
+            _MovieSearchResponse,
         )
 
         # Limit to the first three candidates to reduce TMDB requests
         for candidate in search_response.results[:3]:
-            candidate_year = _release_year(candidate.release_date)
+            candidate_year = _year_from_date(candidate.release_date)
 
             if candidate_year is None or candidate_year != movie_mention.year:
                 continue
@@ -164,13 +225,73 @@ class TMDBMovieResolver:
             return MovieResult(
                 status=ResultStatus.RESOLVED,
                 movie_mention=movie_mention,
-                movie=self._enrich(movie_mention, movie),
+                movie=self._enrich_movie(movie_mention, movie),
             )
 
         return MovieResult(
             status=ResultStatus.UNRESOLVED,
             movie_mention=movie_mention,
             movie=None,
+        )
+
+    async def _resolve_tv_series(
+        self,
+        tv_series_mention: TVSeriesMention,
+    ) -> TVSeriesResult:
+        normalized_mention_title = normalize_screen_work_title(tv_series_mention.title)
+        search_response = await self._get_model(
+            "search/tv",
+            {
+                "query": tv_series_mention.title,
+                "include_adult": True,
+                "language": "en-US",
+                "first_air_date_year": tv_series_mention.year,
+                "page": 1,
+            },
+            _TVSearchResponse,
+        )
+
+        for candidate in search_response.results[:3]:
+            candidate_year = _year_from_date(candidate.first_air_date)
+            if candidate_year is None or candidate_year != tv_series_mention.year:
+                continue
+
+            primary_titles_matched = any(
+                normalize_screen_work_title(title) == normalized_mention_title
+                for title in (candidate.name, candidate.original_name)
+            )
+
+            append_to_response = (
+                "aggregate_credits,external_ids"
+                if primary_titles_matched
+                else "aggregate_credits,alternative_titles,external_ids"
+            )
+            tv_series = await self._get_model(
+                f"tv/{candidate.id}",
+                {
+                    "append_to_response": append_to_response,
+                    "language": "en-US",
+                },
+                _TVSeriesDetails,
+            )
+
+            if not primary_titles_matched:
+                if not any(
+                    normalize_screen_work_title(alternative_title.title) == normalized_mention_title
+                    for alternative_title in tv_series.alternative_titles.titles
+                ):
+                    continue
+
+            return TVSeriesResult(
+                status=ResultStatus.RESOLVED,
+                tv_series_mention=tv_series_mention,
+                tv_series=self._enrich_tv_series(tv_series_mention, tv_series),
+            )
+
+        return TVSeriesResult(
+            status=ResultStatus.UNRESOLVED,
+            tv_series_mention=tv_series_mention,
+            tv_series=None,
         )
 
     async def _get_model[ModelType: BaseModel](
@@ -205,7 +326,7 @@ class TMDBMovieResolver:
             )
             raise EnrichmentError(_ENRICHMENT_ERROR_MESSAGE) from exc
 
-    def _enrich(
+    def _enrich_movie(
         self,
         movie_mention: MovieMention,
         movie: _MovieDetails,
@@ -232,15 +353,50 @@ class TMDBMovieResolver:
             tmdb_score=movie.vote_average,
         )
 
+    def _enrich_tv_series(
+        self,
+        tv_series_mention: TVSeriesMention,
+        tv_series: _TVSeriesDetails,
+    ) -> EnrichedTVSeries:
+        cast_members = [member.name for member in tv_series.aggregate_credits.cast[:5]]
+        creators = list(dict.fromkeys(creator.name for creator in tv_series.created_by))
+        poster_url = (
+            f"{self._image_base_url}/{tv_series.poster_path.lstrip('/')}"
+            if tv_series.poster_path
+            else None
+        )
+        imdb_id = tv_series.external_ids.imdb_id
+        if imdb_id:
+            imdb_id = imdb_id.strip()
+        last_air_year = (
+            _year_from_date(tv_series.last_air_date or "")
+            if tv_series.status in {"Ended", "Canceled"}
+            else None
+        )
+        return EnrichedTVSeries(
+            title=tv_series_mention.title,
+            first_air_year=tv_series_mention.year,
+            last_air_year=last_air_year,
+            cast=cast_members,
+            creators=creators,
+            description=tv_series.overview,
+            poster_url=poster_url,
+            tmdb_id=tv_series.id,
+            tmdb_url=f"https://www.themoviedb.org/tv/{tv_series.id}",
+            imdb_id=imdb_id,
+            imdb_url=(f"https://www.imdb.com/title/{imdb_id}/" if imdb_id else None),
+            tmdb_score=tv_series.vote_average,
+        )
 
-def create_tmdb_movie_resolver(settings: TMDBConfig) -> TMDBMovieResolver:
-    """Create a reusable authenticated TMDB Movie Resolver.
+
+def create_tmdb_screen_work_resolver(settings: TMDBConfig) -> TMDBScreenWorkResolver:
+    """Create a reusable authenticated TMDB Screen Work Resolver.
 
     Args:
         settings: Validated TMDB credentials, endpoints, and timeout.
 
     Returns:
-        TMDBMovieResolver: Resolver owning one asynchronous HTTP client.
+        TMDBScreenWorkResolver: Resolver owning one asynchronous HTTP client.
     """
     client = httpx.AsyncClient(
         base_url=f"{settings.base_url.rstrip('/')}/",
@@ -250,9 +406,9 @@ def create_tmdb_movie_resolver(settings: TMDBConfig) -> TMDBMovieResolver:
         },
         timeout=settings.request_timeout_seconds,
     )
-    return TMDBMovieResolver(client, settings.image_base_url)
+    return TMDBScreenWorkResolver(client, settings.image_base_url)
 
 
-def _release_year(release_date: str) -> int | None:
+def _year_from_date(release_date: str) -> int | None:
     year = release_date[:4]
     return int(year) if len(year) == 4 and year.isdigit() else None

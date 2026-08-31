@@ -1,20 +1,15 @@
 """Orchestrate Source-to-Enriched-Entity extraction."""
 
-from collections.abc import Sequence
 from typing import Protocol
 
 from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
-    MovieMention,
-    MovieResult,
     PipelineResult,
-    ResultStatus,
     ScreenWorkMentions,
     ScreenWorkResults,
     Source,
     Transcript,
-    TVSeriesResult,
 )
 
 
@@ -77,14 +72,14 @@ class _ScreenWorkMentionInterpreter(Protocol):
         ...
 
 
-class _MovieResolver(Protocol):
-    """Resolve and enrich ordered Movie Mentions against provider candidates."""
+class _ScreenWorkResolver(Protocol):
+    """Resolve and enrich grouped Screen Work Mentions against provider candidates."""
 
     async def resolve(
         self,
-        movie_mentions: Sequence[MovieMention],
-    ) -> list[MovieResult]:
-        """Return one Resolved or Unresolved Result per Movie Mention."""
+        screen_work_mentions: ScreenWorkMentions,
+    ) -> ScreenWorkResults:
+        """Return one Resolved or Unresolved Result per Screen Work Mention."""
         ...
 
     async def aclose(self) -> None:
@@ -100,7 +95,7 @@ class ExtractionPipeline:
         source_metadata_service: _SourceMetadataInspector,
         transcription_service: _TranscriptAcquirer,
         interpretation_service: _ScreenWorkMentionInterpreter,
-        movie_resolver: _MovieResolver,
+        screen_work_resolver: _ScreenWorkResolver,
     ) -> None:
         """Initialize the pipeline with explicit stage services.
 
@@ -108,12 +103,12 @@ class ExtractionPipeline:
             source_metadata_service: Service that validates and inspects Sources.
             transcription_service: Service that acquires Transcripts.
             interpretation_service: Service that interprets Screen Work Mentions.
-            movie_resolver: Module that resolves and enriches Movie Mentions.
+            screen_work_resolver: Module that resolves and enriches Screen Work Mentions.
         """
         self._source_metadata_service = source_metadata_service
         self._transcription_service = transcription_service
         self._interpretation_service = interpretation_service
-        self._movie_resolver = movie_resolver
+        self._screen_work_resolver = screen_work_resolver
 
     async def run(self, url: str) -> PipelineResult:
         """Produce Resolved or Unresolved Results for one submitted Source.
@@ -141,22 +136,11 @@ class ExtractionPipeline:
             inspected.source,
             transcript,
         )
-        movie_results = await self._movie_resolver.resolve(interpreted.movies)
-        tv_series_results = [
-            TVSeriesResult(
-                status=ResultStatus.UNRESOLVED,
-                tv_series_mention=mention,
-                tv_series=None,
-            )
-            for mention in interpreted.tv_series
-        ]
+        screen_work_results = await self._screen_work_resolver.resolve(interpreted)
         return PipelineResult(
             source=inspected.source,
             transcript=transcript,
-            results=ScreenWorkResults(
-                movies=movie_results,
-                tv_series=tv_series_results,
-            ),
+            results=screen_work_results,
         )
 
     async def aclose(self) -> None:
@@ -164,4 +148,4 @@ class ExtractionPipeline:
         try:
             await self._interpretation_service.aclose()
         finally:
-            await self._movie_resolver.aclose()
+            await self._screen_work_resolver.aclose()

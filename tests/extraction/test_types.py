@@ -4,6 +4,7 @@ from datetime import date
 
 from reelio.extraction.types import (
     MINIMUM_SCREEN_WORK_MENTION_YEAR,
+    EnrichedTVSeries,
     MovieMention,
     MovieResult,
     PipelineResult,
@@ -48,10 +49,24 @@ def test_grouped_screen_work_domain_types_preserve_kind_and_field_placement() ->
         movie_mention=movie_mention,
         movie=None,
     )
+    enriched_tv_series = EnrichedTVSeries(
+        title=tv_series_mention.title,
+        first_air_year=tv_series_mention.year,
+        last_air_year=None,
+        cast=["Pedro Pascal"],
+        creators=["Craig Mazin"],
+        description="A post-apocalyptic drama.",
+        poster_url=None,
+        tmdb_id=100088,
+        tmdb_url="https://www.themoviedb.org/tv/100088",
+        imdb_id=None,
+        imdb_url=None,
+        tmdb_score=8.6,
+    )
     tv_series_result = TVSeriesResult(
-        status=ResultStatus.UNRESOLVED,
+        status=ResultStatus.RESOLVED,
         tv_series_mention=tv_series_mention,
-        tv_series=None,
+        tv_series=enriched_tv_series,
     )
     results = ScreenWorkResults(
         movies=[movie_result],

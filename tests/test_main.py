@@ -44,7 +44,7 @@ class _FakeProvider:
         self.close_calls += 1
 
 
-class _FakeMovieResolver:
+class _FakeScreenWorkResolver:
     def __init__(self) -> None:
         self.close_calls = 0
 
@@ -192,7 +192,7 @@ async def test_production_lifespan_closes_one_selected_provider(
     """Construct one selected provider and close it when production stops."""
     monkeypatch.setenv("REELIO_LLM_PROVIDER", "openai")
     provider = _FakeProvider()
-    resolver = _FakeMovieResolver()
+    resolver = _FakeScreenWorkResolver()
     provider_factory_calls = 0
 
     def create_provider(selection: LLMProviderSelectionConfig) -> _FakeProvider:
@@ -205,7 +205,7 @@ async def test_production_lifespan_closes_one_selected_provider(
     monkeypatch.setattr(main_module, "load_whisper_transcriber", lambda settings: object())
     monkeypatch.setattr(
         main_module,
-        "create_tmdb_movie_resolver",
+        "create_tmdb_screen_work_resolver",
         lambda settings: resolver,
     )
     application = create_app()

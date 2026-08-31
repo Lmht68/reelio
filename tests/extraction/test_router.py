@@ -39,19 +39,22 @@ from reelio.extraction.services.transcription.service import (
 )
 from reelio.extraction.types import (
     EnrichedMovie,
+    EnrichedTVSeries,
     MovieMention,
     MovieResult,
     PipelineResult,
     ResultStatus,
     ScreenWorkMentions,
+    ScreenWorkResults,
     TVSeriesMention,
+    TVSeriesResult,
 )
 from reelio.main import app
 from tests.extraction.fakes import (
     FakeInterpretationService as _FakeInterpretationService,
 )
 from tests.extraction.fakes import (
-    FakeMovieResolver as _FakeMovieResolver,
+    FakeScreenWorkResolver as _FakeScreenWorkResolver,
 )
 
 
@@ -175,13 +178,8 @@ def _transcription_service(provider: _CaptionProvider) -> TranscriptionService:
     )
 
 
-def _pipeline(
-    metadata_service: SourceMetadataService,
-    transcription_service: TranscriptionService,
-    mentions: ScreenWorkMentions | None = None,
-) -> ExtractionPipeline:
-    movie_mention = MovieMention(title="Dune: Part One", year=2021)
-    movie = EnrichedMovie(
+def _enriched_movie(movie_mention: MovieMention) -> EnrichedMovie:
+    return EnrichedMovie(
         title=movie_mention.title,
         year=movie_mention.year,
         cast=[
@@ -200,27 +198,64 @@ def _pipeline(
         imdb_url="https://www.imdb.com/title/tt1160419/",
         tmdb_score=7.8,
     )
+
+
+def _enriched_tv_series(tv_series_mention: TVSeriesMention) -> EnrichedTVSeries:
+    return EnrichedTVSeries(
+        title=tv_series_mention.title,
+        first_air_year=tv_series_mention.year,
+        last_air_year=None,
+        cast=["Pedro Pascal", "Bella Ramsey"],
+        creators=["Craig Mazin", "Neil Druckmann"],
+        description="A smuggler escorts a teenager across a ruined America.",
+        poster_url="https://image.tmdb.org/t/p/w500/the-last-of-us.jpg",
+        tmdb_id=100088,
+        tmdb_url="https://www.themoviedb.org/tv/100088",
+        imdb_id="tt3581920",
+        imdb_url="https://www.imdb.com/title/tt3581920/",
+        tmdb_score=8.6,
+    )
+
+
+def _pipeline(
+    metadata_service: SourceMetadataService,
+    transcription_service: TranscriptionService,
+    mentions: ScreenWorkMentions | None = None,
+    results: ScreenWorkResults | None = None,
+) -> ExtractionPipeline:
+    movie_mention = MovieMention(title="Dune: Part One", year=2021)
     interpreted = (
         mentions
         if mentions is not None
         else ScreenWorkMentions(movies=[movie_mention], tv_series=[])
     )
-    movie_results = (
-        [
-            MovieResult(
-                status=ResultStatus.RESOLVED,
-                movie_mention=movie_mention,
-                movie=movie,
-            )
-        ]
-        if interpreted.movies
-        else []
+    screen_work_results = (
+        results
+        if results is not None
+        else ScreenWorkResults(
+            movies=[
+                MovieResult(
+                    status=ResultStatus.RESOLVED,
+                    movie_mention=interpreted_movie_mention,
+                    movie=_enriched_movie(interpreted_movie_mention),
+                )
+                for interpreted_movie_mention in interpreted.movies
+            ],
+            tv_series=[
+                TVSeriesResult(
+                    status=ResultStatus.UNRESOLVED,
+                    tv_series_mention=interpreted_tv_series_mention,
+                    tv_series=None,
+                )
+                for interpreted_tv_series_mention in interpreted.tv_series
+            ],
+        )
     )
     return ExtractionPipeline(
         metadata_service,
         transcription_service,
         _FakeInterpretationService(interpreted),
-        _FakeMovieResolver(movie_results),
+        _FakeScreenWorkResolver(screen_work_results),
     )
 
 
@@ -228,9 +263,45 @@ def _install_pipeline(application: FastAPI, pipeline: ExtractionPipelineProtocol
     application.dependency_overrides[get_pipeline] = lambda: pipeline
 
 
-async def test_extract_returns_schema_valid_response(client: AsyncClient) -> None:
-    """Return real source metadata and deterministic result statuses."""
+async def test_extract_returns_resolved_and_unresolved_screen_work_results(
+    client: AsyncClient,
+) -> None:
+    """Return a complete mixed Screen Work contract with resolved and null entities."""
     metadata_extractor = _MetadataExtractor()
+    resolved_movie_mention = MovieMention(title="Dune: Part One", year=2021)
+    unresolved_movie_mention = MovieMention(title="Unknown Movie", year=2024)
+    resolved_tv_series_mention = TVSeriesMention(title="The Last of Us", year=2023)
+    unresolved_tv_series_mention = TVSeriesMention(title="Unknown TV Series", year=2024)
+    mentions = ScreenWorkMentions(
+        movies=[resolved_movie_mention, unresolved_movie_mention],
+        tv_series=[resolved_tv_series_mention, unresolved_tv_series_mention],
+    )
+    results = ScreenWorkResults(
+        movies=[
+            MovieResult(
+                status=ResultStatus.RESOLVED,
+                movie_mention=resolved_movie_mention,
+                movie=_enriched_movie(resolved_movie_mention),
+            ),
+            MovieResult(
+                status=ResultStatus.UNRESOLVED,
+                movie_mention=unresolved_movie_mention,
+                movie=None,
+            ),
+        ],
+        tv_series=[
+            TVSeriesResult(
+                status=ResultStatus.RESOLVED,
+                tv_series_mention=resolved_tv_series_mention,
+                tv_series=_enriched_tv_series(resolved_tv_series_mention),
+            ),
+            TVSeriesResult(
+                status=ResultStatus.UNRESOLVED,
+                tv_series_mention=unresolved_tv_series_mention,
+                tv_series=None,
+            ),
+        ],
+    )
     pipeline = _pipeline(
         SourceMetadataService(
             extractor=metadata_extractor,
@@ -239,6 +310,8 @@ async def test_extract_returns_schema_valid_response(client: AsyncClient) -> Non
         _transcription_service(
             _CaptionProvider([_CaptionTrack("en-GB", ["Router", "caption text."])])
         ),
+        mentions,
+        results,
     )
     _install_pipeline(app, pipeline)
 
@@ -260,25 +333,68 @@ async def test_extract_returns_schema_valid_response(client: AsyncClient) -> Non
     assert payload.transcript.language == "en-GB"
     assert payload.transcript.method == "youtube_captions"
     assert payload.transcript.text == "Router caption text."
+
     raw_results = response.json()["results"]
     assert set(raw_results) == {"movies", "tv_series"}
-    assert raw_results["tv_series"] == []
-    assert len(payload.results.movies) == 1
-    assert payload.results.tv_series == []
-    resolved = payload.results.movies[0]
-    assert resolved.status is ResultStatus.RESOLVED
-    assert resolved.movie_mention.title == "Dune: Part One"
-    assert resolved.movie_mention.year == 2021
-    assert resolved.movie is not None
-    assert resolved.movie.tmdb_id == 438631
-    assert resolved.movie.cast == [
+    assert [item["status"] for item in raw_results["movies"]] == ["resolved", "unresolved"]
+    assert [item["status"] for item in raw_results["tv_series"]] == ["resolved", "unresolved"]
+    assert raw_results["movies"][1]["movie"] is None
+    assert raw_results["tv_series"][1]["tv_series"] is None
+    assert set(raw_results["tv_series"][0]["tv_series"]) == {
+        "title",
+        "first_air_year",
+        "last_air_year",
+        "cast",
+        "creators",
+        "description",
+        "poster_url",
+        "tmdb_id",
+        "tmdb_url",
+        "imdb_id",
+        "imdb_url",
+        "tmdb_score",
+    }
+
+    resolved_movie = payload.results.movies[0]
+    assert resolved_movie.status is ResultStatus.RESOLVED
+    assert resolved_movie.movie_mention.title == resolved_movie_mention.title
+    assert resolved_movie.movie_mention.year == resolved_movie_mention.year
+    assert resolved_movie.movie is not None
+    assert resolved_movie.movie.tmdb_id == 438631
+    assert resolved_movie.movie.cast == [
         "Timothée Chalamet",
         "Rebecca Ferguson",
         "Oscar Isaac",
         "Josh Brolin",
         "Stellan Skarsgård",
     ]
-    assert resolved.movie.directors == ["Denis Villeneuve"]
+    assert resolved_movie.movie.directors == ["Denis Villeneuve"]
+    assert payload.results.movies[1].movie is None
+
+    resolved_tv_series = payload.results.tv_series[0]
+    assert resolved_tv_series.status is ResultStatus.RESOLVED
+    assert resolved_tv_series.tv_series_mention.title == resolved_tv_series_mention.title
+    assert resolved_tv_series.tv_series_mention.year == resolved_tv_series_mention.year
+    assert resolved_tv_series.tv_series is not None
+    assert resolved_tv_series.tv_series.title == "The Last of Us"
+    assert resolved_tv_series.tv_series.first_air_year == 2023
+    assert resolved_tv_series.tv_series.last_air_year is None
+    assert resolved_tv_series.tv_series.cast == ["Pedro Pascal", "Bella Ramsey"]
+    assert resolved_tv_series.tv_series.creators == ["Craig Mazin", "Neil Druckmann"]
+    assert (
+        resolved_tv_series.tv_series.description
+        == "A smuggler escorts a teenager across a ruined America."
+    )
+    assert (
+        resolved_tv_series.tv_series.poster_url
+        == "https://image.tmdb.org/t/p/w500/the-last-of-us.jpg"
+    )
+    assert resolved_tv_series.tv_series.tmdb_id == 100088
+    assert resolved_tv_series.tv_series.tmdb_url == "https://www.themoviedb.org/tv/100088"
+    assert resolved_tv_series.tv_series.imdb_id == "tt3581920"
+    assert resolved_tv_series.tv_series.imdb_url == "https://www.imdb.com/title/tt3581920/"
+    assert resolved_tv_series.tv_series.tmdb_score == 8.6
+    assert payload.results.tv_series[1].tv_series is None
 
 
 async def test_extract_maps_unavailable_captions_to_502(
@@ -649,7 +765,7 @@ async def test_unhandled_failures_do_not_leak_internals() -> None:
 
 
 async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
-    """Document the endpoint request and configured error responses."""
+    """Document grouped resolution, complete TV metadata, and atomic provider failure."""
     response = await client.get("/openapi.json")
 
     assert response.status_code == 200
@@ -676,11 +792,29 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     } <= set(source_properties)
     response_schema = responses["200"]["content"]["application/json"]["schema"]
     assert response_schema == {"$ref": "#/components/schemas/ExtractResponse"}
+
     example = responses["200"]["content"]["application/json"]["example"]
     assert set(example["results"]) == {"movies", "tv_series"}
-    tv_series_example = example["results"]["tv_series"][0]
-    assert tv_series_example["status"] == "unresolved"
-    assert set(tv_series_example) == {"status", "tv_series_mention"}
+    resolved_tv_series_example = example["results"]["tv_series"][0]
+    assert resolved_tv_series_example["status"] == "resolved"
+    assert set(resolved_tv_series_example["tv_series"]) == {
+        "title",
+        "first_air_year",
+        "last_air_year",
+        "cast",
+        "creators",
+        "description",
+        "poster_url",
+        "tmdb_id",
+        "tmdb_url",
+        "imdb_id",
+        "imdb_url",
+        "tmdb_score",
+    }
+    unresolved_tv_series_example = example["results"]["tv_series"][1]
+    assert unresolved_tv_series_example["status"] == "unresolved"
+    assert unresolved_tv_series_example["tv_series"] is None
+
     assert "ResultModel" not in schemas
     extract_response_properties = schemas["ExtractResponse"]["properties"]
     assert extract_response_properties["results"] == {
@@ -698,6 +832,7 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "type": "array",
         "title": "Tv Series",
     }
+
     movie_result_schema = schemas["MovieResultModel"]
     assert {"status", "movie_mention", "movie"} <= set(movie_result_schema["required"])
     assert movie_result_schema["properties"]["movie_mention"] == {
@@ -709,13 +844,44 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "$ref": "#/components/schemas/TVSeriesMentionModel"
     }
     assert tv_series_result_schema["properties"]["tv_series"] == {
-        "title": "Tv Series",
-        "type": "null",
+        "anyOf": [
+            {"$ref": "#/components/schemas/TVSeriesModel"},
+            {"type": "null"},
+        ],
     }
+
+    tv_series_schema = schemas["TVSeriesModel"]
+    assert {
+        "title",
+        "first_air_year",
+        "last_air_year",
+        "cast",
+        "creators",
+        "description",
+        "poster_url",
+        "tmdb_id",
+        "tmdb_url",
+        "imdb_id",
+        "imdb_url",
+        "tmdb_score",
+    } <= set(tv_series_schema["required"])
+    tv_series_properties = tv_series_schema["properties"]
+    assert tv_series_properties["tmdb_score"]["minimum"] == 0
+    assert tv_series_properties["tmdb_score"]["maximum"] == 10
+    assert (
+        tv_series_properties["tmdb_score"]["description"]
+        == "TMDB vote average on a zero-to-ten scale."
+    )
+    assert tv_series_properties["first_air_year"]["description"] == "TV First Air Year."
+    assert "unavailable rather than proof" in tv_series_properties["last_air_year"]["description"]
+    assert "First five aggregate cast" in tv_series_properties["cast"]["description"]
+    assert "created_by" in tv_series_properties["creators"]["description"]
+
     movie_mention_schema = schemas["MovieMentionModel"]
     assert {"title", "year"} <= set(movie_mention_schema["required"])
     tv_series_mention_schema = schemas["TVSeriesMentionModel"]
     assert {"title", "year"} <= set(tv_series_mention_schema["required"])
+    assert tv_series_mention_schema["properties"]["year"]["description"] == "TV First Air Year."
     movie_schema = schemas["MovieModel"]
     assert {"year", "tmdb_score"} <= set(movie_schema["required"])
     assert set(document["components"]["schemas"]["Platform"]["enum"]) == {
@@ -727,3 +893,7 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     }
     assert "YouTube, Instagram, Facebook, TikTok, or X" in operation["description"]
     assert "first-reference order" in operation["description"]
+    assert "Any TMDB provider failure fails the complete request." in operation["description"]
+    assert (
+        "Any TMDB provider failure fails the complete request." in responses["502"]["description"]
+    )
