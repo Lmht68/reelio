@@ -1,4 +1,4 @@
-"""OpenAI Responses adapter for Movie Mention interpretation."""
+"""OpenAI Responses adapter for Screen Work Mention interpretation."""
 
 from collections.abc import Sequence
 from typing import cast
@@ -12,17 +12,17 @@ from reelio.extraction.exceptions import (
     PipelineTimeoutError,
 )
 from reelio.extraction.services.interpretation.config import LLMProvider, OpenAIConfig
-from reelio.extraction.services.interpretation.schemas import MovieInterpretationResponse
+from reelio.extraction.services.interpretation.schemas import ScreenWorkInterpretationResponse
 from reelio.extraction.services.interpretation.types import LLMMessage
 
 _PROVIDER_ERROR_MESSAGE = "Movie Mention interpretation provider failed."
 _PROVIDER_TIMEOUT_MESSAGE = "Movie Mention interpretation timed out."
-_RESPONSE_SCHEMA_NAME = "movie_mention_interpretation"
+_RESPONSE_SCHEMA_NAME = "screen_work_mention_interpretation"
 _OFFICIAL_BASE_URL = "https://api.openai.com/v1"
 
 
 class OpenAIProvider:
-    """Generate JSON Movie Mention interpretations through OpenAI Responses."""
+    """Generate JSON Screen Work Mention interpretations through OpenAI."""
 
     def __init__(self, client: AsyncOpenAI, settings: OpenAIConfig) -> None:
         """Initialize the adapter with a lifespan-owned client and settings.
@@ -68,7 +68,7 @@ class OpenAIProvider:
                 "format": {
                     "type": "json_schema",
                     "name": _RESPONSE_SCHEMA_NAME,
-                    "schema": MovieInterpretationResponse.model_json_schema(),
+                    "schema": ScreenWorkInterpretationResponse.model_json_schema(),
                     "strict": True,
                 }
             },

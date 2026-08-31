@@ -1,4 +1,4 @@
-"""OpenAI-compatible DeepSeek adapter for Movie Mention interpretation."""
+"""OpenAI-compatible DeepSeek adapter for Screen Work Mention interpretation."""
 
 from collections.abc import Sequence
 from typing import cast
@@ -21,7 +21,7 @@ _PROVIDER_TIMEOUT_MESSAGE = "Movie Mention interpretation timed out."
 
 
 class DeepSeekProvider:
-    """Generate JSON Movie Mention interpretations through DeepSeek."""
+    """Generate JSON Screen Work Mention interpretations through DeepSeek."""
 
     def __init__(self, client: AsyncOpenAI, settings: DeepSeekConfig) -> None:
         """Initialize the adapter with a lifespan-owned client and settings.

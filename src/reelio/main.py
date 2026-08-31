@@ -22,10 +22,10 @@ from reelio.extraction.services.interpretation.config import (
     LLMProviderSelectionConfig,
 )
 from reelio.extraction.services.interpretation.factory import (
-    create_movie_mention_provider,
+    create_screen_work_mention_provider,
 )
 from reelio.extraction.services.interpretation.service import (
-    MovieMentionInterpretationService,
+    ScreenWorkMentionInterpretationService,
 )
 from reelio.extraction.services.transcription.acquisition import (
     YouTubeCaptionProvider,
@@ -52,7 +52,7 @@ async def _create_production_pipeline() -> ExtractionPipelineProtocol:
     interpretation_settings = InterpretationConfig()
     llm_provider_selection = LLMProviderSelectionConfig()  # type: ignore[call-arg]
     async with AsyncExitStack() as cleanup:
-        llm_provider = create_movie_mention_provider(llm_provider_selection)
+        llm_provider = create_screen_work_mention_provider(llm_provider_selection)
         cleanup.push_async_callback(llm_provider.aclose)
         transcriber = await asyncio.to_thread(
             load_whisper_transcriber,
@@ -72,7 +72,7 @@ async def _create_production_pipeline() -> ExtractionPipelineProtocol:
             temp_media_dir=_transcription_settings.temp_media_dir,
             semaphore=asyncio.Semaphore(_transcription_settings.whisper_max_concurrent),
         )
-        interpretation_service = MovieMentionInterpretationService(
+        interpretation_service = ScreenWorkMentionInterpretationService(
             provider=llm_provider,
             settings=interpretation_settings,
         )

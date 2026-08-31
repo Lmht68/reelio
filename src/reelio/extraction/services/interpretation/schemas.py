@@ -1,4 +1,4 @@
-"""Strict response schemas for Movie Mention interpretation."""
+"""Strict response schemas for Screen Work Mention interpretation."""
 
 import unicodedata
 
@@ -11,8 +11,8 @@ from reelio.extraction.types import (
 )
 
 
-class InterpretedMovie(BaseModel):
-    """Validate one canonical movie title and release year."""
+class InterpretedScreenWorkMention(BaseModel):
+    """Validate one canonical Screen Work title and year."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -42,27 +42,28 @@ class InterpretedMovie(BaseModel):
 
     @field_validator("year")
     @classmethod
-    def validate_release_year(cls, value: int) -> int:
-        """Reject implausible future release years.
+    def validate_screen_work_year(cls, value: int) -> int:
+        """Reject implausible future Screen Work years.
 
         Args:
-            value: Release year returned by the provider.
+            value: Screen Work year returned by the provider.
 
         Returns:
-            int: The validated release year.
+            int: The validated Screen Work year.
 
         Raises:
             ValueError: If the year is more than two years in the future.
         """
-        maximum_release_year = maximum_screen_work_mention_year()
-        if value > maximum_release_year:
-            raise ValueError(f"year must be no later than {maximum_release_year}")
+        maximum_screen_work_year = maximum_screen_work_mention_year()
+        if value > maximum_screen_work_year:
+            raise ValueError(f"year must be no later than {maximum_screen_work_year}")
         return value
 
 
-class MovieInterpretationResponse(BaseModel):
-    """Validate the complete structured Movie Mention response."""
+class ScreenWorkInterpretationResponse(BaseModel):
+    """Validate the complete structured Screen Work Mention response."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    movies: list[InterpretedMovie]
+    movies: list[InterpretedScreenWorkMention]
+    tv_series: list[InterpretedScreenWorkMention]

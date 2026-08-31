@@ -3,29 +3,32 @@
 from collections.abc import Sequence
 
 from reelio.extraction.types import (
-    MentionResult,
     MovieMention,
+    MovieResult,
     ResultStatus,
+    ScreenWorkMentions,
     Source,
     Transcript,
 )
 
 
 class FakeInterpretationService:
-    """Provide deterministic Movie Mention interpretation for pipeline tests."""
+    """Provide deterministic Screen Work Mention interpretation for pipeline tests."""
 
     def __init__(
         self,
-        movie_mentions: Sequence[MovieMention] = (),
+        mentions: ScreenWorkMentions | None = None,
         error: Exception | None = None,
     ) -> None:
-        """Configure returned Movie Mentions or a raised exception.
+        """Configure returned Screen Work Mentions or a raised exception.
 
         Args:
-            movie_mentions: Movie Mentions returned by ``interpret``.
+            mentions: Screen Work Mentions returned by ``interpret``.
             error: Exception raised by ``interpret`` when provided.
         """
-        self.movie_mentions = list(movie_mentions)
+        self.mentions = (
+            mentions if mentions is not None else ScreenWorkMentions(movies=[], tv_series=[])
+        )
         self.error = error
         self.calls: list[tuple[Source, Transcript]] = []
         self.closed = False
@@ -34,15 +37,15 @@ class FakeInterpretationService:
         self,
         source: Source,
         transcript: Transcript,
-    ) -> list[MovieMention]:
-        """Record Interpretation Material and return configured Movie Mentions.
+    ) -> ScreenWorkMentions:
+        """Record Interpretation Material and return configured Screen Work Mentions.
 
         Args:
             source: Source supplied by the extraction pipeline.
             transcript: Transcript supplied by the extraction pipeline.
 
         Returns:
-            list[MovieMention]: Configured Movie Mentions.
+            ScreenWorkMentions: Configured grouped Screen Work Mentions.
 
         Raises:
             Exception: Configured error when one was provided.
@@ -50,7 +53,7 @@ class FakeInterpretationService:
         self.calls.append((source, transcript))
         if self.error is not None:
             raise self.error
-        return self.movie_mentions
+        return self.mentions
 
     async def aclose(self) -> None:
         """Record release of interpretation resources."""
@@ -62,7 +65,7 @@ class FakeMovieResolver:
 
     def __init__(
         self,
-        results: Sequence[MentionResult] | None = None,
+        results: Sequence[MovieResult] | None = None,
         error: Exception | None = None,
     ) -> None:
         """Configure returned results or a raised exception.
@@ -80,14 +83,14 @@ class FakeMovieResolver:
     async def resolve(
         self,
         movie_mentions: Sequence[MovieMention],
-    ) -> list[MentionResult]:
+    ) -> list[MovieResult]:
         """Record and resolve the supplied Movie Mentions.
 
         Args:
             movie_mentions: Ordered Movie Mentions from interpretation.
 
         Returns:
-            list[MentionResult]: Configured or default unresolved results.
+            list[MovieResult]: Configured or default unresolved results.
 
         Raises:
             Exception: Configured error when one was provided.
@@ -98,7 +101,7 @@ class FakeMovieResolver:
         if self.results is not None:
             return self.results
         return [
-            MentionResult(
+            MovieResult(
                 status=ResultStatus.UNRESOLVED,
                 movie_mention=movie_mention,
                 movie=None,

@@ -1,4 +1,4 @@
-"""Configuration models for Movie Mention interpretation."""
+"""Configuration models for Screen Work Mention interpretation."""
 
 from enum import StrEnum
 from typing import Annotated
@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class LLMProvider(StrEnum):
-    """Identify an LLM provider supported for Movie Mention interpretation."""
+    """Identify an LLM provider supported for Screen Work Mention interpretation."""
 
     OPENAI = "openai"
     DEEPSEEK = "deepseek"
@@ -34,7 +34,7 @@ class _ReelioSettings(BaseSettings):
 
 
 class LLMProviderSelectionConfig(_ReelioSettings):
-    """Validate the LLM provider selected for Movie Mention interpretation."""
+    """Validate the LLM provider selected for Screen Work Mention interpretation."""
 
     llm_provider: LLMProvider = Field(validation_alias="REELIO_LLM_PROVIDER")
 

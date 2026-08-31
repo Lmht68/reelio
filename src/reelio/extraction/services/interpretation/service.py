@@ -1,4 +1,4 @@
-"""Interpret bounded Source material into ordered Movie Mentions."""
+"""Interpret bounded Source material into ordered Screen Work Mentions."""
 
 import logging
 from collections.abc import Sequence
@@ -21,19 +21,26 @@ from reelio.extraction.services.interpretation.prompt import (
     build_interpretation_material,
     build_system_prompt,
 )
-from reelio.extraction.services.interpretation.schemas import MovieInterpretationResponse
+from reelio.extraction.services.interpretation.schemas import ScreenWorkInterpretationResponse
 from reelio.extraction.services.interpretation.types import LLMMessage
-from reelio.extraction.types import MovieMention, Source, Transcript
+from reelio.extraction.types import (
+    MovieMention,
+    ScreenWorkMentions,
+    Source,
+    Transcript,
+    TVSeriesMention,
+    normalize_screen_work_title,
+)
 
 logger = logging.getLogger(__name__)
 
 _INPUT_LIMIT_MESSAGE = "Interpretation Material exceeds the configured limit."
 _INVALID_RESPONSE_MESSAGE = "The LLM returned an invalid Movie Mention response."
-_STAGE = "movie_mention_interpretation"
+_STAGE = "screen_work_mention_interpretation"
 
 
-class MovieMentionProvider(Protocol):
-    """Define the provider boundary used by Movie Mention interpretation."""
+class ScreenWorkMentionProvider(Protocol):
+    """Define the provider boundary used by Screen Work Mention interpretation."""
 
     @property
     def provider_name(self) -> LLMProvider:
@@ -65,12 +72,12 @@ class MovieMentionProvider(Protocol):
         ...
 
 
-class MovieMentionInterpretationService:
-    """Validate Interpretation Material and produce canonical Movie Mentions."""
+class ScreenWorkMentionInterpretationService:
+    """Validate Interpretation Material and produce canonical Screen Work Mentions."""
 
     def __init__(
         self,
-        provider: MovieMentionProvider,
+        provider: ScreenWorkMentionProvider,
         settings: InterpretationConfig,
     ) -> None:
         """Initialize interpretation with an LLM provider and validated limits.
@@ -87,16 +94,16 @@ class MovieMentionInterpretationService:
         self,
         source: Source,
         transcript: Transcript,
-    ) -> list[MovieMention]:
-        """Interpret ordered, deduplicated Movie Mentions from a Transcript.
+    ) -> ScreenWorkMentions:
+        """Interpret ordered, deduplicated Screen Work Mentions from a Transcript.
 
         Args:
             source: Canonical Source whose metadata supports interpretation.
             transcript: Complete normalized Transcript to interpret.
 
         Returns:
-            list[MovieMention]: Canonical Movie Mentions in first-reference order.
-
+            ScreenWorkMentions: Canonical mentions in first-reference order within
+                each Screen Work kind.
         Raises:
             InterpretationInputTooLargeError: If any Interpretation Material field
                 exceeds its configured limit.
@@ -122,7 +129,7 @@ class MovieMentionInterpretationService:
             response_content = await self._provider.complete(messages)
         except (MovieMentionInterpretationError, PipelineTimeoutError) as exc:
             logger.error(
-                "movie mention interpretation provider request failed",
+                "screen work mention interpretation provider request failed",
                 extra={
                     "stage": _STAGE,
                     "reason": exc.code,
@@ -134,10 +141,10 @@ class MovieMentionInterpretationService:
             raise
 
         try:
-            response = MovieInterpretationResponse.model_validate_json(response_content)
+            response = ScreenWorkInterpretationResponse.model_validate_json(response_content)
         except ValidationError as exc:
             logger.error(
-                "movie mention interpretation response validation failed",
+                "screen work mention interpretation response validation failed",
                 extra={
                     "stage": _STAGE,
                     "reason": "invalid_provider_response",
@@ -148,16 +155,17 @@ class MovieMentionInterpretationService:
             )
             raise InvalidLLMResponseError(_INVALID_RESPONSE_MESSAGE) from exc
 
-        movie_mentions = _deduplicate(response)
+        mentions = _deduplicate(response)
         logger.debug(
-            "movie mention interpretation completed",
+            "screen work mention interpretation completed",
             extra={
                 "stage": _STAGE,
                 "duration_ms": _duration_ms(started_at),
-                "movie_mention_count": len(movie_mentions),
+                "movie_mention_count": len(mentions.movies),
+                "tv_series_mention_count": len(mentions.tv_series),
             },
         )
-        return movie_mentions
+        return mentions
 
     async def aclose(self) -> None:
         """Close the lifespan-owned interpretation provider."""
@@ -186,22 +194,37 @@ class MovieMentionInterpretationService:
             if actual_size <= maximum_size:
                 continue
             logger.error(
-                "movie mention interpretation input rejected",
+                "screen work mention interpretation input rejected",
                 extra={"stage": _STAGE, "reason": reason},
             )
             raise InterpretationInputTooLargeError(_INPUT_LIMIT_MESSAGE)
 
 
-def _deduplicate(response: MovieInterpretationResponse) -> list[MovieMention]:
-    seen: set[tuple[str, int]] = set()
+def _deduplicate(response: ScreenWorkInterpretationResponse) -> ScreenWorkMentions:
+    seen_movie_identities: set[tuple[str, int]] = set()
     movie_mentions: list[MovieMention] = []
     for movie in response.movies:
-        identity = (movie.title, movie.year)
-        if identity in seen:
+        title = normalize_screen_work_title(movie.title)
+        identity = (title, movie.year)
+        if identity in seen_movie_identities:
             continue
-        seen.add(identity)
-        movie_mentions.append(MovieMention(title=movie.title, year=movie.year))
-    return movie_mentions
+        seen_movie_identities.add(identity)
+        movie_mentions.append(MovieMention(title=title, year=movie.year))
+
+    seen_tv_series_identities: set[tuple[str, int]] = set()
+    tv_series_mentions: list[TVSeriesMention] = []
+    for tv_series in response.tv_series:
+        title = normalize_screen_work_title(tv_series.title)
+        identity = (title, tv_series.year)
+        if identity in seen_tv_series_identities:
+            continue
+        seen_tv_series_identities.add(identity)
+        tv_series_mentions.append(TVSeriesMention(title=title, year=tv_series.year))
+
+    return ScreenWorkMentions(
+        movies=movie_mentions,
+        tv_series=tv_series_mentions,
+    )
 
 
 def _duration_ms(started_at: float) -> float:

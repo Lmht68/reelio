@@ -8,10 +8,58 @@ from reelio.extraction import schemas as extraction_schemas
 from reelio.extraction.service import ExtractionPipelineProtocol
 from reelio.extraction.types import (
     EnrichedMovie,
-    MentionResult,
     MovieMention,
+    MovieResult,
     PipelineResult,
+    TVSeriesMention,
+    TVSeriesResult,
 )
+
+_EXTRACT_RESPONSE_EXAMPLE = {
+    "source": {
+        "platform": "youtube",
+        "video_id": "dQw4w9WgXcQ",
+        "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "title": "Screen Work review",
+        "description": "A review mentioning a Movie and a TV Series.",
+        "channel": "Example channel",
+        "duration_seconds": 42,
+    },
+    "transcript": {
+        "text": "Dune: Part One and The Last of Us are excellent.",
+        "language": "en",
+        "method": "youtube_captions",
+    },
+    "results": {
+        "movies": [
+            {
+                "status": "resolved",
+                "movie_mention": {"title": "Dune: Part One", "year": 2021},
+                "movie": {
+                    "title": "Dune: Part One",
+                    "year": 2021,
+                    "cast": ["Timothée Chalamet"],
+                    "directors": ["Denis Villeneuve"],
+                    "description": "Paul Atreides faces his destiny on Arrakis.",
+                    "poster_url": "https://image.tmdb.org/t/p/w500/dune.jpg",
+                    "tmdb_id": 438631,
+                    "tmdb_url": "https://www.themoviedb.org/movie/438631",
+                    "imdb_id": "tt1160419",
+                    "imdb_url": "https://www.imdb.com/title/tt1160419/",
+                    "tmdb_score": 7.8,
+                },
+            }
+        ],
+        "tv_series": [
+            {
+                "status": "unresolved",
+                "tv_series_mention": {"title": "The Last of Us", "year": 2023},
+                "tv_series": None,
+            }
+        ],
+    },
+}
+
 
 router = APIRouter(prefix="/api", tags=["extraction"])
 
@@ -35,6 +83,15 @@ def _to_movie_mention_schema(mention: MovieMention) -> extraction_schemas.MovieM
     )
 
 
+def _to_tv_series_mention_schema(
+    mention: TVSeriesMention,
+) -> extraction_schemas.TVSeriesMentionModel:
+    return extraction_schemas.TVSeriesMentionModel(
+        title=mention.title,
+        year=mention.year,
+    )
+
+
 def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.MovieModel:
     return extraction_schemas.MovieModel(
         title=movie.title,
@@ -51,12 +108,24 @@ def _to_movie_schema(movie: EnrichedMovie) -> extraction_schemas.MovieModel:
     )
 
 
-def _to_result_schema(result: MentionResult) -> extraction_schemas.ResultModel:
+def _to_movie_result_schema(
+    result: MovieResult,
+) -> extraction_schemas.MovieResultModel:
     movie = _to_movie_schema(result.movie) if result.movie is not None else None
-    return extraction_schemas.ResultModel(
+    return extraction_schemas.MovieResultModel(
         status=result.status,
         movie_mention=_to_movie_mention_schema(result.movie_mention),
         movie=movie,
+    )
+
+
+def _to_tv_series_result_schema(
+    result: TVSeriesResult,
+) -> extraction_schemas.TVSeriesResultModel:
+    return extraction_schemas.TVSeriesResultModel(
+        status=result.status,
+        tv_series_mention=_to_tv_series_mention_schema(result.tv_series_mention),
+        tv_series=None,
     )
 
 
@@ -76,21 +145,33 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
             language=result.transcript.language,
             method=result.transcript.method,
         ),
-        results=[_to_result_schema(item) for item in result.results],
+        results=extraction_schemas.ScreenWorkResultsModel(
+            movies=[_to_movie_result_schema(item) for item in result.results.movies],
+            tv_series=[_to_tv_series_result_schema(item) for item in result.results.tv_series],
+        ),
     )
 
 
 @router.post(
     "/extract",
     status_code=status.HTTP_200_OK,
-    summary="Extract mentioned movies from a supported public video Source",
+    response_model=extraction_schemas.ExtractResponse,
+    summary="Extract mentioned Movies and TV Series from a public video Source",
     description=(
-        "Accept a public YouTube, Instagram, Facebook, TikTok, or X video URL "
-        "and return the normalized Source, the Transcript with its acquisition "
-        "method, and one Resolved or Unresolved result per mentioned movie."
+        "Accept a public YouTube, Instagram, Facebook, TikTok, or X video URL and "
+        "return the normalized Source, the Transcript with its acquisition method, "
+        "and grouped Movie and TV Series results. Each list preserves first-reference "
+        "order within its kind; TV Series are unresolved with null enrichment in "
+        "issue 02, and there is no cross-kind ordering."
     ),
-    response_description="Source, transcript, and per-mention results.",
+    response_description="Source, transcript, and grouped Screen Work Results.",
     responses={
+        200: {
+            "description": "Grouped Movie and TV Series results.",
+            "content": {
+                "application/json": {"example": _EXTRACT_RESPONSE_EXAMPLE},
+            },
+        },
         400: {
             "model": extraction_schemas.ErrorResponse,
             "description": "Invalid URL, unsupported platform, or unsupported Source.",
@@ -121,7 +202,7 @@ async def extract(
     payload: extraction_schemas.ExtractRequest,
     pipeline: Annotated[ExtractionPipelineProtocol, Depends(get_pipeline)],
 ) -> extraction_schemas.ExtractResponse:
-    """Extract structured movie mentions from a submitted source URL.
+    """Extract structured Movie and TV Series Mentions from a submitted source URL.
 
     Args:
         payload: Validated extraction request containing the source URL.

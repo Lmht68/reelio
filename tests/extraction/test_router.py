@@ -39,10 +39,12 @@ from reelio.extraction.services.transcription.service import (
 )
 from reelio.extraction.types import (
     EnrichedMovie,
-    MentionResult,
     MovieMention,
+    MovieResult,
     PipelineResult,
     ResultStatus,
+    ScreenWorkMentions,
+    TVSeriesMention,
 )
 from reelio.main import app
 from tests.extraction.fakes import (
@@ -176,6 +178,7 @@ def _transcription_service(provider: _CaptionProvider) -> TranscriptionService:
 def _pipeline(
     metadata_service: SourceMetadataService,
     transcription_service: TranscriptionService,
+    mentions: ScreenWorkMentions | None = None,
 ) -> ExtractionPipeline:
     movie_mention = MovieMention(title="Dune: Part One", year=2021)
     movie = EnrichedMovie(
@@ -197,19 +200,27 @@ def _pipeline(
         imdb_url="https://www.imdb.com/title/tt1160419/",
         tmdb_score=7.8,
     )
+    interpreted = (
+        mentions
+        if mentions is not None
+        else ScreenWorkMentions(movies=[movie_mention], tv_series=[])
+    )
+    movie_results = (
+        [
+            MovieResult(
+                status=ResultStatus.RESOLVED,
+                movie_mention=movie_mention,
+                movie=movie,
+            )
+        ]
+        if interpreted.movies
+        else []
+    )
     return ExtractionPipeline(
         metadata_service,
         transcription_service,
-        _FakeInterpretationService([movie_mention]),
-        _FakeMovieResolver(
-            [
-                MentionResult(
-                    status=ResultStatus.RESOLVED,
-                    movie_mention=movie_mention,
-                    movie=movie,
-                )
-            ]
-        ),
+        _FakeInterpretationService(interpreted),
+        _FakeMovieResolver(movie_results),
     )
 
 
@@ -249,8 +260,12 @@ async def test_extract_returns_schema_valid_response(client: AsyncClient) -> Non
     assert payload.transcript.language == "en-GB"
     assert payload.transcript.method == "youtube_captions"
     assert payload.transcript.text == "Router caption text."
-    assert len(payload.results) == 1
-    resolved = payload.results[0]
+    raw_results = response.json()["results"]
+    assert set(raw_results) == {"movies", "tv_series"}
+    assert raw_results["tv_series"] == []
+    assert len(payload.results.movies) == 1
+    assert payload.results.tv_series == []
+    resolved = payload.results.movies[0]
     assert resolved.status is ResultStatus.RESOLVED
     assert resolved.movie_mention.title == "Dune: Part One"
     assert resolved.movie_mention.year == 2021
@@ -291,6 +306,76 @@ async def test_extract_maps_unavailable_captions_to_502(
             "message": "Transcript is unavailable for this video.",
         }
     }
+
+
+@pytest.mark.parametrize(
+    ("mentions", "expected_movies", "expected_tv_series"),
+    [
+        (ScreenWorkMentions(movies=[], tv_series=[]), [], []),
+        (
+            ScreenWorkMentions(
+                movies=[MovieMention(title="Dune: Part One", year=2021)],
+                tv_series=[],
+            ),
+            ["Dune: Part One"],
+            [],
+        ),
+        (
+            ScreenWorkMentions(
+                movies=[],
+                tv_series=[
+                    TVSeriesMention(title="The Last of Us", year=2023),
+                    TVSeriesMention(title="Arcane", year=2021),
+                ],
+            ),
+            [],
+            ["The Last of Us", "Arcane"],
+        ),
+        (
+            ScreenWorkMentions(
+                movies=[MovieMention(title="Dune: Part One", year=2021)],
+                tv_series=[
+                    TVSeriesMention(title="Arcane", year=2021),
+                    TVSeriesMention(title="The Last of Us", year=2023),
+                ],
+            ),
+            ["Dune: Part One"],
+            ["Arcane", "The Last of Us"],
+        ),
+    ],
+    ids=["empty", "movie-only", "tv-only", "mixed"],
+)
+async def test_extract_groups_screen_work_results(
+    client: AsyncClient,
+    mentions: ScreenWorkMentions,
+    expected_movies: list[str],
+    expected_tv_series: list[str],
+) -> None:
+    """Serialize always-present independently ordered Movie and TV Series lists."""
+    pipeline = _pipeline(
+        SourceMetadataService(
+            extractor=_MetadataExtractor(),
+            settings=_settings(),
+        ),
+        _transcription_service(_CaptionProvider([_CaptionTrack("en", ["Grouped", "results."])])),
+        mentions,
+    )
+    _install_pipeline(app, pipeline)
+
+    response = await client.post("/api/extract", json={"url": _CANONICAL_URL})
+
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert set(results) == {"movies", "tv_series"}
+    assert [item["movie_mention"]["title"] for item in results["movies"]] == expected_movies
+    assert [
+        item["tv_series_mention"]["title"] for item in results["tv_series"]
+    ] == expected_tv_series
+    assert all(set(item) == {"status", "movie_mention", "movie"} for item in results["movies"])
+    assert all(
+        set(item) == {"status", "tv_series_mention", "tv_series"} for item in results["tv_series"]
+    )
+    assert all(item["tv_series"] is None for item in results["tv_series"])
 
 
 async def test_extract_returns_whisper_transcript(
@@ -589,13 +674,48 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "channel",
         "duration_seconds",
     } <= set(source_properties)
-    result_schema = schemas["ResultModel"]
-    assert {"status", "movie_mention", "movie"} <= set(result_schema["required"])
-    assert result_schema["properties"]["movie_mention"] == {
+    response_schema = responses["200"]["content"]["application/json"]["schema"]
+    assert response_schema == {"$ref": "#/components/schemas/ExtractResponse"}
+    example = responses["200"]["content"]["application/json"]["example"]
+    assert set(example["results"]) == {"movies", "tv_series"}
+    tv_series_example = example["results"]["tv_series"][0]
+    assert tv_series_example["status"] == "unresolved"
+    assert set(tv_series_example) == {"status", "tv_series_mention"}
+    assert "ResultModel" not in schemas
+    extract_response_properties = schemas["ExtractResponse"]["properties"]
+    assert extract_response_properties["results"] == {
+        "$ref": "#/components/schemas/ScreenWorkResultsModel"
+    }
+    screen_work_results = schemas["ScreenWorkResultsModel"]
+    assert screen_work_results["required"] == ["movies", "tv_series"]
+    assert screen_work_results["properties"]["movies"] == {
+        "items": {"$ref": "#/components/schemas/MovieResultModel"},
+        "type": "array",
+        "title": "Movies",
+    }
+    assert screen_work_results["properties"]["tv_series"] == {
+        "items": {"$ref": "#/components/schemas/TVSeriesResultModel"},
+        "type": "array",
+        "title": "Tv Series",
+    }
+    movie_result_schema = schemas["MovieResultModel"]
+    assert {"status", "movie_mention", "movie"} <= set(movie_result_schema["required"])
+    assert movie_result_schema["properties"]["movie_mention"] == {
         "$ref": "#/components/schemas/MovieMentionModel"
+    }
+    tv_series_result_schema = schemas["TVSeriesResultModel"]
+    assert {"status", "tv_series_mention", "tv_series"} <= set(tv_series_result_schema["required"])
+    assert tv_series_result_schema["properties"]["tv_series_mention"] == {
+        "$ref": "#/components/schemas/TVSeriesMentionModel"
+    }
+    assert tv_series_result_schema["properties"]["tv_series"] == {
+        "title": "Tv Series",
+        "type": "null",
     }
     movie_mention_schema = schemas["MovieMentionModel"]
     assert {"title", "year"} <= set(movie_mention_schema["required"])
+    tv_series_mention_schema = schemas["TVSeriesMentionModel"]
+    assert {"title", "year"} <= set(tv_series_mention_schema["required"])
     movie_schema = schemas["MovieModel"]
     assert {"year", "tmdb_score"} <= set(movie_schema["required"])
     assert set(document["components"]["schemas"]["Platform"]["enum"]) == {
@@ -606,3 +726,4 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "x",
     }
     assert "YouTube, Instagram, Facebook, TikTok, or X" in operation["description"]
+    assert "first-reference order" in operation["description"]

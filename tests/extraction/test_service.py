@@ -20,11 +20,14 @@ from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
     MovieMention,
+    MovieResult,
     Platform,
     ResultStatus,
+    ScreenWorkMentions,
     Source,
     Transcript,
     TranscriptMethod,
+    TVSeriesMention,
 )
 from tests.extraction.fakes import (
     FakeInterpretationService as _FakeInterpretationService,
@@ -109,19 +112,13 @@ def _transcript() -> Transcript:
     )
 
 
-async def test_pipeline_integrates_fake_movie_interpretation_results() -> None:
-    """Combine Source, Transcript, and fake Movie Mentions as Unresolved Results."""
+async def test_pipeline_returns_empty_grouped_results_and_calls_movie_resolver_once() -> None:
+    """Resolve an empty Movie sequence and return both required result lists."""
     source = _source()
     transcript = _transcript()
     metadata_service = _FakeSourceMetadataService(source)
     transcription_service = _FakeTranscriptionService(transcript)
-    interpretation_service = _FakeInterpretationService(
-        [
-            MovieMention(title="Dune: Part One", year=2021),
-            MovieMention(title="Che: Part One", year=2008),
-            MovieMention(title="Che: Part Two", year=2008),
-        ]
-    )
+    interpretation_service = _FakeInterpretationService(ScreenWorkMentions(movies=[], tv_series=[]))
     movie_resolver = _FakeMovieResolver()
     pipeline = _pipeline(
         metadata_service,
@@ -137,10 +134,98 @@ async def test_pipeline_integrates_fake_movie_interpretation_results() -> None:
     assert metadata_service.calls == [_CANONICAL_URL]
     assert transcription_service.calls == [(source, _CANONICAL_URL)]
     assert interpretation_service.calls == [(source, transcript)]
-    assert movie_resolver.calls == [tuple(interpretation_service.movie_mentions)]
-    assert [item.status for item in result.results] == [ResultStatus.UNRESOLVED] * 3
-    assert [item.movie_mention for item in result.results] == interpretation_service.movie_mentions
-    assert all(item.movie is None for item in result.results)
+    assert movie_resolver.calls == [()]
+    assert result.results.movies == []
+    assert result.results.tv_series == []
+
+
+async def test_pipeline_returns_ordered_movie_results_unchanged() -> None:
+    """Pass only Movie Mentions to the resolver and preserve its result objects."""
+    movie_mentions = [
+        MovieMention(title="Dune: Part One", year=2021),
+        MovieMention(title="Che: Part One", year=2008),
+    ]
+    movie_results = [
+        MovieResult(ResultStatus.UNRESOLVED, movie_mentions[0], None),
+        MovieResult(ResultStatus.UNRESOLVED, movie_mentions[1], None),
+    ]
+    interpretation_service = _FakeInterpretationService(
+        ScreenWorkMentions(movies=movie_mentions, tv_series=[])
+    )
+    movie_resolver = _FakeMovieResolver(results=movie_results)
+    pipeline = _pipeline(
+        _FakeSourceMetadataService(_source()),
+        _FakeTranscriptionService(_transcript()),
+        interpretation_service,
+        movie_resolver,
+    )
+
+    result = await pipeline.run(_CANONICAL_URL)
+
+    assert movie_resolver.calls == [tuple(movie_mentions)]
+    assert result.results.movies == movie_results
+    assert result.results.movies[0] is movie_results[0]
+    assert result.results.movies[1] is movie_results[1]
+    assert result.results.tv_series == []
+
+
+async def test_pipeline_projects_tv_only_mentions_without_movie_resolution_input() -> None:
+    """Return ordered unresolved TV Series Results while resolving an empty Movie list."""
+    tv_series_mentions = [
+        TVSeriesMention(title="The Last of Us", year=2023),
+        TVSeriesMention(title="Arcane", year=2021),
+    ]
+    interpretation_service = _FakeInterpretationService(
+        ScreenWorkMentions(movies=[], tv_series=tv_series_mentions)
+    )
+    movie_resolver = _FakeMovieResolver()
+    pipeline = _pipeline(
+        _FakeSourceMetadataService(_source()),
+        _FakeTranscriptionService(_transcript()),
+        interpretation_service,
+        movie_resolver,
+    )
+
+    result = await pipeline.run(_CANONICAL_URL)
+
+    assert movie_resolver.calls == [()]
+    assert result.results.movies == []
+    assert [item.status for item in result.results.tv_series] == [
+        ResultStatus.UNRESOLVED,
+        ResultStatus.UNRESOLVED,
+    ]
+    assert [item.tv_series_mention for item in result.results.tv_series] == tv_series_mentions
+    assert result.results.tv_series[0].tv_series_mention is tv_series_mentions[0]
+    assert result.results.tv_series[1].tv_series_mention is tv_series_mentions[1]
+    assert all(item.tv_series is None for item in result.results.tv_series)
+
+
+async def test_pipeline_groups_mixed_interpretation_results() -> None:
+    """Keep Movie and TV Series ordering independent in one pipeline result."""
+    movie_mention = MovieMention(title="Dune: Part One", year=2021)
+    tv_series_mention = TVSeriesMention(title="The Last of Us", year=2023)
+    movie_result = MovieResult(ResultStatus.UNRESOLVED, movie_mention, None)
+    interpretation_service = _FakeInterpretationService(
+        ScreenWorkMentions(
+            movies=[movie_mention],
+            tv_series=[tv_series_mention],
+        )
+    )
+    movie_resolver = _FakeMovieResolver(results=[movie_result])
+    pipeline = _pipeline(
+        _FakeSourceMetadataService(_source()),
+        _FakeTranscriptionService(_transcript()),
+        interpretation_service,
+        movie_resolver,
+    )
+
+    result = await pipeline.run(_CANONICAL_URL)
+
+    assert movie_resolver.calls == [(movie_mention,)]
+    assert result.results.movies == [movie_result]
+    assert result.results.tv_series[0].status is ResultStatus.UNRESOLVED
+    assert result.results.tv_series[0].tv_series_mention is tv_series_mention
+    assert result.results.tv_series[0].tv_series is None
 
 
 async def test_pipeline_preserves_whisper_transcript_method() -> None:
@@ -241,7 +326,12 @@ async def test_pipeline_propagates_resolution_errors_unchanged() -> None:
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
-        _FakeInterpretationService([MovieMention(title="Dune: Part One", year=2021)]),
+        _FakeInterpretationService(
+            ScreenWorkMentions(
+                movies=[MovieMention(title="Dune: Part One", year=2021)],
+                tv_series=[],
+            )
+        ),
         movie_resolver,
     )
 

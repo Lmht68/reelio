@@ -6,11 +6,15 @@ from typing import Protocol
 from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
-    MentionResult,
     MovieMention,
+    MovieResult,
     PipelineResult,
+    ResultStatus,
+    ScreenWorkMentions,
+    ScreenWorkResults,
     Source,
     Transcript,
+    TVSeriesResult,
 )
 
 
@@ -18,7 +22,7 @@ class ExtractionPipelineProtocol(Protocol):
     """Define the end-to-end extraction pipeline boundary."""
 
     async def run(self, url: str) -> PipelineResult:
-        """Extract structured movie mentions from a submitted source URL.
+        """Extract structured Screen Work Mentions from a submitted source URL.
 
         Args:
             url: Source URL submitted by the API caller.
@@ -57,15 +61,15 @@ class _TranscriptAcquirer(Protocol):
         ...
 
 
-class _MovieMentionInterpreter(Protocol):
-    """Interpret ordered Movie Mentions from one Source and Transcript."""
+class _ScreenWorkMentionInterpreter(Protocol):
+    """Interpret ordered Screen Work Mentions from one Source and Transcript."""
 
     async def interpret(
         self,
         source: Source,
         transcript: Transcript,
-    ) -> list[MovieMention]:
-        """Return canonical Movie Mentions in first-reference order."""
+    ) -> ScreenWorkMentions:
+        """Return canonical mentions in first-reference order within each kind."""
         ...
 
     async def aclose(self) -> None:
@@ -79,7 +83,7 @@ class _MovieResolver(Protocol):
     async def resolve(
         self,
         movie_mentions: Sequence[MovieMention],
-    ) -> list[MentionResult]:
+    ) -> list[MovieResult]:
         """Return one Resolved or Unresolved Result per Movie Mention."""
         ...
 
@@ -95,7 +99,7 @@ class ExtractionPipeline:
         self,
         source_metadata_service: _SourceMetadataInspector,
         transcription_service: _TranscriptAcquirer,
-        interpretation_service: _MovieMentionInterpreter,
+        interpretation_service: _ScreenWorkMentionInterpreter,
         movie_resolver: _MovieResolver,
     ) -> None:
         """Initialize the pipeline with explicit stage services.
@@ -103,7 +107,7 @@ class ExtractionPipeline:
         Args:
             source_metadata_service: Service that validates and inspects Sources.
             transcription_service: Service that acquires Transcripts.
-            interpretation_service: Service that interprets Movie Mentions.
+            interpretation_service: Service that interprets Screen Work Mentions.
             movie_resolver: Module that resolves and enriches Movie Mentions.
         """
         self._source_metadata_service = source_metadata_service
@@ -133,15 +137,26 @@ class ExtractionPipeline:
         finally:
             inspected.cleanup()
 
-        movie_mentions = await self._interpretation_service.interpret(
+        interpreted = await self._interpretation_service.interpret(
             inspected.source,
             transcript,
         )
-        results = await self._movie_resolver.resolve(movie_mentions)
+        movie_results = await self._movie_resolver.resolve(interpreted.movies)
+        tv_series_results = [
+            TVSeriesResult(
+                status=ResultStatus.UNRESOLVED,
+                tv_series_mention=mention,
+                tv_series=None,
+            )
+            for mention in interpreted.tv_series
+        ]
         return PipelineResult(
             source=inspected.source,
             transcript=transcript,
-            results=results,
+            results=ScreenWorkResults(
+                movies=movie_results,
+                tv_series=tv_series_results,
+            ),
         )
 
     async def aclose(self) -> None:

@@ -12,8 +12,8 @@ from reelio.extraction.exceptions import EnrichmentError, PipelineTimeoutError
 from reelio.extraction.services.enrichment.config import TMDBConfig
 from reelio.extraction.types import (
     EnrichedMovie,
-    MentionResult,
     MovieMention,
+    MovieResult,
     ResultStatus,
     normalize_screen_work_title,
 )
@@ -95,14 +95,14 @@ class TMDBMovieResolver:
     async def resolve(
         self,
         movie_mentions: Sequence[MovieMention],
-    ) -> list[MentionResult]:
+    ) -> list[MovieResult]:
         """Resolve and enrich Movie Mentions while preserving their order.
 
         Args:
             movie_mentions: Canonical Movie Mentions in first-reference order.
 
         Returns:
-            list[MentionResult]: One Resolved or Unresolved Result per Movie Mention.
+            list[MovieResult]: One Resolved or Unresolved Result per Movie Mention.
 
         Raises:
             EnrichmentError: If TMDB fails or returns an invalid response.
@@ -116,7 +116,7 @@ class TMDBMovieResolver:
         """Close the lifespan-owned TMDB client and its connection pool."""
         await self._client.aclose()
 
-    async def _resolve_one(self, movie_mention: MovieMention) -> MentionResult:
+    async def _resolve_one(self, movie_mention: MovieMention) -> MovieResult:
         normalized_mention_title = normalize_screen_work_title(movie_mention.title)
         search_response = await self._get_model(
             "search/movie",
@@ -161,13 +161,13 @@ class TMDBMovieResolver:
                 ):
                     continue
 
-            return MentionResult(
+            return MovieResult(
                 status=ResultStatus.RESOLVED,
                 movie_mention=movie_mention,
                 movie=self._enrich(movie_mention, movie),
             )
 
-        return MentionResult(
+        return MovieResult(
             status=ResultStatus.UNRESOLVED,
             movie_mention=movie_mention,
             movie=None,

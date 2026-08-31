@@ -18,7 +18,7 @@ from reelio.extraction.services.interpretation.openai import (
     OpenAIProvider,
     create_openai_provider,
 )
-from reelio.extraction.services.interpretation.schemas import MovieInterpretationResponse
+from reelio.extraction.services.interpretation.schemas import ScreenWorkInterpretationResponse
 from reelio.extraction.services.interpretation.types import LLMMessage
 
 
@@ -88,7 +88,10 @@ def test_openai_provider_constructor_uses_configured_client_options(
 
 async def test_openai_adapter_sends_strict_responses_request_and_closes_client() -> None:
     """Map trusted messages to a private strict Structured Outputs request."""
-    response_json = '{"movies":[{"title":"Dune: Part One","year":2021}]}'
+    response_json = (
+        '{"movies":[{"title":"Dune: Part One","year":2021}],'
+        '"tv_series":[{"title":"The Last of Us","year":2023}]}'
+    )
     fake_responses = _FakeResponses(SimpleNamespace(status="completed", output_text=response_json))
     fake_client = _FakeOpenAIClient(fake_responses)
     provider = OpenAIProvider(cast(AsyncOpenAI, fake_client), _settings())
@@ -107,8 +110,8 @@ async def test_openai_adapter_sends_strict_responses_request_and_closes_client()
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": "movie_mention_interpretation",
-                "schema": MovieInterpretationResponse.model_json_schema(),
+                "name": "screen_work_mention_interpretation",
+                "schema": ScreenWorkInterpretationResponse.model_json_schema(),
                 "strict": True,
             }
         },
@@ -116,6 +119,11 @@ async def test_openai_adapter_sends_strict_responses_request_and_closes_client()
     assert provider.provider_name is LLMProvider.OPENAI
     assert provider.model_name == "gpt-5-nano"
     assert fake_client.closed is True
+
+    schema = ScreenWorkInterpretationResponse.model_json_schema()
+    assert schema["required"] == ["movies", "tv_series"]
+    assert schema["additionalProperties"] is False
+    assert schema["$defs"]["InterpretedScreenWorkMention"]["additionalProperties"] is False
 
 
 async def test_openai_adapter_maps_refusal_response() -> None:

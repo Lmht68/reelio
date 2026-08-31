@@ -201,7 +201,7 @@ async def test_production_lifespan_closes_one_selected_provider(
         assert selection.llm_provider is LLMProvider.OPENAI
         return provider
 
-    monkeypatch.setattr(main_module, "create_movie_mention_provider", create_provider)
+    monkeypatch.setattr(main_module, "create_screen_work_mention_provider", create_provider)
     monkeypatch.setattr(main_module, "load_whisper_transcriber", lambda settings: object())
     monkeypatch.setattr(
         main_module,
@@ -233,7 +233,7 @@ async def test_production_lifespan_closes_provider_after_partial_startup_failure
 
     monkeypatch.setattr(
         main_module,
-        "create_movie_mention_provider",
+        "create_screen_work_mention_provider",
         create_provider,
     )
     monkeypatch.setattr(main_module, "load_whisper_transcriber", fail_whisper_load)

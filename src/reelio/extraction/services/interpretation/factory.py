@@ -1,4 +1,4 @@
-"""Construct the selected Movie Mention interpretation provider."""
+"""Construct the selected Screen Work Mention interpretation provider."""
 
 from typing import assert_never
 
@@ -10,19 +10,19 @@ from reelio.extraction.services.interpretation.config import (
 )
 from reelio.extraction.services.interpretation.deepseek import create_deepseek_provider
 from reelio.extraction.services.interpretation.openai import create_openai_provider
-from reelio.extraction.services.interpretation.service import MovieMentionProvider
+from reelio.extraction.services.interpretation.service import ScreenWorkMentionProvider
 
 
-def create_movie_mention_provider(
+def create_screen_work_mention_provider(
     selection: LLMProviderSelectionConfig,
-) -> MovieMentionProvider:
-    """Construct the configured lifespan-owned Movie Mention provider.
+) -> ScreenWorkMentionProvider:
+    """Construct the configured lifespan-owned Screen Work Mention provider.
 
     Args:
         selection: Validated fixed provider selection for this application lifespan.
 
     Returns:
-        MovieMentionProvider: The selected native provider adapter.
+        ScreenWorkMentionProvider: The selected native provider adapter.
 
     Raises:
         ValidationError: If the selected provider configuration is invalid.

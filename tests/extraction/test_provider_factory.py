@@ -1,4 +1,4 @@
-"""Selected Movie Mention provider factory tests."""
+"""Selected Screen Work Mention provider factory tests."""
 
 from collections.abc import Callable, Sequence
 from typing import cast
@@ -58,7 +58,7 @@ def test_factory_constructs_only_selected_openai_provider(
         lambda settings: pytest.fail(f"unexpected DeepSeek configuration: {settings}"),
     )
 
-    selected_provider = provider_factory.create_movie_mention_provider(_selection())
+    selected_provider = provider_factory.create_screen_work_mention_provider(_selection())
 
     assert selected_provider is provider
     assert captured_settings[0].model == "gpt-5-nano"
@@ -85,7 +85,7 @@ def test_factory_constructs_only_selected_deepseek_provider(
         lambda settings: pytest.fail(f"unexpected OpenAI configuration: {settings}"),
     )
 
-    selected_provider = provider_factory.create_movie_mention_provider(_selection())
+    selected_provider = provider_factory.create_screen_work_mention_provider(_selection())
 
     assert selected_provider is provider
     assert captured_settings[0].model == "deepseek-v4-flash"
@@ -109,4 +109,4 @@ def test_factory_does_not_fallback_after_selected_provider_failure(
     )
 
     with pytest.raises(RuntimeError, match="OpenAI construction failed"):
-        provider_factory.create_movie_mention_provider(_selection())
+        provider_factory.create_screen_work_mention_provider(_selection())

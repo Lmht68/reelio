@@ -6,7 +6,7 @@ from reelio.extraction.types import Platform, ResultStatus, TranscriptMethod
 
 
 class ExtractRequest(BaseModel):
-    """Request body for extracting movie mentions from a source URL."""
+    """Request body for extracting Screen Work Mentions from a source URL."""
 
     url: str = Field(
         min_length=1,
@@ -64,20 +64,42 @@ class MovieMentionModel(BaseModel):
     year: int
 
 
-class ResultModel(BaseModel):
-    """One interpreted mention and its resolution outcome."""
+class MovieResultModel(BaseModel):
+    """One interpreted Movie Mention and its resolution outcome."""
 
     status: ResultStatus
     movie_mention: MovieMentionModel
     movie: MovieModel | None
 
 
+class TVSeriesMentionModel(BaseModel):
+    """Title and first air year of a TV Series Mention from a transcript."""
+
+    title: str
+    year: int
+
+
+class TVSeriesResultModel(BaseModel):
+    """One unresolved TV Series Mention and its temporary null enrichment."""
+
+    status: ResultStatus
+    tv_series_mention: TVSeriesMentionModel
+    tv_series: None
+
+
+class ScreenWorkResultsModel(BaseModel):
+    """Screen Work Results grouped in independent first-reference order."""
+
+    movies: list[MovieResultModel]
+    tv_series: list[TVSeriesResultModel]
+
+
 class ExtractResponse(BaseModel):
-    """Successful extraction response containing source and movie results."""
+    """Successful extraction response containing grouped Screen Work Results."""
 
     source: SourceModel
     transcript: TranscriptModel
-    results: list[ResultModel]
+    results: ScreenWorkResultsModel
 
 
 class ErrorDetail(BaseModel):

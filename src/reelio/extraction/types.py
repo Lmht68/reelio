@@ -107,6 +107,35 @@ class MovieMention:
 
 
 @dataclass
+class TVSeriesMention:
+    """Contain a TV Series Mention interpreted from Interpretation Material.
+
+    Attributes:
+        title: Canonical TV Series Title.
+        year: TV First Air Year.
+    """
+
+    title: str
+    year: int
+
+
+@dataclass
+class ScreenWorkMentions:
+    """Contain ordered Screen Work Mentions grouped by kind.
+
+    List position preserves first-reference order within each Screen Work kind.
+    There is no cross-kind ordering.
+
+    Attributes:
+        movies: Canonical Movie Mentions in first-reference order.
+        tv_series: Canonical TV Series Mentions in first-reference order.
+    """
+
+    movies: list[MovieMention]
+    tv_series: list[TVSeriesMention]
+
+
+@dataclass
 class EnrichedMovie:
     """Contain provider-verified metadata for a movie entity.
 
@@ -138,18 +167,51 @@ class EnrichedMovie:
 
 
 @dataclass
-class MentionResult:
-    """Represent one interpreted mention and its resolution outcome.
+class MovieResult:
+    """Represent one Movie Mention and its resolution outcome.
 
     Attributes:
         status: Current resolution state of the Movie Mention.
         movie_mention: Canonical title and Movie Release Year.
-        movie: Enriched Entity, or ``None`` before resolution or after no match.
+        movie: Enriched Movie, or ``None`` when unresolved.
     """
 
     status: ResultStatus
     movie_mention: MovieMention
     movie: EnrichedMovie | None
+
+
+@dataclass
+class TVSeriesResult:
+    """Represent one TV Series Mention and its resolution outcome.
+
+    TV Series enrichment is intentionally unavailable in this issue.
+
+    Attributes:
+        status: Current resolution state of the TV Series Mention.
+        tv_series_mention: Canonical title and TV First Air Year.
+        tv_series: Always ``None`` until TV Series enrichment is introduced.
+    """
+
+    status: ResultStatus
+    tv_series_mention: TVSeriesMention
+    tv_series: None
+
+
+@dataclass
+class ScreenWorkResults:
+    """Contain ordered Screen Work Results grouped by kind.
+
+    List position preserves first-reference order within each Screen Work kind.
+    There is no cross-kind ordering.
+
+    Attributes:
+        movies: Movie Results in first-reference order.
+        tv_series: TV Series Results in first-reference order.
+    """
+
+    movies: list[MovieResult]
+    tv_series: list[TVSeriesResult]
 
 
 @dataclass
@@ -159,9 +221,9 @@ class PipelineResult:
     Attributes:
         source: Canonical identity of the submitted source.
         transcript: Full transcript used for mention interpretation.
-        results: One result for each interpreted movie mention.
+        results: Screen Work Results grouped by kind.
     """
 
     source: Source
     transcript: Transcript
-    results: list[MentionResult]
+    results: ScreenWorkResults
