@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from datetime import date
 from typing import cast
 
 import httpx
@@ -70,7 +71,7 @@ class _MovieAlternativeTitles(_TMDBModel):
 class _MovieDetails(_TMDBModel):
     id: int
     title: str
-    release_date: str = ""
+    release_date: date
     overview: str = ""
     poster_path: str | None = None
     imdb_id: str | None = None
@@ -225,7 +226,7 @@ class TMDBScreenWorkResolver:
             return MovieResult(
                 status=ResultStatus.RESOLVED,
                 movie_mention=movie_mention,
-                movie=self._enrich_movie(movie_mention, movie),
+                movie=self._enrich_movie(movie),
             )
 
         return MovieResult(
@@ -326,11 +327,7 @@ class TMDBScreenWorkResolver:
             )
             raise EnrichmentError(_ENRICHMENT_ERROR_MESSAGE) from exc
 
-    def _enrich_movie(
-        self,
-        movie_mention: MovieMention,
-        movie: _MovieDetails,
-    ) -> EnrichedMovie:
+    def _enrich_movie(self, movie: _MovieDetails) -> EnrichedMovie:
         cast_members = [member.name for member in movie.credits.cast[:5]]
         directors = list(
             dict.fromkeys(member.name for member in movie.credits.crew if member.job == "Director")
@@ -340,8 +337,8 @@ class TMDBScreenWorkResolver:
         )
         imdb_id = movie.imdb_id.strip() if movie.imdb_id else None
         return EnrichedMovie(
-            title=movie_mention.title,
-            year=movie_mention.year,
+            title=movie.title,
+            year=movie.release_date.year,
             cast=cast_members,
             directors=directors,
             description=movie.overview,

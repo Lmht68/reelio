@@ -44,7 +44,7 @@ def _mentions(
 
 
 async def test_resolver_selects_first_title_and_year_match_and_enriches() -> None:
-    """Select the first Movie title-and-year match from the first search page."""
+    """Return TMDB Movie identity while retaining the original Movie Mention."""
     requested_paths: list[str] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
@@ -91,7 +91,7 @@ async def test_resolver_selects_first_title_and_year_match_and_enriches() -> Non
             json={
                 "id": 2,
                 "title": "Le Fabuleux Destin d'Amélie Poulain",
-                "release_date": "2001-04-25",
+                "release_date": "2000-04-25",
                 "overview": "A Parisian woman quietly improves the lives around her.",
                 "poster_path": "/amelie.jpg",
                 "imdb_id": "tt0211915",
@@ -130,9 +130,11 @@ async def test_resolver_selects_first_title_and_year_match_and_enriches() -> Non
     result = results.movies[0]
     assert result.status is ResultStatus.RESOLVED
     assert result.movie_mention is movie_mention
+    assert result.movie_mention.title == "Amélie"
+    assert result.movie_mention.year == 2001
     assert result.movie is not None
-    assert result.movie.title == "Amélie"
-    assert result.movie.year == 2001
+    assert result.movie.title == "Le Fabuleux Destin d'Amélie Poulain"
+    assert result.movie.year == 2000
     assert result.movie.cast == [
         "Audrey Tautou",
         "Mathieu Kassovitz",
