@@ -19,6 +19,8 @@ from reelio.extraction.service import ExtractionPipeline
 from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
+    ExtractionMentions,
+    ExtractionResults,
     MovieMention,
     MovieResult,
     Platform,
@@ -34,9 +36,7 @@ from reelio.extraction.types import (
 from tests.extraction.fakes import (
     FakeInterpretationService as _FakeInterpretationService,
 )
-from tests.extraction.fakes import (
-    FakeScreenWorkResolver as _FakeScreenWorkResolver,
-)
+from tests.extraction.fakes import FakeResultAggregator as _FakeResultAggregator
 
 _VIDEO_ID = "dQw4w9WgXcQ"
 _CANONICAL_URL = f"https://www.youtube.com/watch?v={_VIDEO_ID}"
@@ -48,14 +48,18 @@ class _FakeSourceMetadataService:
         source: Source | None = None,
         error: Exception | None = None,
         prepared_audio: PreparedAudio | None = None,
+        call_order: list[str] | None = None,
     ) -> None:
         self.source = source
         self.prepared_audio = prepared_audio
         self.error = error
+        self.call_order = call_order
         self.calls: list[str] = []
 
     async def inspect(self, submitted_url: str) -> InspectedSource:
         self.calls.append(submitted_url)
+        if self.call_order is not None:
+            self.call_order.append("source_inspection")
         if self.error is not None:
             raise self.error
         assert self.source is not None
@@ -63,9 +67,15 @@ class _FakeSourceMetadataService:
 
 
 class _FakeTranscriptionService:
-    def __init__(self, transcript: Transcript, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        transcript: Transcript,
+        error: Exception | None = None,
+        call_order: list[str] | None = None,
+    ) -> None:
         self.transcript = transcript
         self.error = error
+        self.call_order = call_order
         self.calls: list[tuple[Source, str]] = []
 
     async def acquire(
@@ -75,6 +85,8 @@ class _FakeTranscriptionService:
         prepared_audio: object | None = None,
     ) -> Transcript:
         self.calls.append((source, submitted_url))
+        if self.call_order is not None:
+            self.call_order.append("transcript_acquisition")
         if self.error is not None:
             raise self.error
         return self.transcript
@@ -84,13 +96,13 @@ def _pipeline(
     metadata_service: _FakeSourceMetadataService,
     transcription_service: _FakeTranscriptionService,
     interpretation_service: _FakeInterpretationService | None = None,
-    screen_work_resolver: _FakeScreenWorkResolver | None = None,
+    result_aggregator: _FakeResultAggregator | None = None,
 ) -> ExtractionPipeline:
     return ExtractionPipeline(
         metadata_service,
         transcription_service,
         interpretation_service or _FakeInterpretationService(),
-        screen_work_resolver or _FakeScreenWorkResolver(),
+        result_aggregator or _FakeResultAggregator(),
     )
 
 
@@ -114,20 +126,40 @@ def _transcript() -> Transcript:
     )
 
 
-async def test_pipeline_returns_empty_grouped_results_and_calls_resolver_once() -> None:
-    """Pass empty grouped Mentions to the resolver once and return both result lists."""
+async def test_pipeline_inspects_source_before_acquiring_transcript() -> None:
+    """Inspect one Source before acquiring one Transcript for its submitted URL."""
+    call_order: list[str] = []
+    source = _source()
+    transcript = _transcript()
+    metadata_service = _FakeSourceMetadataService(source, call_order=call_order)
+    transcription_service = _FakeTranscriptionService(
+        transcript,
+        call_order=call_order,
+    )
+    pipeline = _pipeline(metadata_service, transcription_service)
+
+    await pipeline.run(_CANONICAL_URL)
+
+    assert metadata_service.calls == [_CANONICAL_URL]
+    assert transcription_service.calls == [(source, _CANONICAL_URL)]
+    assert call_order == ["source_inspection", "transcript_acquisition"]
+
+
+async def test_pipeline_returns_empty_grouped_results_and_aggregates_once() -> None:
+    """Pass empty generalized mentions to aggregation once and retain empty results."""
     source = _source()
     transcript = _transcript()
     metadata_service = _FakeSourceMetadataService(source)
     transcription_service = _FakeTranscriptionService(transcript)
     screen_work_mentions = ScreenWorkMentions(movies=[], tv_series=[])
-    interpretation_service = _FakeInterpretationService(screen_work_mentions)
-    screen_work_resolver = _FakeScreenWorkResolver()
+    extraction_mentions = ExtractionMentions(screen_works=screen_work_mentions)
+    interpretation_service = _FakeInterpretationService(extraction_mentions)
+    result_aggregator = _FakeResultAggregator()
     pipeline = _pipeline(
         metadata_service,
         transcription_service,
         interpretation_service,
-        screen_work_resolver,
+        result_aggregator,
     )
 
     result = await pipeline.run(_CANONICAL_URL)
@@ -137,9 +169,10 @@ async def test_pipeline_returns_empty_grouped_results_and_calls_resolver_once() 
     assert metadata_service.calls == [_CANONICAL_URL]
     assert transcription_service.calls == [(source, _CANONICAL_URL)]
     assert interpretation_service.calls == [(source, transcript)]
-    assert screen_work_resolver.calls == [screen_work_mentions]
-    assert result.results.movies == []
-    assert result.results.tv_series == []
+    assert result_aggregator.calls == [extraction_mentions]
+    assert result_aggregator.calls[0] is extraction_mentions
+    assert result.results.screen_works.movies == []
+    assert result.results.screen_works.tv_series == []
 
 
 async def test_pipeline_returns_ordered_movie_results_unchanged() -> None:
@@ -154,57 +187,62 @@ async def test_pipeline_returns_ordered_movie_results_unchanged() -> None:
     ]
     screen_work_mentions = ScreenWorkMentions(movies=movie_mentions, tv_series=[])
     screen_work_results = ScreenWorkResults(movies=movie_results, tv_series=[])
-    interpretation_service = _FakeInterpretationService(screen_work_mentions)
-    screen_work_resolver = _FakeScreenWorkResolver(results=screen_work_results)
+    extraction_mentions = ExtractionMentions(screen_works=screen_work_mentions)
+    extraction_results = ExtractionResults(screen_works=screen_work_results)
+    interpretation_service = _FakeInterpretationService(extraction_mentions)
+    result_aggregator = _FakeResultAggregator(results=extraction_results)
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
         interpretation_service,
-        screen_work_resolver,
+        result_aggregator,
     )
 
     result = await pipeline.run(_CANONICAL_URL)
 
-    assert screen_work_resolver.calls == [screen_work_mentions]
-    assert result.results is screen_work_results
-    assert result.results.movies == movie_results
-    assert result.results.movies[0] is movie_results[0]
-    assert result.results.movies[1] is movie_results[1]
-    assert result.results.tv_series == []
+    assert result_aggregator.calls == [extraction_mentions]
+    assert result.results is extraction_results
+    assert result.results.screen_works.movies == movie_results
+    assert result.results.screen_works.movies[0] is movie_results[0]
+    assert result.results.screen_works.movies[1] is movie_results[1]
+    assert result.results.screen_works.tv_series == []
 
 
-async def test_pipeline_returns_tv_only_results_from_grouped_resolver() -> None:
-    """Pass TV-only Mentions to the grouped resolver without pipeline placeholders."""
+async def test_pipeline_returns_tv_only_results_from_aggregator() -> None:
+    """Pass TV-only Mentions to aggregation without pipeline placeholders."""
     tv_series_mentions = [
         TVSeriesMention(title="The Last of Us", year=2023),
         TVSeriesMention(title="Arcane", year=2021),
     ]
     screen_work_mentions = ScreenWorkMentions(movies=[], tv_series=tv_series_mentions)
-    interpretation_service = _FakeInterpretationService(screen_work_mentions)
-    screen_work_resolver = _FakeScreenWorkResolver()
+    extraction_mentions = ExtractionMentions(screen_works=screen_work_mentions)
+    interpretation_service = _FakeInterpretationService(extraction_mentions)
+    result_aggregator = _FakeResultAggregator()
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
         interpretation_service,
-        screen_work_resolver,
+        result_aggregator,
     )
 
     result = await pipeline.run(_CANONICAL_URL)
 
-    assert screen_work_resolver.calls == [screen_work_mentions]
-    assert result.results.movies == []
-    assert [item.status for item in result.results.tv_series] == [
+    assert result_aggregator.calls == [extraction_mentions]
+    assert result.results.screen_works.movies == []
+    assert [item.status for item in result.results.screen_works.tv_series] == [
         ResultStatus.UNRESOLVED,
         ResultStatus.UNRESOLVED,
     ]
-    assert [item.tv_series_mention for item in result.results.tv_series] == tv_series_mentions
-    assert result.results.tv_series[0].tv_series_mention is tv_series_mentions[0]
-    assert result.results.tv_series[1].tv_series_mention is tv_series_mentions[1]
-    assert all(item.tv_series is None for item in result.results.tv_series)
+    assert [
+        item.tv_series_mention for item in result.results.screen_works.tv_series
+    ] == tv_series_mentions
+    assert result.results.screen_works.tv_series[0].tv_series_mention is tv_series_mentions[0]
+    assert result.results.screen_works.tv_series[1].tv_series_mention is tv_series_mentions[1]
+    assert all(item.tv_series is None for item in result.results.screen_works.tv_series)
 
 
 async def test_pipeline_groups_mixed_interpretation_results() -> None:
-    """Keep Movie and TV Series ordering independent in grouped resolver results."""
+    """Keep Movie and TV Series ordering independent in grouped aggregator results."""
     movie_mention = MovieMention(title="Dune: Part One", year=2021)
     tv_series_mention = TVSeriesMention(title="The Last of Us", year=2023)
     movie_result = MovieResult(ResultStatus.UNRESOLVED, movie_mention, None)
@@ -217,21 +255,23 @@ async def test_pipeline_groups_mixed_interpretation_results() -> None:
         movies=[movie_result],
         tv_series=[tv_series_result],
     )
-    interpretation_service = _FakeInterpretationService(screen_work_mentions)
-    screen_work_resolver = _FakeScreenWorkResolver(results=screen_work_results)
+    extraction_mentions = ExtractionMentions(screen_works=screen_work_mentions)
+    extraction_results = ExtractionResults(screen_works=screen_work_results)
+    interpretation_service = _FakeInterpretationService(extraction_mentions)
+    result_aggregator = _FakeResultAggregator(results=extraction_results)
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
         interpretation_service,
-        screen_work_resolver,
+        result_aggregator,
     )
 
     result = await pipeline.run(_CANONICAL_URL)
 
-    assert screen_work_resolver.calls == [screen_work_mentions]
-    assert result.results is screen_work_results
-    assert result.results.movies == [movie_result]
-    assert result.results.tv_series == [tv_series_result]
+    assert result_aggregator.calls == [extraction_mentions]
+    assert result.results is extraction_results
+    assert result.results.screen_works.movies == [movie_result]
+    assert result.results.screen_works.tv_series == [tv_series_result]
 
 
 async def test_pipeline_preserves_whisper_transcript_method() -> None:
@@ -325,43 +365,65 @@ async def test_pipeline_propagates_transcription_errors_unchanged(
     assert transcription_service.calls == [(_source(), _CANONICAL_URL)]
 
 
-async def test_pipeline_propagates_resolution_errors_unchanged() -> None:
+async def test_pipeline_propagates_aggregation_errors_unchanged() -> None:
     """Propagate TMDB resolution failures without changing their domain policy."""
-    resolution_error = EnrichmentError("TMDB candidate resolution failed.")
+    aggregation_error = EnrichmentError("TMDB candidate resolution failed.")
     screen_work_mentions = ScreenWorkMentions(
         movies=[MovieMention(title="Dune: Part One", year=2021)],
         tv_series=[TVSeriesMention(title="The Last of Us", year=2023)],
     )
-    screen_work_resolver = _FakeScreenWorkResolver(error=resolution_error)
+    extraction_mentions = ExtractionMentions(screen_works=screen_work_mentions)
+    result_aggregator = _FakeResultAggregator(error=aggregation_error)
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
-        _FakeInterpretationService(screen_work_mentions),
-        screen_work_resolver,
+        _FakeInterpretationService(extraction_mentions),
+        result_aggregator,
     )
 
     with pytest.raises(EnrichmentError) as error:
         await pipeline.run(_CANONICAL_URL)
 
-    assert error.value is resolution_error
-    assert screen_work_resolver.calls == [screen_work_mentions]
+    assert error.value is aggregation_error
+    assert result_aggregator.calls == [extraction_mentions]
 
 
-async def test_pipeline_closes_interpretation_and_resolution_modules() -> None:
-    """Delegate lifespan cleanup to interpretation and resolution modules."""
+async def test_pipeline_closes_interpretation_and_aggregation_modules() -> None:
+    """Delegate lifespan cleanup to interpretation and aggregation modules."""
     interpretation_service = _FakeInterpretationService()
-    screen_work_resolver = _FakeScreenWorkResolver()
+    result_aggregator = _FakeResultAggregator()
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
         _FakeTranscriptionService(_transcript()),
         interpretation_service,
-        screen_work_resolver,
+        result_aggregator,
     )
 
     await pipeline.aclose()
 
     assert interpretation_service.closed is True
-    assert screen_work_resolver.closed is True
+    assert result_aggregator.closed is True
+
+
+class _FailingCloseInterpretationService(_FakeInterpretationService):
+    async def aclose(self) -> None:
+        raise RuntimeError("interpretation close failed")
+
+
+async def test_pipeline_closes_aggregation_when_interpretation_close_fails() -> None:
+    """Close aggregation when the first shutdown operation raises."""
+    result_aggregator = _FakeResultAggregator()
+    pipeline = _pipeline(
+        _FakeSourceMetadataService(_source()),
+        _FakeTranscriptionService(_transcript()),
+        _FailingCloseInterpretationService(),
+        result_aggregator,
+    )
+
+    with pytest.raises(RuntimeError, match="interpretation close failed"):
+        await pipeline.aclose()
+
+    assert result_aggregator.closed is True
 
 
 @pytest.mark.parametrize(

@@ -16,16 +16,17 @@ from reelio.extraction.exceptions import (
 from reelio.extraction.router import router as extraction_router
 from reelio.extraction.service import ExtractionPipeline, ExtractionPipelineProtocol
 from reelio.extraction.services.enrichment.config import tmdb_settings as _tmdb_settings
+from reelio.extraction.services.enrichment.service import ExtractionResultAggregator
 from reelio.extraction.services.enrichment.tmdb import create_tmdb_screen_work_resolver
 from reelio.extraction.services.interpretation.config import (
     InterpretationConfig,
     LLMProviderSelectionConfig,
 )
 from reelio.extraction.services.interpretation.factory import (
-    create_screen_work_mention_provider,
+    create_mention_interpretation_provider,
 )
 from reelio.extraction.services.interpretation.service import (
-    ScreenWorkMentionInterpretationService,
+    MentionInterpretationService,
 )
 from reelio.extraction.services.transcription.acquisition import (
     YouTubeCaptionProvider,
@@ -65,7 +66,7 @@ async def _create_production_pipeline() -> ExtractionPipelineProtocol:
     interpretation_settings = InterpretationConfig()
     llm_provider_selection = LLMProviderSelectionConfig()  # type: ignore[call-arg]
     async with AsyncExitStack() as cleanup:
-        llm_provider = create_screen_work_mention_provider(llm_provider_selection)
+        llm_provider = create_mention_interpretation_provider(llm_provider_selection)
         cleanup.push_async_callback(llm_provider.aclose)
         transcriber = await asyncio.to_thread(
             load_whisper_transcriber,
@@ -85,16 +86,18 @@ async def _create_production_pipeline() -> ExtractionPipelineProtocol:
             temp_media_dir=_transcription_settings.temp_media_dir,
             semaphore=asyncio.Semaphore(_transcription_settings.whisper_max_concurrent),
         )
-        interpretation_service = ScreenWorkMentionInterpretationService(
+        interpretation_service = MentionInterpretationService(
             provider=llm_provider,
             settings=interpretation_settings,
         )
         screen_work_resolver = create_tmdb_screen_work_resolver(_tmdb_settings)
+        cleanup.push_async_callback(screen_work_resolver.aclose)
+        result_aggregator = ExtractionResultAggregator(screen_work_resolver)
         pipeline = ExtractionPipeline(
             source_metadata_service=source_metadata_service,
             transcription_service=transcription_service,
             interpretation_service=interpretation_service,
-            screen_work_resolver=screen_work_resolver,
+            result_aggregator=result_aggregator,
         )
         cleanup.pop_all()
         return pipeline

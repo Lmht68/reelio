@@ -1,4 +1,4 @@
-"""Interpret bounded Source material into ordered Screen Work Mentions."""
+"""Interpret bounded Source material into grouped Extraction Mentions."""
 
 import logging
 from collections.abc import Sequence
@@ -24,6 +24,7 @@ from reelio.extraction.services.interpretation.prompt import (
 from reelio.extraction.services.interpretation.schemas import ScreenWorkInterpretationResponse
 from reelio.extraction.services.interpretation.types import LLMMessage
 from reelio.extraction.types import (
+    ExtractionMentions,
     MovieMention,
     ScreenWorkMentions,
     Source,
@@ -36,11 +37,11 @@ logger = logging.getLogger(__name__)
 
 _INPUT_LIMIT_MESSAGE = "Interpretation Material exceeds the configured limit."
 _INVALID_RESPONSE_MESSAGE = "The LLM returned an invalid Movie Mention response."
-_STAGE = "screen_work_mention_interpretation"
+_STAGE = "mention_interpretation"
 
 
-class ScreenWorkMentionProvider(Protocol):
-    """Define the provider boundary used by Screen Work Mention interpretation."""
+class MentionInterpretationProvider(Protocol):
+    """Define the provider boundary used by mention interpretation."""
 
     @property
     def provider_name(self) -> LLMProvider:
@@ -72,12 +73,12 @@ class ScreenWorkMentionProvider(Protocol):
         ...
 
 
-class ScreenWorkMentionInterpretationService:
-    """Validate Interpretation Material and produce canonical Screen Work Mentions."""
+class MentionInterpretationService:
+    """Validate Interpretation Material and produce canonical grouped mentions."""
 
     def __init__(
         self,
-        provider: ScreenWorkMentionProvider,
+        provider: MentionInterpretationProvider,
         settings: InterpretationConfig,
     ) -> None:
         """Initialize interpretation with an LLM provider and validated limits.
@@ -94,16 +95,16 @@ class ScreenWorkMentionInterpretationService:
         self,
         source: Source,
         transcript: Transcript,
-    ) -> ScreenWorkMentions:
-        """Interpret ordered, deduplicated Screen Work Mentions from a Transcript.
+    ) -> ExtractionMentions:
+        """Interpret ordered, deduplicated mentions from a Transcript.
 
         Args:
             source: Canonical Source whose metadata supports interpretation.
             transcript: Complete normalized Transcript to interpret.
 
         Returns:
-            ScreenWorkMentions: Canonical mentions in first-reference order within
-                each Screen Work kind.
+            ExtractionMentions: Canonical mentions grouped by service scope.
+
         Raises:
             InterpretationInputTooLargeError: If any Interpretation Material field
                 exceeds its configured limit.
@@ -129,7 +130,7 @@ class ScreenWorkMentionInterpretationService:
             response_content = await self._provider.complete(messages)
         except (MovieMentionInterpretationError, PipelineTimeoutError) as exc:
             logger.error(
-                "screen work mention interpretation provider request failed",
+                "mention interpretation provider request failed",
                 extra={
                     "stage": _STAGE,
                     "reason": exc.code,
@@ -144,7 +145,7 @@ class ScreenWorkMentionInterpretationService:
             response = ScreenWorkInterpretationResponse.model_validate_json(response_content)
         except ValidationError as exc:
             logger.error(
-                "screen work mention interpretation response validation failed",
+                "mention interpretation response validation failed",
                 extra={
                     "stage": _STAGE,
                     "reason": "invalid_provider_response",
@@ -155,17 +156,17 @@ class ScreenWorkMentionInterpretationService:
             )
             raise InvalidLLMResponseError(_INVALID_RESPONSE_MESSAGE) from exc
 
-        mentions = _deduplicate(response)
+        screen_work_mentions = _deduplicate(response)
         logger.debug(
-            "screen work mention interpretation completed",
+            "mention interpretation completed",
             extra={
                 "stage": _STAGE,
                 "duration_ms": _duration_ms(started_at),
-                "movie_mention_count": len(mentions.movies),
-                "tv_series_mention_count": len(mentions.tv_series),
+                "movie_mention_count": len(screen_work_mentions.movies),
+                "tv_series_mention_count": len(screen_work_mentions.tv_series),
             },
         )
-        return mentions
+        return ExtractionMentions(screen_works=screen_work_mentions)
 
     async def aclose(self) -> None:
         """Close the lifespan-owned interpretation provider."""
@@ -194,7 +195,7 @@ class ScreenWorkMentionInterpretationService:
             if actual_size <= maximum_size:
                 continue
             logger.error(
-                "screen work mention interpretation input rejected",
+                "mention interpretation input rejected",
                 extra={"stage": _STAGE, "reason": reason},
             )
             raise InterpretationInputTooLargeError(_INPUT_LIMIT_MESSAGE)

@@ -1,4 +1,4 @@
-"""OpenAI Responses adapter for Screen Work Mention interpretation."""
+"""OpenAI Responses adapter for mention interpretation."""
 
 from collections.abc import Sequence
 from typing import cast
@@ -22,7 +22,7 @@ _OFFICIAL_BASE_URL = "https://api.openai.com/v1"
 
 
 class OpenAIProvider:
-    """Generate JSON Screen Work Mention interpretations through OpenAI."""
+    """Generate JSON mention interpretations through OpenAI."""
 
     def __init__(self, client: AsyncOpenAI, settings: OpenAIConfig) -> None:
         """Initialize the adapter with a lifespan-owned client and settings.

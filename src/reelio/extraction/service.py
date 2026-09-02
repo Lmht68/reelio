@@ -5,9 +5,9 @@ from typing import Protocol
 from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
+    ExtractionMentions,
+    ExtractionResults,
     PipelineResult,
-    ScreenWorkMentions,
-    ScreenWorkResults,
     Source,
     Transcript,
 )
@@ -17,13 +17,13 @@ class ExtractionPipelineProtocol(Protocol):
     """Define the end-to-end extraction pipeline boundary."""
 
     async def run(self, url: str) -> PipelineResult:
-        """Extract structured Screen Work Mentions from a submitted source URL.
+        """Extract structured mentions and results from a submitted source URL.
 
         Args:
             url: Source URL submitted by the API caller.
 
         Returns:
-            PipelineResult: Canonical source, transcript, and mention results.
+            PipelineResult: Canonical source, transcript, and grouped results.
 
         Raises:
             ExtractionError: If a pipeline stage fails with a domain error.
@@ -56,15 +56,15 @@ class _TranscriptAcquirer(Protocol):
         ...
 
 
-class _ScreenWorkMentionInterpreter(Protocol):
-    """Interpret ordered Screen Work Mentions from one Source and Transcript."""
+class _MentionInterpreter(Protocol):
+    """Interpret grouped mentions from one Source and Transcript."""
 
     async def interpret(
         self,
         source: Source,
         transcript: Transcript,
-    ) -> ScreenWorkMentions:
-        """Return canonical mentions in first-reference order within each kind."""
+    ) -> ExtractionMentions:
+        """Return canonical mentions grouped by service scope."""
         ...
 
     async def aclose(self) -> None:
@@ -72,18 +72,15 @@ class _ScreenWorkMentionInterpreter(Protocol):
         ...
 
 
-class _ScreenWorkResolver(Protocol):
-    """Resolve and enrich grouped Screen Work Mentions against provider candidates."""
+class _ResultAggregator(Protocol):
+    """Resolve and enrich grouped mentions across service scopes."""
 
-    async def resolve(
-        self,
-        screen_work_mentions: ScreenWorkMentions,
-    ) -> ScreenWorkResults:
-        """Return one Resolved or Unresolved Result per Screen Work Mention."""
+    async def aggregate(self, mentions: ExtractionMentions) -> ExtractionResults:
+        """Return one Resolved or Unresolved Result per interpreted mention."""
         ...
 
     async def aclose(self) -> None:
-        """Release resolution provider resources."""
+        """Release aggregation resources."""
         ...
 
 
@@ -94,21 +91,21 @@ class ExtractionPipeline:
         self,
         source_metadata_service: _SourceMetadataInspector,
         transcription_service: _TranscriptAcquirer,
-        interpretation_service: _ScreenWorkMentionInterpreter,
-        screen_work_resolver: _ScreenWorkResolver,
+        interpretation_service: _MentionInterpreter,
+        result_aggregator: _ResultAggregator,
     ) -> None:
         """Initialize the pipeline with explicit stage services.
 
         Args:
             source_metadata_service: Service that validates and inspects Sources.
             transcription_service: Service that acquires Transcripts.
-            interpretation_service: Service that interprets Screen Work Mentions.
-            screen_work_resolver: Module that resolves and enriches Screen Work Mentions.
+            interpretation_service: Service that interprets grouped mentions.
+            result_aggregator: Module that resolves and enriches grouped mentions.
         """
         self._source_metadata_service = source_metadata_service
         self._transcription_service = transcription_service
         self._interpretation_service = interpretation_service
-        self._screen_work_resolver = screen_work_resolver
+        self._result_aggregator = result_aggregator
 
     async def run(self, url: str) -> PipelineResult:
         """Produce Resolved or Unresolved Results for one submitted Source.
@@ -136,16 +133,16 @@ class ExtractionPipeline:
             inspected.source,
             transcript,
         )
-        screen_work_results = await self._screen_work_resolver.resolve(interpreted)
+        results = await self._result_aggregator.aggregate(interpreted)
         return PipelineResult(
             source=inspected.source,
             transcript=transcript,
-            results=screen_work_results,
+            results=results,
         )
 
     async def aclose(self) -> None:
-        """Release lifespan-owned interpretation and resolution resources."""
+        """Release lifespan-owned interpretation and aggregation resources."""
         try:
             await self._interpretation_service.aclose()
         finally:
-            await self._screen_work_resolver.aclose()
+            await self._result_aggregator.aclose()

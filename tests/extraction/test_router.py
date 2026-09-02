@@ -40,6 +40,8 @@ from reelio.extraction.services.transcription.service import (
 from reelio.extraction.types import (
     EnrichedMovie,
     EnrichedTVSeries,
+    ExtractionMentions,
+    ExtractionResults,
     MovieMention,
     MovieResult,
     PipelineResult,
@@ -53,9 +55,7 @@ from reelio.main import app
 from tests.extraction.fakes import (
     FakeInterpretationService as _FakeInterpretationService,
 )
-from tests.extraction.fakes import (
-    FakeScreenWorkResolver as _FakeScreenWorkResolver,
-)
+from tests.extraction.fakes import FakeResultAggregator as _FakeResultAggregator
 
 
 @pytest.fixture(autouse=True)
@@ -224,7 +224,7 @@ def _pipeline(
     results: ScreenWorkResults | None = None,
 ) -> ExtractionPipeline:
     movie_mention = MovieMention(title="Dune: Part One", year=2021)
-    interpreted = (
+    interpreted_screen_works = (
         mentions
         if mentions is not None
         else ScreenWorkMentions(movies=[movie_mention], tv_series=[])
@@ -239,7 +239,7 @@ def _pipeline(
                     movie_mention=interpreted_movie_mention,
                     movie=_enriched_movie(interpreted_movie_mention),
                 )
-                for interpreted_movie_mention in interpreted.movies
+                for interpreted_movie_mention in interpreted_screen_works.movies
             ],
             tv_series=[
                 TVSeriesResult(
@@ -247,15 +247,15 @@ def _pipeline(
                     tv_series_mention=interpreted_tv_series_mention,
                     tv_series=None,
                 )
-                for interpreted_tv_series_mention in interpreted.tv_series
+                for interpreted_tv_series_mention in interpreted_screen_works.tv_series
             ],
         )
     )
     return ExtractionPipeline(
         metadata_service,
         transcription_service,
-        _FakeInterpretationService(interpreted),
-        _FakeScreenWorkResolver(screen_work_results),
+        _FakeInterpretationService(ExtractionMentions(screen_works=interpreted_screen_works)),
+        _FakeResultAggregator(ExtractionResults(screen_works=screen_work_results)),
     )
 
 

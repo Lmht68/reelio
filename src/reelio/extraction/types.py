@@ -1,4 +1,4 @@
-"""Domain types and Screen Work identity primitives for Canonical Movie or TV Series titles."""
+"""Domain types for extraction and Screen Work identity primitives."""
 
 import unicodedata
 from dataclasses import dataclass
@@ -136,6 +136,17 @@ class ScreenWorkMentions:
 
 
 @dataclass
+class ExtractionMentions:
+    """Contain interpreted mentions grouped by service scope.
+
+    Attributes:
+        screen_works: Ordered Screen Work Mentions grouped by kind.
+    """
+
+    screen_works: ScreenWorkMentions
+
+
+@dataclass
 class EnrichedMovie:
     """Contain provider-verified metadata for a movie entity.
 
@@ -246,15 +257,26 @@ class ScreenWorkResults:
 
 
 @dataclass
+class ExtractionResults:
+    """Contain resolved results grouped by service scope.
+
+    Attributes:
+        screen_works: Ordered Screen Work Results grouped by kind.
+    """
+
+    screen_works: ScreenWorkResults
+
+
+@dataclass
 class PipelineResult:
     """Contain the structured output of an end-to-end extraction pipeline.
 
     Attributes:
         source: Canonical identity of the submitted source.
         transcript: Full transcript used for mention interpretation.
-        results: Screen Work Results grouped by kind.
+        results: Resolved results grouped by service scope.
     """
 
     source: Source
     transcript: Transcript
-    results: ScreenWorkResults
+    results: ExtractionResults

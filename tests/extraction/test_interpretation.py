@@ -30,13 +30,13 @@ from reelio.extraction.services.interpretation.deepseek import (
 from reelio.extraction.services.interpretation.prompt import build_system_prompt
 from reelio.extraction.services.interpretation.schemas import ScreenWorkInterpretationResponse
 from reelio.extraction.services.interpretation.service import (
-    ScreenWorkMentionInterpretationService,
+    MentionInterpretationService,
 )
 from reelio.extraction.services.interpretation.types import LLMMessage
 from reelio.extraction.types import (
+    ExtractionMentions,
     MovieMention,
     Platform,
-    ScreenWorkMentions,
     Source,
     Transcript,
     TranscriptMethod,
@@ -154,9 +154,9 @@ def _response(
 async def _interpret(
     transcript_text: str,
     response: str,
-) -> tuple[ScreenWorkMentions, _FakeProvider]:
+) -> tuple[ExtractionMentions, _FakeProvider]:
     provider = _FakeProvider([response])
-    service = ScreenWorkMentionInterpretationService(provider, _settings())
+    service = MentionInterpretationService(provider, _settings())
     mentions = await service.interpret(_source(), _transcript(transcript_text))
     return mentions, provider
 
@@ -182,8 +182,8 @@ async def test_directly_named_movie_returns_canonical_title_and_year() -> None:
         _response(("The Godfather", 1972)),
     )
 
-    assert mentions.movies == [MovieMention(title="The Godfather", year=1972)]
-    assert mentions.tv_series == []
+    assert mentions.screen_works.movies == [MovieMention(title="The Godfather", year=1972)]
+    assert mentions.screen_works.tv_series == []
     _assert_prompt(provider, transcript_text, "explicitly or implicitly")
 
 
@@ -196,8 +196,8 @@ async def test_shortened_title_is_normalized_to_complete_canonical_title() -> No
         _response((canonical_title, 1964)),
     )
 
-    assert mentions.movies == [MovieMention(title=canonical_title, year=1964)]
-    assert mentions.tv_series == []
+    assert mentions.screen_works.movies == [MovieMention(title=canonical_title, year=1964)]
+    assert mentions.screen_works.tv_series == []
     _assert_prompt(provider, transcript_text, "shortened")
 
 
@@ -209,8 +209,8 @@ async def test_dune_in_villeneuve_context_resolves_to_part_one() -> None:
         _response(("Dune: Part One", 2021)),
     )
 
-    assert mentions.movies == [MovieMention(title="Dune: Part One", year=2021)]
-    assert mentions.tv_series == []
+    assert mentions.screen_works.movies == [MovieMention(title="Dune: Part One", year=2021)]
+    assert mentions.screen_works.tv_series == []
     _assert_prompt(provider, transcript_text, "Villeneuve context")
 
 
@@ -222,11 +222,11 @@ async def test_new_dune_movies_expand_to_both_villeneuve_movies() -> None:
         _response(("Dune: Part One", 2021), ("Dune: Part Two", 2024)),
     )
 
-    assert mentions.movies == [
+    assert mentions.screen_works.movies == [
         MovieMention(title="Dune: Part One", year=2021),
         MovieMention(title="Dune: Part Two", year=2024),
     ]
-    assert mentions.tv_series == []
+    assert mentions.screen_works.tv_series == []
     _assert_prompt(provider, transcript_text, "The new Dune movies are incredible")
 
 
@@ -238,11 +238,11 @@ async def test_che_complete_work_expands_to_both_parts() -> None:
         _response(("Che: Part One", 2008), ("Che: Part Two", 2008)),
     )
 
-    assert mentions.movies == [
+    assert mentions.screen_works.movies == [
         MovieMention(title="Che: Part One", year=2008),
         MovieMention(title="Che: Part Two", year=2008),
     ]
-    assert mentions.tv_series == []
+    assert mentions.screen_works.tv_series == []
     _assert_prompt(provider, transcript_text, "Che is a two-part work")
 
 
@@ -254,8 +254,8 @@ async def test_specific_part_of_multipart_work_returns_only_that_part() -> None:
         _response(("Che: Part Two", 2008)),
     )
 
-    assert mentions.movies == [MovieMention(title="Che: Part Two", year=2008)]
-    assert mentions.tv_series == []
+    assert mentions.screen_works.movies == [MovieMention(title="Che: Part Two", year=2008)]
+    assert mentions.screen_works.tv_series == []
     _assert_prompt(provider, transcript_text, "one part only")
 
 
@@ -267,8 +267,8 @@ async def test_uniquely_identifiable_implicit_reference_is_returned() -> None:
         _response(("2001: A Space Odyssey", 1968)),
     )
 
-    assert mentions.movies == [MovieMention(title="2001: A Space Odyssey", year=1968)]
-    assert mentions.tv_series == []
+    assert mentions.screen_works.movies == [MovieMention(title="2001: A Space Odyssey", year=1968)]
+    assert mentions.screen_works.tv_series == []
     _assert_prompt(provider, transcript_text, "implicit references")
 
 
@@ -277,8 +277,8 @@ async def test_ambiguous_reference_without_context_is_omitted() -> None:
     transcript_text = "That old Dune was strange."
     mentions, provider = await _interpret(transcript_text, _response())
 
-    assert mentions.movies == []
-    assert mentions.tv_series == []
+    assert mentions.screen_works.movies == []
+    assert mentions.screen_works.tv_series == []
     _assert_prompt(provider, transcript_text, "genuinely ambiguous")
 
 
@@ -287,8 +287,8 @@ async def test_non_screen_work_entities_are_excluded() -> None:
     transcript_text = "I read Dune, admire Villeneuve, and love the Dune universe."
     mentions, provider = await _interpret(transcript_text, _response())
 
-    assert mentions.movies == []
-    assert mentions.tv_series == []
+    assert mentions.screen_works.movies == []
+    assert mentions.screen_works.tv_series == []
     _assert_prompt(provider, transcript_text, "open-ended franchise or universe")
 
 
@@ -305,11 +305,11 @@ async def test_deduplication_preserves_normalized_first_occurrence_order() -> No
         ),
     )
 
-    assert mentions.movies == [
+    assert mentions.screen_works.movies == [
         MovieMention(title="Amélie", year=2001),
         MovieMention(title="Dune: Part One", year=2021),
     ]
-    assert mentions.tv_series == []
+    assert mentions.screen_works.tv_series == []
 
 
 async def test_grouped_trilogy_preserves_canonical_release_order() -> None:
@@ -324,12 +324,12 @@ async def test_grouped_trilogy_preserves_canonical_release_order() -> None:
         ),
     )
 
-    assert [mention.title for mention in mentions.movies] == [
+    assert [mention.title for mention in mentions.screen_works.movies] == [
         "Three Colors: Blue",
         "Three Colors: White",
         "Three Colors: Red",
     ]
-    assert mentions.tv_series == []
+    assert mentions.screen_works.tv_series == []
     _assert_prompt(provider, transcript_text, "canonical release or part order")
 
 
@@ -337,8 +337,8 @@ async def test_valid_empty_screen_work_lists_do_not_retry() -> None:
     """Accept empty required arrays after exactly one provider request."""
     mentions, provider = await _interpret("No screen works are mentioned.", _response())
 
-    assert mentions.movies == []
-    assert mentions.tv_series == []
+    assert mentions.screen_works.movies == []
+    assert mentions.screen_works.tv_series == []
     assert len(provider.calls) == 1
 
 
@@ -360,12 +360,12 @@ async def test_mixed_mentions_preserve_independent_order_and_deduplication() -> 
         ),
     )
 
-    assert mentions.movies == [
+    assert mentions.screen_works.movies == [
         MovieMention(title="Fargo", year=1996),
         MovieMention(title="Amélie", year=2001),
         MovieMention(title="Shared Title", year=2021),
     ]
-    assert mentions.tv_series == [
+    assert mentions.screen_works.tv_series == [
         TVSeriesMention(title="Neon Genesis Evangelion", year=1995),
         TVSeriesMention(title="Fargo", year=2014),
         TVSeriesMention(title="Shared Title", year=2021),
@@ -383,8 +383,8 @@ async def test_tv_series_first_air_year_and_canonical_title_are_preserved() -> N
         ),
     )
 
-    assert mentions.movies == [MovieMention(title="Fargo", year=1996)]
-    assert mentions.tv_series == [TVSeriesMention(title="Fargo", year=2014)]
+    assert mentions.screen_works.movies == [MovieMention(title="Fargo", year=1996)]
+    assert mentions.screen_works.tv_series == [TVSeriesMention(title="Fargo", year=2014)]
 
 
 async def test_maximum_future_screen_work_year_is_accepted() -> None:
@@ -395,8 +395,10 @@ async def test_maximum_future_screen_work_year_is_accepted() -> None:
         _response(tv_series=(("Forthcoming Series", maximum_year),)),
     )
 
-    assert mentions.movies == []
-    assert mentions.tv_series == [TVSeriesMention(title="Forthcoming Series", year=maximum_year)]
+    assert mentions.screen_works.movies == []
+    assert mentions.screen_works.tv_series == [
+        TVSeriesMention(title="Forthcoming Series", year=maximum_year)
+    ]
 
 
 @pytest.mark.parametrize(
@@ -429,7 +431,7 @@ def test_system_prompt_defines_grouped_screen_work_policy(rule_fragment: str) ->
 async def test_malformed_json_immediately_raises_invalid_response() -> None:
     """Reject malformed JSON without making a validation-repair request."""
     provider = _FakeProvider(["not json"])
-    service = ScreenWorkMentionInterpretationService(provider, _settings())
+    service = MentionInterpretationService(provider, _settings())
 
     with pytest.raises(InvalidLLMResponseError):
         await service.interpret(_source(), _transcript("Dune."))
@@ -440,7 +442,7 @@ async def test_malformed_json_immediately_raises_invalid_response() -> None:
 async def test_second_queued_response_is_not_used_for_repair() -> None:
     """Leave a queued correction unused because repair requests are disabled."""
     provider = _FakeProvider(["not json", _response(("Dune: Part One", 2021))])
-    service = ScreenWorkMentionInterpretationService(provider, _settings())
+    service = MentionInterpretationService(provider, _settings())
 
     with pytest.raises(InvalidLLMResponseError):
         await service.interpret(_source(), _transcript("Dune."))
@@ -453,7 +455,7 @@ async def test_provider_failure_preserves_interpretation_exception_policy() -> N
     """Propagate the provider's typed Movie Mention interpretation failure."""
     provider_error = MovieMentionInterpretationError("provider unavailable")
     provider = _FakeProvider(error=provider_error)
-    service = ScreenWorkMentionInterpretationService(provider, _settings())
+    service = MentionInterpretationService(provider, _settings())
 
     with pytest.raises(MovieMentionInterpretationError) as error:
         await service.interpret(_source(), _transcript("Dune."))
@@ -487,7 +489,7 @@ async def test_oversized_interpretation_material_is_rejected_without_provider_ca
 ) -> None:
     """Reject every bounded field rather than sending a truncated prompt."""
     provider = _FakeProvider([_response()])
-    service = ScreenWorkMentionInterpretationService(provider, _settings(**setting_overrides))
+    service = MentionInterpretationService(provider, _settings(**setting_overrides))
 
     with pytest.raises(InterpretationInputTooLargeError):
         await service.interpret(source, transcript)
@@ -504,7 +506,7 @@ async def test_prompt_injection_remains_json_content_without_channel() -> None:
         channel="This channel must never reach the LLM provider",
     )
     provider = _FakeProvider([_response()])
-    service = ScreenWorkMentionInterpretationService(provider, _settings())
+    service = MentionInterpretationService(provider, _settings())
 
     await service.interpret(source, _transcript(injection))
 
@@ -600,7 +602,7 @@ async def test_strict_response_schema_rejects_invalid_fields(
     """Reject each defect while its corrected twin validates unchanged."""
     ScreenWorkInterpretationResponse.model_validate_json(corrected_response)
     provider = _FakeProvider([invalid_response])
-    service = ScreenWorkMentionInterpretationService(provider, _settings())
+    service = MentionInterpretationService(provider, _settings())
 
     with pytest.raises(InvalidLLMResponseError):
         await service.interpret(_source(), _transcript("Dune."))
@@ -612,12 +614,12 @@ async def test_response_accepts_more_than_two_hundred_mentions() -> None:
     """Do not impose an undocumented Screen Work Mention response ceiling."""
     response = _response(*((f"Movie {index}", 2000) for index in range(201)))
     provider = _FakeProvider([response])
-    service = ScreenWorkMentionInterpretationService(provider, _settings())
+    service = MentionInterpretationService(provider, _settings())
 
     mentions = await service.interpret(_source(), _transcript("Many movies."))
 
-    assert len(mentions.movies) == 201
-    assert mentions.tv_series == []
+    assert len(mentions.screen_works.movies) == 201
+    assert mentions.screen_works.tv_series == []
 
 
 async def test_logs_never_include_transcript_or_raw_invalid_response(
@@ -627,7 +629,7 @@ async def test_logs_never_include_transcript_or_raw_invalid_response(
     transcript_secret = "private transcript marker"
     raw_response = "private raw response marker"
     provider = _FakeProvider([raw_response])
-    service = ScreenWorkMentionInterpretationService(provider, _settings())
+    service = MentionInterpretationService(provider, _settings())
 
     with (
         caplog.at_level(

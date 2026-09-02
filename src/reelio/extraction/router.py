@@ -190,8 +190,10 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
             method=result.transcript.method,
         ),
         results=extraction_schemas.ScreenWorkResultsModel(
-            movies=[_to_movie_result_schema(item) for item in result.results.movies],
-            tv_series=[_to_tv_series_result_schema(item) for item in result.results.tv_series],
+            movies=[_to_movie_result_schema(item) for item in result.results.screen_works.movies],
+            tv_series=[
+                _to_tv_series_result_schema(item) for item in result.results.screen_works.tv_series
+            ],
         ),
     )
 

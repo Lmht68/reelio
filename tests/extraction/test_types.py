@@ -5,6 +5,8 @@ from datetime import date
 from reelio.extraction.types import (
     MINIMUM_SCREEN_WORK_MENTION_YEAR,
     EnrichedTVSeries,
+    ExtractionMentions,
+    ExtractionResults,
     MovieMention,
     MovieResult,
     PipelineResult,
@@ -36,14 +38,15 @@ def test_screen_work_mention_year_policy() -> None:
     assert maximum_screen_work_mention_year() == date.today().year + 2
 
 
-def test_grouped_screen_work_domain_types_preserve_kind_and_field_placement() -> None:
-    """Keep Movie and TV Series mentions and results in their grouped fields."""
+def test_extraction_domain_types_preserve_nested_screen_work_identity() -> None:
+    """Retain exact nested Screen Work containers through pipeline output."""
     movie_mention = MovieMention(title="Dune: Part One", year=2021)
     tv_series_mention = TVSeriesMention(title="The Last of Us", year=2023)
-    mentions = ScreenWorkMentions(
+    screen_work_mentions = ScreenWorkMentions(
         movies=[movie_mention],
         tv_series=[tv_series_mention],
     )
+    mentions = ExtractionMentions(screen_works=screen_work_mentions)
     movie_result = MovieResult(
         status=ResultStatus.UNRESOLVED,
         movie_mention=movie_mention,
@@ -68,10 +71,11 @@ def test_grouped_screen_work_domain_types_preserve_kind_and_field_placement() ->
         tv_series_mention=tv_series_mention,
         tv_series=enriched_tv_series,
     )
-    results = ScreenWorkResults(
+    screen_work_results = ScreenWorkResults(
         movies=[movie_result],
         tv_series=[tv_series_result],
     )
+    results = ExtractionResults(screen_works=screen_work_results)
     pipeline_result = PipelineResult(
         source=Source(
             platform=Platform.YOUTUBE,
@@ -90,7 +94,10 @@ def test_grouped_screen_work_domain_types_preserve_kind_and_field_placement() ->
         results=results,
     )
 
-    assert pipeline_result.results.movies == [movie_result]
-    assert pipeline_result.results.tv_series == [tv_series_result]
-    assert mentions.movies == [movie_mention]
-    assert mentions.tv_series == [tv_series_mention]
+    assert pipeline_result.results is results
+    assert pipeline_result.results.screen_works is screen_work_results
+    assert pipeline_result.results.screen_works.movies == [movie_result]
+    assert pipeline_result.results.screen_works.tv_series == [tv_series_result]
+    assert mentions.screen_works is screen_work_mentions
+    assert mentions.screen_works.movies == [movie_mention]
+    assert mentions.screen_works.tv_series == [tv_series_mention]

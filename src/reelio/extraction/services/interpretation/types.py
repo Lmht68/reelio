@@ -1,4 +1,4 @@
-"""Provider-neutral types for Screen Work Mention interpretation."""
+"""Provider-neutral types for mention interpretation."""
 
 from dataclasses import dataclass
 from typing import Literal

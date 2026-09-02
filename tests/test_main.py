@@ -194,6 +194,7 @@ async def test_production_lifespan_closes_one_selected_provider(
     provider = _FakeProvider()
     resolver = _FakeScreenWorkResolver()
     provider_factory_calls = 0
+    resolver_factory_calls = 0
 
     def create_provider(selection: LLMProviderSelectionConfig) -> _FakeProvider:
         nonlocal provider_factory_calls
@@ -201,17 +202,19 @@ async def test_production_lifespan_closes_one_selected_provider(
         assert selection.llm_provider is LLMProvider.OPENAI
         return provider
 
-    monkeypatch.setattr(main_module, "create_screen_work_mention_provider", create_provider)
+    def create_resolver(settings: object) -> _FakeScreenWorkResolver:
+        nonlocal resolver_factory_calls
+        resolver_factory_calls += 1
+        return resolver
+
+    monkeypatch.setattr(main_module, "create_mention_interpretation_provider", create_provider)
     monkeypatch.setattr(main_module, "load_whisper_transcriber", lambda settings: object())
-    monkeypatch.setattr(
-        main_module,
-        "create_tmdb_screen_work_resolver",
-        lambda settings: resolver,
-    )
+    monkeypatch.setattr(main_module, "create_tmdb_screen_work_resolver", create_resolver)
     application = create_app()
 
     async with application.router.lifespan_context(application):
         assert provider_factory_calls == 1
+        assert resolver_factory_calls == 1
 
     assert provider.close_calls == 1
     assert resolver.close_calls == 1
@@ -233,7 +236,7 @@ async def test_production_lifespan_closes_provider_after_partial_startup_failure
 
     monkeypatch.setattr(
         main_module,
-        "create_screen_work_mention_provider",
+        "create_mention_interpretation_provider",
         create_provider,
     )
     monkeypatch.setattr(main_module, "load_whisper_transcriber", fail_whisper_load)
@@ -243,6 +246,48 @@ async def test_production_lifespan_closes_provider_after_partial_startup_failure
     with pytest.raises(RuntimeError, match="Whisper load failed"):
         await context.__aenter__()
     assert provider.close_calls == 1
+    assert not hasattr(application.state, "extraction_pipeline")
+
+
+async def test_production_lifespan_closes_resolver_after_aggregation_setup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Close every acquired resource when aggregation setup aborts startup."""
+    monkeypatch.setenv("REELIO_LLM_PROVIDER", "openai")
+    provider = _FakeProvider()
+    resolver = _FakeScreenWorkResolver()
+    resolver_factory_calls = 0
+
+    def create_provider(selection: LLMProviderSelectionConfig) -> _FakeProvider:
+        assert selection.llm_provider is LLMProvider.OPENAI
+        return provider
+
+    def create_resolver(settings: object) -> _FakeScreenWorkResolver:
+        nonlocal resolver_factory_calls
+        resolver_factory_calls += 1
+        return resolver
+
+    def fail_aggregation_setup(screen_work_resolver: object) -> NoReturn:
+        assert screen_work_resolver is resolver
+        raise RuntimeError("aggregation setup failed")
+
+    monkeypatch.setattr(main_module, "create_mention_interpretation_provider", create_provider)
+    monkeypatch.setattr(main_module, "load_whisper_transcriber", lambda settings: object())
+    monkeypatch.setattr(main_module, "create_tmdb_screen_work_resolver", create_resolver)
+    monkeypatch.setattr(
+        main_module,
+        "ExtractionResultAggregator",
+        fail_aggregation_setup,
+    )
+    application = create_app()
+    context = application.router.lifespan_context(application)
+
+    with pytest.raises(RuntimeError, match="aggregation setup failed"):
+        await context.__aenter__()
+
+    assert resolver_factory_calls == 1
+    assert provider.close_calls == 1
+    assert resolver.close_calls == 1
     assert not hasattr(application.state, "extraction_pipeline")
 
 
