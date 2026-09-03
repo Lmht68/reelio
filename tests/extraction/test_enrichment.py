@@ -154,6 +154,115 @@ async def test_resolver_selects_first_title_and_year_match_and_enriches() -> Non
     assert client.is_closed is True
 
 
+@pytest.mark.parametrize(
+    ("provider_year", "expected_search_years"),
+    [
+        (2000 - 1, ["2000", "2001", "1999"]),
+        (2000 + 1, ["2000", "2001"]),
+    ],
+)
+async def test_resolver_searches_adjacent_years_after_exact_year_has_no_match(
+    provider_year: int,
+    expected_search_years: list[str],
+) -> None:
+    """Resolve a Movie whose provider release year differs by one."""
+    requested_search_years: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            search_year = request.url.params["year"]
+            requested_search_years.append(search_year)
+            if int(search_year) != provider_year:
+                return httpx.Response(200, json={"results": []})
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 1,
+                            "title": "Target",
+                            "release_date": f"{provider_year}-01-01",
+                        }
+                    ]
+                },
+            )
+
+        assert request.url.path == "/3/movie/1"
+        assert request.url.params["append_to_response"] == "credits"
+        return httpx.Response(
+            200,
+            json={
+                "id": 1,
+                "title": "Target",
+                "release_date": f"{provider_year}-01-01",
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    movie_mention = MovieMention(title="Target", year=2000)
+
+    results = await resolver.resolve(_mentions(movies=[movie_mention]))
+
+    assert requested_search_years == expected_search_years
+    result = results.movies[0]
+    assert result.status is ResultStatus.RESOLVED
+    assert result.movie_mention is movie_mention
+    assert result.movie is not None
+    assert result.movie.year == provider_year
+    await resolver.aclose()
+
+
+async def test_resolver_rejects_movie_details_release_year_more_than_one_year_away() -> None:
+    """Leave a Movie unresolved when its provider release year differs by two."""
+    requested_search_years: list[str] = []
+    requested_detail_paths: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            search_year = request.url.params["year"]
+            requested_search_years.append(search_year)
+            if search_year != "1999":
+                return httpx.Response(200, json={"results": []})
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 1,
+                            "title": "Target",
+                            "release_date": "1999-01-01",
+                        }
+                    ]
+                },
+            )
+
+        requested_detail_paths.append(request.url.path)
+        assert request.url.path == "/3/movie/1"
+        return httpx.Response(
+            200,
+            json={
+                "id": 1,
+                "title": "Target",
+                "release_date": "1998-01-01",
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    movie_mention = MovieMention(title="Target", year=2000)
+
+    results = await resolver.resolve(_mentions(movies=[movie_mention]))
+
+    assert requested_search_years == ["2000", "2001", "1999"]
+    assert requested_detail_paths == ["/3/movie/1"]
+    result = results.movies[0]
+    assert result.status is ResultStatus.UNRESOLVED
+    assert result.movie_mention is movie_mention
+    assert result.movie is None
+    await resolver.aclose()
+
+
 async def test_resolver_matches_provider_alternative_title() -> None:
     """Resolve a Movie Mention through a provider alternative title."""
 
@@ -196,19 +305,20 @@ async def test_resolver_matches_provider_alternative_title() -> None:
     await resolver.aclose()
 
 
-async def test_resolver_searches_first_page_only_before_returning_unresolved() -> None:
-    """Inspect only the first Movie candidate page before returning unresolved."""
-    requested_pages: list[str] = []
+async def test_resolver_searches_only_first_page_per_year_before_returning_unresolved() -> None:
+    """Inspect only page one for each tolerated Movie release year."""
+    requested_searches: list[tuple[str, str]] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/3/search/movie"
+        search_year = request.url.params["year"]
         page = request.url.params["page"]
-        requested_pages.append(page)
+        requested_searches.append((search_year, page))
         assert page == "1"
         return httpx.Response(
             200,
             json={
-                "results": [{"id": 1, "release_date": "1999-01-01"}],
+                "results": [{"id": 1, "release_date": "1998-01-01"}],
                 "total_pages": 2,
             },
         )
@@ -219,7 +329,7 @@ async def test_resolver_searches_first_page_only_before_returning_unresolved() -
 
     results = await resolver.resolve(_mentions(movies=[movie_mention]))
 
-    assert requested_pages == ["1"]
+    assert requested_searches == [("2000", "1"), ("2001", "1"), ("1999", "1")]
     assert results.movies[0].status is ResultStatus.UNRESOLVED
     assert results.movies[0].movie_mention is movie_mention
     assert results.movies[0].movie is None

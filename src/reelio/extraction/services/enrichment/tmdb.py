@@ -180,13 +180,42 @@ class TMDBScreenWorkResolver:
 
     async def _resolve_movie(self, movie_mention: MovieMention) -> MovieResult:
         normalized_mention_title = normalize_screen_work_title(movie_mention.title)
+        for search_year in (
+            movie_mention.year,
+            movie_mention.year + 1,
+            movie_mention.year - 1,
+        ):
+            movie = await self._find_movie_in_year(
+                movie_mention,
+                normalized_mention_title,
+                search_year,
+            )
+            if movie is not None:
+                return MovieResult(
+                    status=ResultStatus.RESOLVED,
+                    movie_mention=movie_mention,
+                    movie=self._enrich_movie(movie),
+                )
+
+        return MovieResult(
+            status=ResultStatus.UNRESOLVED,
+            movie_mention=movie_mention,
+            movie=None,
+        )
+
+    async def _find_movie_in_year(
+        self,
+        movie_mention: MovieMention,
+        normalized_mention_title: str,
+        search_year: int,
+    ) -> _MovieDetails | None:
         search_response = await self._get_model(
             "search/movie",
             {
                 "query": movie_mention.title,
                 "include_adult": True,
                 "language": "en-US",
-                "year": movie_mention.year,
+                "year": search_year,
                 "page": 1,
             },
             _MovieSearchResponse,
@@ -195,8 +224,7 @@ class TMDBScreenWorkResolver:
         # Limit to the first three candidates to reduce TMDB requests
         for candidate in search_response.results[:3]:
             candidate_year = _year_from_date(candidate.release_date)
-
-            if candidate_year is None or candidate_year != movie_mention.year:
+            if candidate_year is None or candidate_year != search_year:
                 continue
 
             primary_titles_matched = any(
@@ -223,17 +251,12 @@ class TMDBScreenWorkResolver:
                 ):
                     continue
 
-            return MovieResult(
-                status=ResultStatus.RESOLVED,
-                movie_mention=movie_mention,
-                movie=self._enrich_movie(movie),
-            )
+            if abs(movie.release_date.year - movie_mention.year) > 1:
+                continue
 
-        return MovieResult(
-            status=ResultStatus.UNRESOLVED,
-            movie_mention=movie_mention,
-            movie=None,
-        )
+            return movie
+
+        return None
 
     async def _resolve_tv_series(
         self,
