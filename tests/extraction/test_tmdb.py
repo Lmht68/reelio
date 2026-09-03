@@ -1,4 +1,4 @@
-"""TMDB candidate resolution and enrichment contract tests."""
+"""TMDB candidate resolution contract tests."""
 
 import asyncio
 from collections.abc import Callable
