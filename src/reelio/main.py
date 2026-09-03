@@ -48,19 +48,6 @@ _DOCS_ENVIRONMENTS = {Environment.LOCAL, Environment.STAGING}
 _PipelineFactory = Callable[[], Awaitable[ExtractionPipelineProtocol]]
 
 
-class _ReelioFastAPI(FastAPI):
-    """Generate the extraction OpenAPI contract with explicit null examples."""
-
-    def openapi(self) -> dict[str, object]:
-        """Generate the cached OpenAPI document with the unresolved TV example."""
-        openapi_schema = super().openapi()
-        response_example = openapi_schema["paths"]["/api/extract"]["post"]["responses"]["200"][
-            "content"
-        ]["application/json"]["example"]
-        response_example["results"]["tv_series"][1]["tv_series"] = None
-        return openapi_schema
-
-
 async def _create_production_pipeline() -> ExtractionPipelineProtocol:
     """Load production dependencies and compose one extraction pipeline."""
     interpretation_settings = InterpretationConfig()
@@ -156,7 +143,7 @@ def create_app(pipeline_factory: _PipelineFactory | None = None) -> FastAPI:
         FastAPI: The composed application instance.
     """
     configure_logging(app_settings.log_level)
-    application = _ReelioFastAPI(
+    application = FastAPI(
         title="Reelio API",
         version="0.1.0",
         default_response_class=JSONResponse,
