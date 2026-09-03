@@ -90,6 +90,13 @@ class EnrichmentError(ExtractionError):
     status_code = 502
 
 
+class CatalogProviderError(ExtractionError):
+    """Indicate that a core catalog provider request failed."""
+
+    code = "catalog_provider_failed"
+    status_code = 502
+
+
 class PipelineTimeoutError(ExtractionError):
     """Indicate that an external pipeline operation timed out."""
 

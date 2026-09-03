@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
 
+from reelio.extraction.market import SpotifyMarket
+
 MINIMUM_SCREEN_WORK_MENTION_YEAR = 1888
 _MAX_FUTURE_SCREEN_WORK_MENTION_YEARS = 2
 
@@ -275,8 +277,10 @@ class PipelineResult:
         source: Canonical identity of the submitted source.
         transcript: Full transcript used for mention interpretation.
         results: Resolved results grouped by service scope.
+        market: Effective Spotify market used for catalog resolution.
     """
 
     source: Source
     transcript: Transcript
     results: ExtractionResults
+    market: SpotifyMarket

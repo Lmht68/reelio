@@ -1,6 +1,7 @@
 """Application composition and documentation lifecycle tests."""
 
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
+from contextlib import asynccontextmanager
 from typing import NoReturn, cast
 
 import ctranslate2
@@ -11,6 +12,8 @@ from pydantic import ValidationError
 import reelio.extraction.services.transcription.acquisition as transcription_service
 import reelio.main as main_module
 from reelio.config import Environment, app_settings
+from reelio.extraction.market import SpotifyMarket
+from reelio.extraction.services.catalog.config import SpotifyConfig
 from reelio.extraction.services.interpretation.config import (
     LLMProvider,
     LLMProviderSelectionConfig,
@@ -24,7 +27,11 @@ class _FakePipeline:
     def __init__(self) -> None:
         self.close_calls = 0
 
-    async def run(self, url: str) -> PipelineResult:
+    async def run(
+        self,
+        url: str,
+        market: SpotifyMarket | None = None,
+    ) -> PipelineResult:
         raise AssertionError(f"unexpected pipeline call for {url}")
 
     async def aclose(self) -> None:
@@ -303,3 +310,44 @@ async def test_production_lifespan_rejects_unsupported_provider_selection(
         await context.__aenter__()
 
     assert not hasattr(application.state, "extraction_pipeline")
+
+
+class _FakeSpotifyCatalog:
+    """Record lifecycle ownership for a composed Spotify catalog boundary."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        """Record one catalog shutdown call."""
+        self.close_calls += 1
+
+
+async def test_injected_lifespan_owns_one_spotify_catalog() -> None:
+    """Close the injected catalog context after the injected pipeline exits."""
+    catalog = _FakeSpotifyCatalog()
+    pipeline = _FakePipeline()
+
+    @asynccontextmanager
+    async def catalog_factory(
+        _settings: SpotifyConfig,
+    ) -> AsyncGenerator[_FakeSpotifyCatalog]:
+        try:
+            yield catalog
+        finally:
+            await catalog.aclose()
+
+    async def pipeline_factory() -> _FakePipeline:
+        return pipeline
+
+    application = create_app(
+        pipeline_factory=pipeline_factory,
+        spotify_catalog_factory=catalog_factory,
+    )
+
+    async with application.router.lifespan_context(application):
+        assert application.state.spotify_catalog is catalog
+
+    assert catalog.close_calls == 1
+    assert pipeline.close_calls == 1
+    assert not hasattr(application.state, "spotify_catalog")

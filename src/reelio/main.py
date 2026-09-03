@@ -13,8 +13,11 @@ from reelio.extraction.exceptions import (
     extraction_error_handler,
     unhandled_error_handler,
 )
+from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.router import router as extraction_router
 from reelio.extraction.service import ExtractionPipeline, ExtractionPipelineProtocol
+from reelio.extraction.services.catalog.config import SpotifyConfig
+from reelio.extraction.services.catalog.spotify import create_spotify_catalog
 from reelio.extraction.services.enrichment.config import tmdb_settings as _tmdb_settings
 from reelio.extraction.services.enrichment.service import ExtractionResultAggregator
 from reelio.extraction.services.enrichment.tmdb import create_tmdb_screen_work_resolver
@@ -46,10 +49,20 @@ from reelio.ops import router as ops_router
 
 _DOCS_ENVIRONMENTS = {Environment.LOCAL, Environment.STAGING}
 _PipelineFactory = Callable[[], Awaitable[ExtractionPipelineProtocol]]
+_SpotifyCatalogFactory = Callable[
+    [SpotifyConfig],
+    AbstractAsyncContextManager[object],
+]
 
 
-async def _create_production_pipeline() -> ExtractionPipelineProtocol:
-    """Load production dependencies and compose one extraction pipeline."""
+async def _create_production_pipeline(
+    default_market: SpotifyMarket,
+) -> ExtractionPipelineProtocol:
+    """Load production dependencies and compose one extraction pipeline.
+
+    Args:
+        default_market: Validated Spotify market used when an API request omits it.
+    """
     interpretation_settings = InterpretationConfig()
     llm_provider_selection = LLMProviderSelectionConfig()  # type: ignore[call-arg]
     async with AsyncExitStack() as cleanup:
@@ -85,6 +98,7 @@ async def _create_production_pipeline() -> ExtractionPipelineProtocol:
             transcription_service=transcription_service,
             interpretation_service=interpretation_service,
             result_aggregator=result_aggregator,
+            default_market=default_market,
         )
         cleanup.pop_all()
         return pipeline
@@ -108,6 +122,23 @@ async def _managed_lifespan(
 
 
 @asynccontextmanager
+async def _managed_spotify_lifespan(
+    application: FastAPI,
+    pipeline_factory: _PipelineFactory,
+    spotify_settings: SpotifyConfig,
+    spotify_catalog_factory: _SpotifyCatalogFactory,
+) -> AsyncGenerator[None]:
+    async with spotify_catalog_factory(spotify_settings) as spotify_catalog:
+        application.state.spotify_catalog = spotify_catalog
+        try:
+            async with _managed_lifespan(application, pipeline_factory):
+                yield
+        finally:
+            if hasattr(application.state, "spotify_catalog"):
+                del application.state.spotify_catalog
+
+
+@asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
     """Manage application startup and shutdown resources.
 
@@ -117,38 +148,75 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
     Yields:
         None: While the application is running.
     """
-    async with _managed_lifespan(application, _create_production_pipeline):
+    spotify_settings = SpotifyConfig()  # type: ignore[call-arg]
+
+    async def create_pipeline() -> ExtractionPipelineProtocol:
+        """Compose the pipeline with the lifespan's validated default market."""
+        return await _create_production_pipeline(spotify_settings.default_market)
+
+    async with _managed_spotify_lifespan(
+        application,
+        create_pipeline,
+        spotify_settings,
+        create_spotify_catalog,
+    ):
         yield
 
 
 def _lifespan_for(
     pipeline_factory: _PipelineFactory,
+    spotify_catalog_factory: _SpotifyCatalogFactory | None = None,
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
     @asynccontextmanager
     async def configured_lifespan(application: FastAPI) -> AsyncGenerator[None]:
-        async with _managed_lifespan(application, pipeline_factory):
+        if spotify_catalog_factory is None:
+            async with _managed_lifespan(application, pipeline_factory):
+                yield
+            return
+
+        spotify_settings = SpotifyConfig()  # type: ignore[call-arg]
+        async with _managed_spotify_lifespan(
+            application,
+            pipeline_factory,
+            spotify_settings,
+            spotify_catalog_factory,
+        ):
             yield
 
     return configured_lifespan
 
 
-def create_app(pipeline_factory: _PipelineFactory | None = None) -> FastAPI:
+def create_app(
+    pipeline_factory: _PipelineFactory | None = None,
+    spotify_catalog_factory: _SpotifyCatalogFactory | None = None,
+) -> FastAPI:
     """Build and configure the Reelio FastAPI application.
 
     Args:
         pipeline_factory: Optional asynchronous factory used to compose the
             lifespan-owned pipeline. The production factory is used when omitted.
+        spotify_catalog_factory: Optional catalog context-manager factory for a
+            pipeline-injection test lifespan.
 
     Returns:
         FastAPI: The composed application instance.
+
+    Raises:
+        ValueError: If a catalog factory is supplied without a pipeline factory.
     """
+    if pipeline_factory is None and spotify_catalog_factory is not None:
+        raise ValueError("spotify_catalog_factory requires pipeline_factory")
     configure_logging(app_settings.log_level)
     application = FastAPI(
         title="Reelio API",
         version="0.1.0",
         default_response_class=JSONResponse,
         openapi_url=("/openapi.json" if app_settings.environment in _DOCS_ENVIRONMENTS else None),
-        lifespan=(lifespan if pipeline_factory is None else _lifespan_for(pipeline_factory)),
+        lifespan=(
+            lifespan
+            if pipeline_factory is None
+            else _lifespan_for(pipeline_factory, spotify_catalog_factory)
+        ),
     )
     application.include_router(ops_router)
     application.include_router(extraction_router)

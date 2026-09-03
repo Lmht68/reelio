@@ -2,11 +2,12 @@
 
 from pydantic import BaseModel, Field
 
+from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.types import Platform, ResultStatus, TranscriptMethod
 
 
 class ExtractRequest(BaseModel):
-    """Request body for extracting Screen Work Mentions from a source URL."""
+    """Request one extraction with an optional Spotify market."""
 
     url: str = Field(
         min_length=1,
@@ -18,6 +19,12 @@ class ExtractRequest(BaseModel):
             "https://www.tiktok.com/@creator/video/1234567890123456789",
             "https://x.com/creator/status/123456789",
         ],
+    )
+
+    market: SpotifyMarket | None = Field(
+        default=None,
+        description="Optional ISO 3166-1 alpha-2 Spotify market.",
+        examples=["US", "JP"],
     )
 
 
@@ -131,8 +138,11 @@ class ScreenWorkResultsModel(BaseModel):
 
 
 class ExtractResponse(BaseModel):
-    """Successful extraction response containing grouped Screen Work Results."""
+    """Successful extraction response containing grouped results and effective market."""
 
+    market: SpotifyMarket = Field(
+        description="Effective ISO 3166-1 alpha-2 Spotify market.",
+    )
     source: SourceModel
     transcript: TranscriptModel
     results: ScreenWorkResultsModel

@@ -2,6 +2,7 @@
 
 from typing import Protocol
 
+from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
@@ -12,15 +13,22 @@ from reelio.extraction.types import (
     Transcript,
 )
 
+_DEFAULT_MARKET = SpotifyMarket("US")
+
 
 class ExtractionPipelineProtocol(Protocol):
     """Define the end-to-end extraction pipeline boundary."""
 
-    async def run(self, url: str) -> PipelineResult:
-        """Extract structured mentions and results from a submitted source URL.
+    async def run(
+        self,
+        url: str,
+        market: SpotifyMarket | None = None,
+    ) -> PipelineResult:
+        """Extract structured mentions and results from a source URL.
 
         Args:
             url: Source URL submitted by the API caller.
+            market: Optional validated Spotify market from the API caller.
 
         Returns:
             PipelineResult: Canonical source, transcript, and grouped results.
@@ -93,6 +101,7 @@ class ExtractionPipeline:
         transcription_service: _TranscriptAcquirer,
         interpretation_service: _MentionInterpreter,
         result_aggregator: _ResultAggregator,
+        default_market: SpotifyMarket = _DEFAULT_MARKET,
     ) -> None:
         """Initialize the pipeline with explicit stage services.
 
@@ -101,20 +110,27 @@ class ExtractionPipeline:
             transcription_service: Service that acquires Transcripts.
             interpretation_service: Service that interprets grouped mentions.
             result_aggregator: Module that resolves and enriches grouped mentions.
+            default_market: Validated fallback Spotify market for omitted requests.
         """
         self._source_metadata_service = source_metadata_service
         self._transcription_service = transcription_service
         self._interpretation_service = interpretation_service
         self._result_aggregator = result_aggregator
+        self._default_market = default_market
 
-    async def run(self, url: str) -> PipelineResult:
+    async def run(
+        self,
+        url: str,
+        market: SpotifyMarket | None = None,
+    ) -> PipelineResult:
         """Produce Resolved or Unresolved Results for one submitted Source.
 
         Args:
             url: Source URL submitted by the API caller.
+            market: Optional validated Spotify market from the API caller.
 
         Returns:
-            PipelineResult: Source, Transcript, and per-mention resolution Results.
+            PipelineResult: Source, Transcript, effective market, and Results.
 
         Raises:
             ExtractionError: If any pipeline stage fails with a domain error.
@@ -134,10 +150,12 @@ class ExtractionPipeline:
             transcript,
         )
         results = await self._result_aggregator.aggregate(interpreted)
+        effective_market = self._default_market if market is None else market
         return PipelineResult(
             source=inspected.source,
             transcript=transcript,
             results=results,
+            market=effective_market,
         )
 
     async def aclose(self) -> None:

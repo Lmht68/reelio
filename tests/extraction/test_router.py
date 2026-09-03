@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from reelio.extraction.exceptions import (
+    CatalogProviderError,
     DurationLimitExceededError,
     EnrichmentError,
     ExtractionError,
@@ -24,6 +25,7 @@ from reelio.extraction.exceptions import (
     TranscriptionError,
     UnsupportedPlatformError,
 )
+from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.router import get_pipeline
 from reelio.extraction.schemas import ExtractResponse
 from reelio.extraction.service import ExtractionPipeline, ExtractionPipelineProtocol
@@ -45,9 +47,13 @@ from reelio.extraction.types import (
     MovieMention,
     MovieResult,
     PipelineResult,
+    Platform,
     ResultStatus,
     ScreenWorkMentions,
     ScreenWorkResults,
+    Source,
+    Transcript,
+    TranscriptMethod,
     TVSeriesMention,
     TVSeriesResult,
 )
@@ -70,7 +76,11 @@ class _RaisingPipeline:
     def __init__(self, exception: Exception) -> None:
         self._exception = exception
 
-    async def run(self, url: str) -> PipelineResult:
+    async def run(
+        self,
+        url: str,
+        market: SpotifyMarket | None = None,
+    ) -> PipelineResult:
         raise self._exception
 
     async def aclose(self) -> None:
@@ -79,6 +89,7 @@ class _RaisingPipeline:
 
 _VIDEO_ID = "dQw4w9WgXcQ"
 _CANONICAL_URL = f"https://www.youtube.com/watch?v={_VIDEO_ID}"
+_DEFAULT_MARKET = SpotifyMarket("US")
 
 
 class _MetadataExtractor:
@@ -706,6 +717,11 @@ async def test_concurrent_whisper_http_requests_queue_and_succeed(
             "invalid_llm_response",
         ),
         (EnrichmentError("enrichment failed"), 502, "enrichment_failed"),
+        (
+            CatalogProviderError("Spotify catalog request failed."),
+            502,
+            "catalog_provider_failed",
+        ),
         (PipelineTimeoutError("pipeline timed out"), 504, "pipeline_timeout"),
     ],
 )
@@ -780,6 +796,11 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
     assert request_schema == {"$ref": "#/components/schemas/ExtractRequest"}
     schemas = document["components"]["schemas"]
+    extract_request = schemas["ExtractRequest"]
+    assert extract_request["required"] == ["url"]
+    request_market = extract_request["properties"]["market"]
+    assert request_market["examples"] == ["US", "JP"]
+    assert request_market["anyOf"][0]["pattern"] == "^[A-Z]{2}$"
     source_properties = schemas["SourceModel"]["properties"]
     assert {
         "platform",
@@ -794,6 +815,7 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert response_schema == {"$ref": "#/components/schemas/ExtractResponse"}
 
     example = responses["200"]["content"]["application/json"]["example"]
+    assert example["market"] == "US"
     assert set(example["results"]) == {"movies", "tv_series"}
     resolved_tv_series_example = example["results"]["tv_series"][0]
     assert resolved_tv_series_example["status"] == "resolved"
@@ -813,10 +835,12 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     }
     unresolved_tv_series_example = example["results"]["tv_series"][1]
     assert unresolved_tv_series_example["status"] == "unresolved"
-    assert unresolved_tv_series_example["tv_series"] is None
+    assert "tv_series" not in unresolved_tv_series_example
 
     assert "ResultModel" not in schemas
     extract_response_properties = schemas["ExtractResponse"]["properties"]
+    assert "market" in schemas["ExtractResponse"]["required"]
+    assert extract_response_properties["market"]["pattern"] == "^[A-Z]{2}$"
     assert extract_response_properties["results"] == {
         "$ref": "#/components/schemas/ScreenWorkResultsModel"
     }
@@ -897,3 +921,69 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert (
         "Any TMDB provider failure fails the complete request." in responses["502"]["description"]
     )
+
+
+class _MarketPipeline:
+    """Return a deterministic Pipeline Result while recording effective-market input."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, SpotifyMarket | None]] = []
+
+    async def run(
+        self,
+        url: str,
+        market: SpotifyMarket | None = None,
+    ) -> PipelineResult:
+        """Record the request market and return an otherwise empty extraction result."""
+        self.calls.append((url, market))
+        return PipelineResult(
+            source=Source(
+                platform=Platform.YOUTUBE,
+                video_id=_VIDEO_ID,
+                url=url,
+                title="Market test",
+                description="",
+                channel="Channel",
+                duration_seconds=1,
+            ),
+            transcript=Transcript(
+                text="",
+                language="en",
+                method=TranscriptMethod.YOUTUBE_CAPTIONS,
+            ),
+            results=ExtractionResults(
+                screen_works=ScreenWorkResults(movies=[], tv_series=[]),
+            ),
+            market=market or _DEFAULT_MARKET,
+        )
+
+    async def aclose(self) -> None:
+        """Satisfy the lifespan-owned pipeline protocol."""
+
+
+async def test_extract_validates_forwards_and_exposes_the_effective_market(
+    client: AsyncClient,
+) -> None:
+    """Use the supplied market or configured US default through the HTTP contract."""
+    pipeline = _MarketPipeline()
+    _install_pipeline(app, pipeline)
+
+    explicit_response = await client.post(
+        "/api/extract",
+        json={"url": _CANONICAL_URL, "market": "JP"},
+    )
+    default_response = await client.post(
+        "/api/extract",
+        json={"url": _CANONICAL_URL},
+    )
+    invalid_response = await client.post(
+        "/api/extract",
+        json={"url": _CANONICAL_URL, "market": "jp"},
+    )
+
+    assert explicit_response.status_code == 200
+    assert explicit_response.json()["market"] == "JP"
+    assert default_response.status_code == 200
+    assert default_response.json()["market"] == "US"
+    assert invalid_response.status_code == 422
+    assert pipeline.calls == [(_CANONICAL_URL, "JP"), (_CANONICAL_URL, None)]

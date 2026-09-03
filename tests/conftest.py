@@ -6,6 +6,8 @@ from collections.abc import AsyncIterator
 os.environ.setdefault("REELIO_LLM_PROVIDER", "deepseek")
 os.environ.setdefault("REELIO_DEEPSEEK_API_KEY", "test-deepseek-key")
 os.environ.setdefault("REELIO_TMDB_API_KEY", "test-tmdb-key")
+os.environ.setdefault("REELIO_SPOTIFY_CLIENT_ID", "test-spotify-client-id")
+os.environ.setdefault("REELIO_SPOTIFY_CLIENT_SECRET", "test-spotify-client-secret")
 
 import pytest
 from httpx import ASGITransport, AsyncClient

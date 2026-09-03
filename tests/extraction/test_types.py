@@ -2,6 +2,7 @@
 
 from datetime import date
 
+from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.types import (
     MINIMUM_SCREEN_WORK_MENTION_YEAR,
     EnrichedTVSeries,
@@ -92,6 +93,7 @@ def test_extraction_domain_types_preserve_nested_screen_work_identity() -> None:
             method=TranscriptMethod.YOUTUBE_CAPTIONS,
         ),
         results=results,
+        market=SpotifyMarket("US"),
     )
 
     assert pipeline_result.results is results

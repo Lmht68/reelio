@@ -17,6 +17,7 @@ from reelio.extraction.types import (
 )
 
 _EXTRACT_RESPONSE_EXAMPLE = {
+    "market": "US",
     "source": {
         "platform": "youtube",
         "video_id": "dQw4w9WgXcQ",
@@ -175,6 +176,7 @@ def _to_tv_series_result_schema(
 
 def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
     return extraction_schemas.ExtractResponse(
+        market=result.market,
         source=extraction_schemas.SourceModel(
             platform=result.source.platform,
             video_id=result.source.video_id,
@@ -202,18 +204,20 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
     "/extract",
     status_code=status.HTTP_200_OK,
     response_model=extraction_schemas.ExtractResponse,
-    summary="Extract mentioned Movies and TV Series from a public video Source",
+    summary="Extract mentioned Screen Works from a public video Source",
     description=(
         "Accept a public YouTube, Instagram, Facebook, TikTok, or X video URL and "
         "return the normalized Source, the Transcript with its acquisition method, "
-        "and grouped Movie and TV Series results. Each list preserves first-reference "
-        "order within its kind, with no cross-kind ordering. Resolved TV Series report "
-        "their TV First Air Year, an optional final air year where null means "
-        "unavailable rather than proof of continuation, Creators from TMDB created_by, "
-        "and up to five aggregate cast names in provider order without role filtering "
-        "or person deduplication. Any TMDB provider failure fails the complete request."
+        "the effective Spotify market, and grouped Movie and TV Series results. Each "
+        "list preserves first-reference order within its kind, with no cross-kind "
+        "ordering. The optional market must use uppercase ISO 3166-1 alpha-2 syntax; "
+        "an omitted market uses configured US. Resolved TV Series report their TV "
+        "First Air Year, an optional final air year where null means unavailable "
+        "rather than proof of continuation, Creators from TMDB created_by, and up to "
+        "five aggregate cast names in provider order without role filtering or person "
+        "deduplication. Any TMDB provider failure fails the complete request."
     ),
-    response_description="Source, transcript, and grouped Screen Work Results.",
+    response_description="Effective market, Source, transcript, and grouped Screen Work Results.",
     responses={
         200: {
             "description": "Grouped Movie and TV Series results.",
@@ -254,17 +258,17 @@ async def extract(
     payload: extraction_schemas.ExtractRequest,
     pipeline: Annotated[ExtractionPipelineProtocol, Depends(get_pipeline)],
 ) -> extraction_schemas.ExtractResponse:
-    """Extract structured Movie and TV Series Mentions from a submitted source URL.
+    """Extract structured Screen Work Mentions from a submitted source URL.
 
     Args:
-        payload: Validated extraction request containing the source URL.
+        payload: Validated extraction request containing source URL and optional market.
         pipeline: ExtractionPipelineProtocol implementation supplied by FastAPI dependency injection.
 
     Returns:
-        ExtractResponse: Canonical source, transcript, and mention results.
+        ExtractResponse: Effective market, canonical source, transcript, and results.
 
     Raises:
         ExtractionError: If the pipeline raises an extraction domain error.
     """
-    result = await pipeline.run(payload.url)
+    result = await pipeline.run(payload.url, payload.market)
     return _to_response(result)

@@ -35,6 +35,7 @@ Provider selection happens once during application startup, remains fixed for th
 - [uv](https://docs.astral.sh/uv/) for dependency and environment management.
 - An LLM API key for the selected provider.
 - A TMDB v4 read access token.
+- Spotify Client Credentials client ID and client secret.
 
 ### Install and configure
 
@@ -45,17 +46,20 @@ cp .env.example .env
 
 Edit `.env` before starting the application.
 
-At minimum, set one LLM provider and its matching credential, plus the TMDB credential:
+At minimum, set one LLM provider and its matching credential, plus the TMDB and
+Spotify credentials:
 
 ```dotenv
 REELIO_LLM_PROVIDER=openai
 REELIO_OPENAI_API_KEY=replace-with-your-openai-key
 REELIO_TMDB_API_KEY=replace-with-your-tmdb-read-access-token
+REELIO_SPOTIFY_CLIENT_ID=replace-with-your-spotify-client-id
+REELIO_SPOTIFY_CLIENT_SECRET=replace-with-your-spotify-client-secret
 ```
 
 Use `REELIO_LLM_PROVIDER=deepseek` and set `REELIO_DEEPSEEK_API_KEY` instead when selecting DeepSeek.
-
 Only the selected LLM provider configuration is validated.
+Spotify catalog configuration is always validated at application startup.
 
 On a machine without CUDA, set `REELIO_WHISPER_DEVICE=cpu` or `REELIO_WHISPER_DEVICE=auto` instead of the example's CUDA default.
 
@@ -96,11 +100,14 @@ Request body:
 
 ```json
 {
-  "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+  "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+  "market": "JP"
 }
 ```
 
 The response contains:
+- `market`: The effective uppercase ISO 3166-1 alpha-2 Spotify market.
+  Omit it to use configured `REELIO_SPOTIFY_DEFAULT_MARKET`, which defaults to `US`.
 
 - `source`: The canonical platform, external video ID, URL, title, description, channel, and duration.
 - `transcript`: The normalized transcript text, detected language, and acquisition method.
@@ -122,6 +129,7 @@ Compact success example:
 
 ```json
 {
+  "market": "US",
   "source": {
     "platform": "youtube",
     "video_id": "dQw4w9WgXcQ",
@@ -227,8 +235,14 @@ All supported settings and their defaults are documented in [`.env.example`](.en
 - Faster-Whisper uses the `large-v3-turbo` model, CUDA, `float16`, and one concurrent transcription by default.
 - Interpretation Material limits default to 500 source-title characters, 2,000 description characters, 64 transcript-language characters, and 100,000 transcript characters.
 - TMDB uses `https://api.themoviedb.org/3`, the `w500` image endpoint, and a 10-second request timeout by default.
+- Spotify catalog requests use the configured default market, API and token endpoints, request timeout, and safe token-expiry skew.
 
 Credentials are loaded from environment variables and are not written to logs.
+
+Spotify catalog access uses Client Credentials in development mode as a prototype constraint.
+Development account ownership, allowlists, and quota restrictions are not production guarantees.
+Before production use, review Spotify Developer Policy, platform terms, attribution requirements, quota eligibility, and the approved use case.
+Spotify metadata, artwork, identifiers, and URLs are excluded from LLM prompts and model-training flows.
 
 ## Development
 
@@ -256,7 +270,8 @@ src/reelio/
     ├── service.py                  End-to-end extraction orchestration
     ├── types.py                    Extraction domain types
     └── services/
-        ├── transcription/          Metadata inspection and transcript acquisition
+        ├── catalog/                Spotify Client Credentials catalog boundary
+        ├── enrichment/             TMDB candidate resolution and enrichment
         ├── interpretation/         OpenAI and DeepSeek Screen Work Mention providers
-        └── enrichment/             TMDB candidate resolution and enrichment
+        └── transcription/          Metadata inspection and transcript acquisition
 ```

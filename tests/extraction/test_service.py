@@ -15,6 +15,7 @@ from reelio.extraction.exceptions import (
     SourceUnavailableError,
     TranscriptionError,
 )
+from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.service import ExtractionPipeline
 from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import InspectedSource
@@ -92,17 +93,22 @@ class _FakeTranscriptionService:
         return self.transcript
 
 
+_DEFAULT_MARKET = SpotifyMarket("US")
+
+
 def _pipeline(
     metadata_service: _FakeSourceMetadataService,
     transcription_service: _FakeTranscriptionService,
     interpretation_service: _FakeInterpretationService | None = None,
     result_aggregator: _FakeResultAggregator | None = None,
+    default_market: SpotifyMarket = _DEFAULT_MARKET,
 ) -> ExtractionPipeline:
     return ExtractionPipeline(
         metadata_service,
         transcription_service,
         interpretation_service or _FakeInterpretationService(),
         result_aggregator or _FakeResultAggregator(),
+        default_market,
     )
 
 
@@ -491,3 +497,20 @@ async def test_pipeline_preserves_transcription_error_when_cleanup_fails(
     assert error.value is transcription_error
     assert request_directory.exists()
     assert any(record.getMessage() == "temporary media cleanup failed" for record in caplog.records)
+
+
+async def test_pipeline_uses_configured_market_until_the_request_overrides_it() -> None:
+    """Expose the configured market unless the API supplies an explicit one."""
+    source = _source()
+    transcript = _transcript()
+    pipeline = _pipeline(
+        _FakeSourceMetadataService(source),
+        _FakeTranscriptionService(transcript),
+        default_market=SpotifyMarket("CA"),
+    )
+
+    default_result = await pipeline.run(_CANONICAL_URL)
+    explicit_result = await pipeline.run(_CANONICAL_URL, SpotifyMarket("JP"))
+
+    assert default_result.market == "CA"
+    assert explicit_result.market == "JP"
