@@ -83,7 +83,11 @@ class _MentionInterpreter(Protocol):
 class _ResultAggregator(Protocol):
     """Resolve and enrich grouped mentions across service scopes."""
 
-    async def aggregate(self, mentions: ExtractionMentions) -> ExtractionResults:
+    async def aggregate(
+        self,
+        mentions: ExtractionMentions,
+        market: SpotifyMarket,
+    ) -> ExtractionResults:
         """Return one Resolved or Unresolved Result per interpreted mention."""
         ...
 
@@ -149,8 +153,8 @@ class ExtractionPipeline:
             inspected.source,
             transcript,
         )
-        results = await self._result_aggregator.aggregate(interpreted)
         effective_market = self._default_market if market is None else market
+        results = await self._result_aggregator.aggregate(interpreted, effective_market)
         return PipelineResult(
             source=inspected.source,
             transcript=transcript,

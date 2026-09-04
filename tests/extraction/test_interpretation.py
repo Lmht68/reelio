@@ -1,9 +1,10 @@
-"""Screen Work Mention interpretation and DeepSeek adapter contract tests."""
+"""Screen Work and Music Mention interpretation adapter contract tests."""
 
 import json
 import logging
 from collections import deque
 from collections.abc import Callable, Sequence
+from datetime import date
 from types import SimpleNamespace
 from typing import cast
 
@@ -28,7 +29,7 @@ from reelio.extraction.services.interpretation.deepseek import (
     create_deepseek_provider,
 )
 from reelio.extraction.services.interpretation.prompt import build_system_prompt
-from reelio.extraction.services.interpretation.schemas import ScreenWorkInterpretationResponse
+from reelio.extraction.services.interpretation.schemas import InterpretationResponse
 from reelio.extraction.services.interpretation.service import (
     MentionInterpretationService,
 )
@@ -36,13 +37,18 @@ from reelio.extraction.services.interpretation.types import LLMMessage
 from reelio.extraction.types import (
     ExtractionMentions,
     MovieMention,
+    MusicReleaseMention,
     Platform,
     Source,
+    TrackMention,
     Transcript,
     TranscriptMethod,
     TVSeriesMention,
     maximum_screen_work_mention_year,
 )
+
+TrackResponse = tuple[str, Sequence[str], str | None, int | None]
+MusicReleaseResponse = tuple[str, Sequence[str], int | None]
 
 
 class _ProviderLogRecord(logging.LogRecord):
@@ -142,11 +148,30 @@ def _transcript(
 def _response(
     *movies: tuple[str, int],
     tv_series: Sequence[tuple[str, int]] = (),
+    tracks: Sequence[TrackResponse] = (),
+    music_releases: Sequence[MusicReleaseResponse] = (),
 ) -> str:
     return json.dumps(
         {
             "movies": [{"title": title, "year": year} for title, year in movies],
             "tv_series": [{"title": title, "year": year} for title, year in tv_series],
+            "tracks": [
+                {
+                    "track_title": track_title,
+                    "artists": list(artists),
+                    "release_title": release_title,
+                    "release_year": release_year,
+                }
+                for track_title, artists, release_title, release_year in tracks
+            ],
+            "music_releases": [
+                {
+                    "release_title": release_title,
+                    "artists": list(artists),
+                    "release_year": release_year,
+                }
+                for release_title, artists, release_year in music_releases
+            ],
         }
     )
 
@@ -342,6 +367,122 @@ async def test_valid_empty_screen_work_lists_do_not_retry() -> None:
     assert len(provider.calls) == 1
 
 
+async def test_track_mention_preserves_explicit_context_and_ordered_artists() -> None:
+    """Return one Track Mention with only explicitly supplied release context."""
+    mentions, provider = await _interpret(
+        "One More Time by Daft Punk was a defining track on Discovery.",
+        _response(
+            tracks=(
+                (
+                    "One More Time",
+                    ("Daft Punk", "Romanthony"),
+                    "Discovery",
+                    2001,
+                ),
+            )
+        ),
+    )
+
+    assert mentions.music.tracks == [
+        TrackMention(
+            track_title="One More Time",
+            artists=["Daft Punk", "Romanthony"],
+            release_title="Discovery",
+            release_year=2001,
+        )
+    ]
+    assert mentions.music.music_releases == []
+    assert len(provider.calls) == 1
+
+
+async def test_music_deduplication_preserves_first_mentions_and_context() -> None:
+    """Deduplicate music identities without replacing the first display values."""
+    mentions, _ = await _interpret(
+        "Amélie and First Album are referenced repeatedly.",
+        _response(
+            tracks=(
+                ("  Ame\u0301lie  ", ("  E\u0301milie  ",), "First Album", 2001),
+                ("Amélie", ("ÉMILIE",), None, None),
+            ),
+            music_releases=(
+                ("  First Album  ", ("Émilie",), None),
+                ("first album", ("ÉMILIE",), 2001),
+            ),
+        ),
+    )
+
+    assert mentions.music.tracks == [
+        TrackMention(
+            track_title="Amélie",
+            artists=["Émilie"],
+            release_title="First Album",
+            release_year=2001,
+        )
+    ]
+    assert mentions.music.music_releases == [
+        MusicReleaseMention(
+            release_title="First Album",
+            artists=["Émilie"],
+            release_year=None,
+        )
+    ]
+
+
+async def test_track_release_context_does_not_create_music_release_mention() -> None:
+    """Keep a Track's contextual release out of independent release results."""
+    transcript = "One More Time from Discovery is still incredible."
+    mentions, provider = await _interpret(
+        transcript,
+        _response(
+            tracks=(("One More Time", ("Daft Punk",), "Discovery", None),),
+        ),
+    )
+
+    assert mentions.music.tracks[0].release_title == "Discovery"
+    assert mentions.music.music_releases == []
+    _assert_prompt(provider, transcript, "directly")
+
+
+async def test_independent_music_release_is_preserved() -> None:
+    """Return an independently and directly named Music Release."""
+    mentions, _ = await _interpret(
+        "Discovery is an essential Daft Punk album.",
+        _response(
+            music_releases=(("Discovery", ("Daft Punk",), 2001),),
+        ),
+    )
+
+    assert mentions.music.tracks == []
+    assert mentions.music.music_releases == [
+        MusicReleaseMention(
+            release_title="Discovery",
+            artists=["Daft Punk"],
+            release_year=2001,
+        )
+    ]
+
+
+async def test_lyric_context_can_identify_a_specific_recording() -> None:
+    """Accept a Track response when lyric context identifies the recording."""
+    transcript = "The lyric says, 'Is this the real life?', from Bohemian Rhapsody."
+    mentions, provider = await _interpret(
+        transcript,
+        _response(
+            tracks=(("Bohemian Rhapsody", ("Queen",), None, None),),
+        ),
+    )
+
+    assert mentions.music.tracks == [
+        TrackMention(
+            track_title="Bohemian Rhapsody",
+            artists=["Queen"],
+            release_title=None,
+            release_year=None,
+        )
+    ]
+    _assert_prompt(provider, transcript, "Lyric text alone")
+
+
 async def test_mixed_mentions_preserve_independent_order_and_deduplication() -> None:
     """Deduplicate each kind independently while retaining cross-kind identities."""
     mentions, provider = await _interpret(
@@ -421,6 +562,16 @@ async def test_maximum_future_screen_work_year_is_accepted() -> None:
         "open-ended franchise or universe",
         "official US English",
         "without a defensible year",
+        "released sound recordings",
+        "source title",
+        "source description",
+        "Lyric text alone",
+        "only when that field is explicit",
+        "independently and directly named",
+        "background audio",
+        "humming",
+        "audio fingerprinting",
+        "unreleased",
     ],
 )
 def test_system_prompt_defines_grouped_screen_work_policy(rule_fragment: str) -> None:
@@ -531,68 +682,177 @@ async def test_prompt_injection_remains_json_content_without_channel() -> None:
     ("invalid_response", "corrected_response"),
     [
         (
-            '{"movies":[]}',
-            '{"movies":[],"tv_series":[]}',
+            '{"movies":[],"tracks":[],"music_releases":[]}',
+            _response(),
         ),
         (
-            '{"tv_series":[]}',
-            '{"movies":[],"tv_series":[]}',
+            '{"tv_series":[],"tracks":[],"music_releases":[]}',
+            _response(),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"music_releases":[]}',
+            _response(),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[]}',
+            _response(),
         ),
         (
             "not json",
-            '{"movies":[],"tv_series":[]}',
+            _response(),
         ),
         (
-            '{"movies":[],"tv_series":[],"reasoning":"none"}',
-            '{"movies":[],"tv_series":[]}',
+            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":[],"version":1}',
+            _response(),
         ),
         (
-            '{"movies":[{"title":"Dune","year":"2021"}],"tv_series":[]}',
-            '{"movies":[{"title":"Dune","year":2021}],"tv_series":[]}',
+            '{"movies":[{"title":"Dune","year":"2021"}],"tv_series":[],"tracks":[],'
+            '"music_releases":[]}',
+            _response(("Dune", 2021)),
         ),
         (
-            '{"movies":[{"title":"Dune","year":1887}],"tv_series":[]}',
-            '{"movies":[{"title":"Dune","year":2021}],"tv_series":[]}',
+            '{"movies":[{"title":"Dune","year":1887}],"tv_series":[],"tracks":[],'
+            '"music_releases":[]}',
+            _response(("Dune", 2021)),
         ),
         (
             '{"movies":[{"title":"Dune","year":'
             f"{maximum_screen_work_mention_year() + 1}"
-            '}],"tv_series":[]}',
-            '{"movies":[{"title":"Dune","year":'
-            f"{maximum_screen_work_mention_year()}"
-            '}],"tv_series":[]}',
+            '}],"tv_series":[],"tracks":[],"music_releases":[]}',
+            _response(("Dune", maximum_screen_work_mention_year())),
         ),
         (
-            '{"movies":[{"title":"Dune","year":2021,"confidence":1}],"tv_series":[]}',
-            '{"movies":[{"title":"Dune","year":2021}],"tv_series":[]}',
+            '{"movies":[{"title":"Dune","year":2021,"confidence":1}],"tv_series":[],'
+            '"tracks":[],"music_releases":[]}',
+            _response(("Dune", 2021)),
         ),
         (
-            '{"movies":[{"title":"   ","year":2021}],"tv_series":[]}',
-            '{"movies":[{"title":"Dune","year":2021}],"tv_series":[]}',
+            '{"movies":[{"title":"   ","year":2021}],"tv_series":[],"tracks":[],'
+            '"music_releases":[]}',
+            _response(("Dune", 2021)),
         ),
         (
-            '{"movies":[{"title":"Dune\\u0000","year":2021}],"tv_series":[]}',
-            '{"movies":[{"title":"Dune","year":2021}],"tv_series":[]}',
+            '{"movies":[{"title":"Dune\\u0000","year":2021}],"tv_series":[],"tracks":[],'
+            '"music_releases":[]}',
+            _response(("Dune", 2021)),
         ),
         (
-            '{"movies":[{"title":"Dune","year":2021}],'
-            '"tv_series":[{"title":"The Last of Us","year":"2023"}]}',
-            '{"movies":[{"title":"Dune","year":2021}],'
-            '"tv_series":[{"title":"The Last of Us","year":2023}]}',
+            '{"movies":[],"tv_series":[{"title":"The Last of Us","year":"2023"}],'
+            '"tracks":[],"music_releases":[]}',
+            _response(tv_series=(("The Last of Us", 2023),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[{"artists":["Queen"],'
+            '"release_title":null,"release_year":null}],"music_releases":[]}',
+            _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
+            '"release_title":null,"release_year":null}],"music_releases":[]}',
+            _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
+            '"artists":[],"release_title":null,"release_year":null}],"music_releases":[]}',
+            _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
+            '"artists":["  "],"release_title":null,"release_year":null}],'
+            '"music_releases":[]}',
+            _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
+            '"artists":["Queen\\u0000"],"release_title":null,"release_year":null}],'
+            '"music_releases":[]}',
+            _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[{"track_title":"  ","artists":["Queen"],'
+            '"release_title":null,"release_year":null}],"music_releases":[]}',
+            _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
+            '"artists":["Queen"],"release_year":null}],"music_releases":[]}',
+            _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
+            '"artists":["Queen"],"release_title":null}],"music_releases":[]}',
+            _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
+            '"artists":["Queen"],"release_title":" ","release_year":null}],'
+            '"music_releases":[]}',
+            _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
+            '"artists":["Queen"],"release_title":null,"release_year":0}],'
+            '"music_releases":[]}',
+            _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
+            '"artists":["Queen"],"release_title":null,"release_year":'
+            f"{date.today().year + 1}"
+            '}],"music_releases":[]}',
+            _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
+            '"artists":["Queen"],"release_title":null,"release_year":null,"version":1}],'
+            '"music_releases":[]}',
+            _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":'
+            '[{"release_title":"A Night at the Opera","artists":["Queen"]}]}',
+            _response(music_releases=(("A Night at the Opera", ("Queen",), None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":'
+            '[{"release_title":"A Night at the Opera","artists":[],"release_year":null}]}',
+            _response(music_releases=(("A Night at the Opera", ("Queen",), None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":'
+            '[{"release_title":" ","artists":["Queen"],"release_year":null}]}',
+            _response(music_releases=(("A Night at the Opera", ("Queen",), None),)),
         ),
     ],
     ids=[
         "missing-tv-series",
         "missing-movies",
+        "missing-tracks",
+        "missing-music-releases",
         "malformed-json",
-        "top-level-extra",
+        "top-level-version",
         "non-integer-movie-year",
-        "low-year",
-        "too-far-future-year",
+        "low-movie-year",
+        "too-far-future-movie-year",
         "movie-item-extra",
-        "blank-title",
-        "control-title",
+        "blank-movie-title",
+        "control-movie-title",
         "invalid-tv-item",
+        "missing-track-title",
+        "missing-track-artists",
+        "empty-track-artists",
+        "blank-track-artist",
+        "control-track-artist",
+        "blank-track-title",
+        "missing-track-release-title",
+        "missing-track-release-year",
+        "blank-track-release-title",
+        "non-positive-track-release-year",
+        "future-track-release-year",
+        "track-version",
+        "missing-music-release-year",
+        "empty-music-release-artists",
+        "blank-music-release-title",
     ],
 )
 async def test_strict_response_schema_rejects_invalid_fields(
@@ -600,7 +860,7 @@ async def test_strict_response_schema_rejects_invalid_fields(
     corrected_response: str,
 ) -> None:
     """Reject each defect while its corrected twin validates unchanged."""
-    ScreenWorkInterpretationResponse.model_validate_json(corrected_response)
+    InterpretationResponse.model_validate_json(corrected_response)
     provider = _FakeProvider([invalid_response])
     service = MentionInterpretationService(provider, _settings())
 

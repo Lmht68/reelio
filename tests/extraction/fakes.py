@@ -1,13 +1,18 @@
 """Shared configurable test doubles for extraction pipeline modules."""
 
+from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.types import (
     ExtractionMentions,
     ExtractionResults,
     MovieResult,
+    MusicMentions,
+    MusicResults,
     ResultStatus,
     ScreenWorkMentions,
     ScreenWorkResults,
     Source,
+    TrackMention,
+    TrackResult,
     Transcript,
     TVSeriesResult,
 )
@@ -30,7 +35,10 @@ class FakeInterpretationService:
         self.mentions = (
             mentions
             if mentions is not None
-            else ExtractionMentions(screen_works=ScreenWorkMentions(movies=[], tv_series=[]))
+            else ExtractionMentions(
+                screen_works=ScreenWorkMentions(movies=[], tv_series=[]),
+                music=MusicMentions(tracks=[], music_releases=[]),
+            )
         )
         self.error = error
         self.calls: list[tuple[Source, Transcript]] = []
@@ -86,6 +94,19 @@ def _unresolved_screen_work_results(
     )
 
 
+def _unresolved_music_results(music_mentions: MusicMentions) -> MusicResults:
+    return MusicResults(
+        tracks=[
+            TrackResult(
+                status=ResultStatus.UNRESOLVED,
+                track_mention=track_mention,
+                track=None,
+            )
+            for track_mention in music_mentions.tracks
+        ]
+    )
+
+
 class FakeScreenWorkResolver:
     """Provide deterministic grouped Screen Work resolution for pipeline tests."""
 
@@ -133,6 +154,45 @@ class FakeScreenWorkResolver:
         self.closed = True
 
 
+class FakeTrackResolver:
+    """Provide deterministic Track resolution for aggregation tests."""
+
+    def __init__(
+        self,
+        results: list[TrackResult] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        """Configure returned Track Results or a raised exception.
+
+        Args:
+            results: Results returned by ``resolve`` when provided.
+            error: Exception raised by ``resolve`` when provided.
+        """
+        self.results = results
+        self.error = error
+        self.calls: list[tuple[list[TrackMention], SpotifyMarket]] = []
+
+    async def resolve(
+        self,
+        track_mentions: list[TrackMention],
+        market: SpotifyMarket,
+    ) -> list[TrackResult]:
+        """Record and resolve ordered Track Mentions for one effective market."""
+        self.calls.append((track_mentions, market))
+        if self.error is not None:
+            raise self.error
+        if self.results is not None:
+            return self.results
+        return [
+            TrackResult(
+                status=ResultStatus.UNRESOLVED,
+                track_mention=track_mention,
+                track=None,
+            )
+            for track_mention in track_mentions
+        ]
+
+
 class FakeResultAggregator:
     """Provide deterministic generalized aggregation for pipeline tests."""
 
@@ -151,13 +211,19 @@ class FakeResultAggregator:
         self.results = results
         self.error = error
         self.calls: list[ExtractionMentions] = []
+        self.markets: list[SpotifyMarket] = []
         self.closed = False
 
-    async def aggregate(self, mentions: ExtractionMentions) -> ExtractionResults:
-        """Record and aggregate supplied mentions.
+    async def aggregate(
+        self,
+        mentions: ExtractionMentions,
+        market: SpotifyMarket,
+    ) -> ExtractionResults:
+        """Record and aggregate supplied mentions for one effective market.
 
         Args:
             mentions: Mentions grouped by service scope.
+            market: Effective Spotify market used for Track resolution.
 
         Returns:
             ExtractionResults: Configured or default grouped unresolved Results.
@@ -166,12 +232,14 @@ class FakeResultAggregator:
             Exception: Configured error when one was provided.
         """
         self.calls.append(mentions)
+        self.markets.append(market)
         if self.error is not None:
             raise self.error
         if self.results is not None:
             return self.results
         return ExtractionResults(
-            screen_works=_unresolved_screen_work_results(mentions.screen_works)
+            screen_works=_unresolved_screen_work_results(mentions.screen_works),
+            music=_unresolved_music_results(mentions.music),
         )
 
     async def aclose(self) -> None:

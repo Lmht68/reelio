@@ -130,11 +130,45 @@ class TVSeriesResultModel(BaseModel):
     tv_series: TVSeriesModel | None
 
 
-class ScreenWorkResultsModel(BaseModel):
-    """Screen Work Results grouped in independent first-reference order."""
+class ArtistCreditModel(BaseModel):
+    """One Spotify artist credit in provider display order."""
+
+    spotify_artist_id: str
+    name: str
+
+
+class TrackMentionModel(BaseModel):
+    """One interpreted Track Mention with explicit optional release context."""
+
+    track_title: str
+    artists: list[str]
+    release_title: str | None
+    release_year: int | None
+
+
+class TrackModel(BaseModel):
+    """Spotify-verified metadata for one playable Track."""
+
+    track_title: str
+    artists: list[ArtistCreditModel]
+    spotify_track_id: str
+    spotify_url: str
+
+
+class TrackResultModel(BaseModel):
+    """One interpreted Track Mention and its resolution outcome."""
+
+    status: ResultStatus
+    track_mention: TrackMentionModel
+    track: TrackModel | None
+
+
+class ExtractionResultsModel(BaseModel):
+    """Resolved results grouped in independent first-reference order."""
 
     movies: list[MovieResultModel]
     tv_series: list[TVSeriesResultModel]
+    tracks: list[TrackResultModel]
 
 
 class ExtractResponse(BaseModel):
@@ -145,7 +179,7 @@ class ExtractResponse(BaseModel):
     )
     source: SourceModel
     transcript: TranscriptModel
-    results: ScreenWorkResultsModel
+    results: ExtractionResultsModel
 
 
 class ErrorDetail(BaseModel):

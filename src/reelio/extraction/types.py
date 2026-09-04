@@ -1,4 +1,4 @@
-"""Domain types for extraction and Screen Work identity primitives."""
+"""Domain types for extraction and identity primitives."""
 
 import unicodedata
 from dataclasses import dataclass
@@ -33,6 +33,31 @@ def normalize_screen_work_title(title: str) -> str:
     return " ".join(unicodedata.normalize("NFC", title).split())
 
 
+def normalize_music_text(text: str) -> str:
+    """Normalize music text for display without changing case.
+
+    Args:
+        text: Music title or artist name to normalize.
+
+    Returns:
+        str: NFC-normalized text with leading, trailing, and repeated whitespace
+        removed.
+    """
+    return " ".join(unicodedata.normalize("NFC", text).split())
+
+
+def normalize_music_identity(text: str) -> str:
+    """Normalize music text for case-insensitive identity comparison.
+
+    Args:
+        text: Music title or artist name to normalize.
+
+    Returns:
+        str: Display-normalized text with Unicode case folding applied.
+    """
+    return normalize_music_text(text).casefold()
+
+
 class Platform(StrEnum):
     """Content platforms supported by the extraction context."""
 
@@ -55,6 +80,19 @@ class ResultStatus(StrEnum):
 
     RESOLVED = "resolved"
     UNRESOLVED = "unresolved"
+
+
+@dataclass(frozen=True, slots=True)
+class ArtistCredit:
+    """Identify one Spotify artist credit in display order.
+
+    Attributes:
+        spotify_artist_id: Spotify Artist identifier.
+        name: Spotify-authoritative credited artist name.
+    """
+
+    spotify_artist_id: str
+    name: str
 
 
 @dataclass
@@ -138,14 +176,61 @@ class ScreenWorkMentions:
 
 
 @dataclass
+class TrackMention:
+    """Contain a released Track Mention interpreted from source material.
+
+    Attributes:
+        track_title: Complete recording title.
+        artists: Ordered credited artist names.
+        release_title: Album or single title when explicitly stated.
+        release_year: Release year when explicitly stated.
+    """
+
+    track_title: str
+    artists: list[str]
+    release_title: str | None
+    release_year: int | None
+
+
+@dataclass
+class MusicReleaseMention:
+    """Contain a Music Release Mention interpreted from source material.
+
+    Attributes:
+        release_title: Album, EP, single, or compilation title.
+        artists: Ordered credited artist names.
+        release_year: Release year when explicitly stated.
+    """
+
+    release_title: str
+    artists: list[str]
+    release_year: int | None
+
+
+@dataclass
+class MusicMentions:
+    """Contain ordered Music Mentions grouped by resolvable kind.
+
+    Attributes:
+        tracks: Released Track Mentions in first-reference order.
+        music_releases: Raw Music Release Mentions in first-reference order.
+    """
+
+    tracks: list[TrackMention]
+    music_releases: list[MusicReleaseMention]
+
+
+@dataclass
 class ExtractionMentions:
     """Contain interpreted mentions grouped by service scope.
 
     Attributes:
         screen_works: Ordered Screen Work Mentions grouped by kind.
+        music: Ordered Music Mentions grouped by kind.
     """
 
     screen_works: ScreenWorkMentions
+    music: MusicMentions
 
 
 @dataclass
@@ -213,6 +298,23 @@ class EnrichedTVSeries:
 
 
 @dataclass
+class EnrichedTrack:
+    """Contain Spotify-verified metadata for a playable Track.
+
+    Attributes:
+        track_title: Spotify-authoritative Track title.
+        artists: Ordered Spotify Track artist credits.
+        spotify_track_id: Playable Spotify Track identifier for the effective market.
+        spotify_url: Direct Spotify URL for the playable Track.
+    """
+
+    track_title: str
+    artists: list[ArtistCredit]
+    spotify_track_id: str
+    spotify_url: str
+
+
+@dataclass
 class MovieResult:
     """Represent one Movie Mention and its resolution outcome.
 
@@ -243,6 +345,21 @@ class TVSeriesResult:
 
 
 @dataclass
+class TrackResult:
+    """Represent one Track Mention and its resolution outcome.
+
+    Attributes:
+        status: Current resolution state of the Track Mention.
+        track_mention: Canonical Track Mention.
+        track: Enriched Track, or ``None`` when unresolved.
+    """
+
+    status: ResultStatus
+    track_mention: TrackMention
+    track: EnrichedTrack | None
+
+
+@dataclass
 class ScreenWorkResults:
     """Contain ordered Screen Work Results grouped by kind.
 
@@ -259,14 +376,27 @@ class ScreenWorkResults:
 
 
 @dataclass
+class MusicResults:
+    """Contain ordered Music Results grouped by public result kind.
+
+    Attributes:
+        tracks: Track Results in first-reference order.
+    """
+
+    tracks: list[TrackResult]
+
+
+@dataclass
 class ExtractionResults:
     """Contain resolved results grouped by service scope.
 
     Attributes:
         screen_works: Ordered Screen Work Results grouped by kind.
+        music: Ordered Music Results grouped by kind.
     """
 
     screen_works: ScreenWorkResults
+    music: MusicResults
 
 
 @dataclass

@@ -3,21 +3,10 @@
 from dataclasses import dataclass
 from typing import Literal
 
+from reelio.extraction.types import ArtistCredit
+
 ReleaseDatePrecision = Literal["year", "month", "day"]
 AlbumType = Literal["album", "single", "compilation"]
-
-
-@dataclass(frozen=True, slots=True)
-class ArtistCredit:
-    """Identify one provider-credited artist in display order.
-
-    Attributes:
-        spotify_artist_id: Spotify Artist identifier.
-        name: Provider-authoritative credited artist name.
-    """
-
-    spotify_artist_id: str
-    name: str
 
 
 @dataclass(frozen=True, slots=True)

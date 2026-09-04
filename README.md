@@ -1,6 +1,6 @@
 # Reelio
 
-Reelio is a FastAPI service that extracts Movie and TV Series Mentions from public social-media videos, verifies them against TMDB, and returns grouped enriched results.
+Reelio is a FastAPI service that extracts Movie, TV Series, and Track Mentions from public social-media videos, verifies Screen Works against TMDB and Tracks against Spotify, and returns grouped enriched results.
 
 ## Overview
 
@@ -11,14 +11,16 @@ The extraction pipeline:
 3. Acquires a normalized transcript from YouTube captions when available and falls back to local Faster-Whisper when needed.
 4. Uses Faster-Whisper directly for non-YouTube sources.
 5. Sends bounded source metadata and transcript material to the selected LLM provider.
-6. Validates the structured LLM response, deduplicates mentions independently per kind, and preserves first-reference order within each kind.
-7. Searches TMDB's Movie and TV endpoints and resolves a Mention only when its canonical title or a provider alternative title matches together with its release or first air year.
-8. Returns grouped `movies` and `tv_series` result lists, resolving each Mention to enriched metadata or `null` independently within its kind.
+6. Validates the structured LLM response, deduplicates Mentions independently per kind, and preserves first-reference order within each kind.
+7. Searches TMDB's Movie and TV endpoints and resolves a Screen Work Mention only when its canonical title or a provider alternative title matches together with its release or first air year.
+8. Searches Spotify's Track endpoint in the effective market and resolves a Track Mention only after a verified candidate match.
+9. Returns grouped `movies`, `tv_series`, and `tracks` result lists, resolving each Mention to enriched metadata or `null` independently within its kind.
 
 Movie results can include the title, release year, cast, directors, description, poster URL, TMDB and IMDb identifiers and links, and the TMDB score.
 TV Series results can include the title, first air year, optional final air year, aggregate cast, Creators, description, poster URL, TMDB and IMDb identifiers and links, and the TMDB score.
+Track results can include Spotify's canonical Track title, ordered artist credits, a playable Spotify Track ID, and a direct Spotify URL.
 
-Screen Work Mention interpretation supports two explicitly selected providers:
+Mention interpretation supports two explicitly selected providers:
 
 - OpenAI uses the Responses API, strict Structured Outputs generated from the application response model, and `store=false`.
 - DeepSeek uses Chat Completions with JSON-object output and disabled thinking.
@@ -89,7 +91,7 @@ Successful response:
 {"status": "ok"}
 ```
 
-### Extract movie and TV series mentions
+### Extract Movie, TV Series, and Track Mentions
 
 ```http
 POST /api/extract
@@ -106,12 +108,12 @@ Request body:
 ```
 
 The response contains:
+
 - `market`: The effective uppercase ISO 3166-1 alpha-2 Spotify market.
   Omit it to use configured `REELIO_SPOTIFY_DEFAULT_MARKET`, which defaults to `US`.
-
 - `source`: The canonical platform, external video ID, URL, title, description, channel, and duration.
 - `transcript`: The normalized transcript text, detected language, and acquisition method.
-- `results`: A grouped object with two always-present lists, `movies` and `tv_series`.
+- `results`: A grouped object with three always-present lists, `movies`, `tv_series`, and `tracks`.
   Each list is deduplicated independently and preserves first-reference order within its kind.
   There is no cross-kind ordering.
 - `results.movies[].movie_mention`: The canonical Movie title and release year interpreted by the LLM.
@@ -123,7 +125,12 @@ The response contains:
   `creators` comes only from TMDB's `created_by` list and retains first-provider order after duplicate names are removed.
   `cast` is the first five TMDB aggregate-cast names in provider order, with no role filtering or person deduplication.
   TMDB and IMDb identifiers and links are included when available, along with the TMDB score.
-- Any TMDB provider HTTP, timeout, or required-response validation failure fails the complete request rather than returning partial category results.
+- `results.tracks[].track_mention`: The interpreted Track title, ordered Track artists, and explicit nullable release title and year context.
+- `results.tracks[].track`: Spotify-backed enrichment for a resolved Mention, or `null` for an unresolved Mention.
+  A resolved Track has Spotify's canonical Track title, ordered artist credits, playable Track ID, and direct URL.
+  Spotify searches use the effective market, examine only the first three provider-ordered candidates, and require an exact or every-field fuzzy identity match.
+  An unresolved Track preserves its original Track Mention.
+- Any TMDB or Spotify provider HTTP, timeout, or required-response validation failure fails the complete request rather than returning partial category results.
 
 Compact success example:
 
@@ -134,13 +141,13 @@ Compact success example:
     "platform": "youtube",
     "video_id": "dQw4w9WgXcQ",
     "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    "title": "Screen Work review",
-    "description": "A review mentioning a Movie and a TV Series.",
+    "title": "Movie, TV Series, and Track review",
+    "description": "A review mentioning a Movie, a TV Series, and a Track.",
     "channel": "Example channel",
     "duration_seconds": 42
   },
   "transcript": {
-    "text": "Dune: Part One and The Last of Us are excellent.",
+    "text": "Dune: Part One, The Last of Us, and One More Time are excellent.",
     "language": "en",
     "method": "youtube_captions"
   },
@@ -188,6 +195,38 @@ Compact success example:
         "tv_series_mention": {"title": "Unknown TV Series", "year": 2024},
         "tv_series": null
       }
+    ],
+    "tracks": [
+      {
+        "status": "resolved",
+        "track_mention": {
+          "track_title": "One More Time",
+          "artists": ["Daft Punk"],
+          "release_title": "Discovery",
+          "release_year": 2001
+        },
+        "track": {
+          "track_title": "One More Time",
+          "artists": [
+            {
+              "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
+              "name": "Daft Punk"
+            }
+          ],
+          "spotify_track_id": "0DiWol3AO6WpXZgp0goxAV",
+          "spotify_url": "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV"
+        }
+      },
+      {
+        "status": "unresolved",
+        "track_mention": {
+          "track_title": "Unknown Track",
+          "artists": ["Unknown Artist"],
+          "release_title": null,
+          "release_year": null
+        },
+        "track": null
+      }
     ]
   }
 }
@@ -220,7 +259,7 @@ The API uses these error classes:
 | `404` | Source is unavailable, private, or not found. |
 | `413` | Source duration or interpretation material exceeds its configured limit. |
 | `500` | Unexpected internal failure. |
-| `502` | Metadata, transcription, LLM, or TMDB provider failure. Any TMDB failure fails the complete request. |
+| `502` | Metadata, transcription, LLM, TMDB, or Spotify provider failure. Any TMDB or Spotify failure fails the complete request. |
 | `504` | External provider timeout. |
 
 ## Configuration
@@ -271,7 +310,7 @@ src/reelio/
     ├── types.py                    Extraction domain types
     └── services/
         ├── catalog/                Spotify Client Credentials catalog boundary
-        ├── enrichment/             TMDB candidate resolution and enrichment
-        ├── interpretation/         OpenAI and DeepSeek Screen Work Mention providers
+        ├── enrichment/             TMDB and Spotify candidate resolution and enrichment
+        ├── interpretation/         OpenAI and DeepSeek structured Mention providers
         └── transcription/          Metadata inspection and transcript acquisition
 ```

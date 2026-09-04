@@ -40,18 +40,24 @@ from reelio.extraction.services.transcription.service import (
     TranscriptionService,
 )
 from reelio.extraction.types import (
+    ArtistCredit,
     EnrichedMovie,
+    EnrichedTrack,
     EnrichedTVSeries,
     ExtractionMentions,
     ExtractionResults,
     MovieMention,
     MovieResult,
+    MusicMentions,
+    MusicResults,
     PipelineResult,
     Platform,
     ResultStatus,
     ScreenWorkMentions,
     ScreenWorkResults,
     Source,
+    TrackMention,
+    TrackResult,
     Transcript,
     TranscriptMethod,
     TVSeriesMention,
@@ -228,11 +234,27 @@ def _enriched_tv_series(tv_series_mention: TVSeriesMention) -> EnrichedTVSeries:
     )
 
 
+def _enriched_track(track_mention: TrackMention) -> EnrichedTrack:
+    return EnrichedTrack(
+        track_title=track_mention.track_title,
+        artists=[
+            ArtistCredit(
+                spotify_artist_id="4tZwfgrHOc3mvqYlEYSvVi",
+                name=track_mention.artists[0],
+            )
+        ],
+        spotify_track_id="0DiWol3AO6WpXZgp0goxAV",
+        spotify_url="https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV",
+    )
+
+
 def _pipeline(
     metadata_service: SourceMetadataService,
     transcription_service: TranscriptionService,
     mentions: ScreenWorkMentions | None = None,
     results: ScreenWorkResults | None = None,
+    music_mentions: MusicMentions | None = None,
+    music_results: MusicResults | None = None,
 ) -> ExtractionPipeline:
     movie_mention = MovieMention(title="Dune: Part One", year=2021)
     interpreted_screen_works = (
@@ -262,11 +284,40 @@ def _pipeline(
             ],
         )
     )
+    interpreted_music = (
+        music_mentions
+        if music_mentions is not None
+        else MusicMentions(tracks=[], music_releases=[])
+    )
+    resolved_music = (
+        music_results
+        if music_results is not None
+        else MusicResults(
+            tracks=[
+                TrackResult(
+                    status=ResultStatus.UNRESOLVED,
+                    track_mention=track_mention,
+                    track=None,
+                )
+                for track_mention in interpreted_music.tracks
+            ]
+        )
+    )
     return ExtractionPipeline(
         metadata_service,
         transcription_service,
-        _FakeInterpretationService(ExtractionMentions(screen_works=interpreted_screen_works)),
-        _FakeResultAggregator(ExtractionResults(screen_works=screen_work_results)),
+        _FakeInterpretationService(
+            ExtractionMentions(
+                screen_works=interpreted_screen_works,
+                music=interpreted_music,
+            )
+        ),
+        _FakeResultAggregator(
+            ExtractionResults(
+                screen_works=screen_work_results,
+                music=resolved_music,
+            )
+        ),
     )
 
 
@@ -274,7 +325,7 @@ def _install_pipeline(application: FastAPI, pipeline: ExtractionPipelineProtocol
     application.dependency_overrides[get_pipeline] = lambda: pipeline
 
 
-async def test_extract_returns_resolved_and_unresolved_screen_work_results(
+async def test_extract_returns_resolved_and_unresolved_screen_work_and_track_results(
     client: AsyncClient,
 ) -> None:
     """Return a complete mixed Screen Work contract with resolved and null entities."""
@@ -313,6 +364,36 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_results(
             ),
         ],
     )
+    resolved_track_mention = TrackMention(
+        track_title="One More Time",
+        artists=["Daft Punk"],
+        release_title="Discovery",
+        release_year=2001,
+    )
+    unresolved_track_mention = TrackMention(
+        track_title="Unknown Track",
+        artists=["Unknown Artist"],
+        release_title=None,
+        release_year=None,
+    )
+    music_mentions = MusicMentions(
+        tracks=[resolved_track_mention, unresolved_track_mention],
+        music_releases=[],
+    )
+    music_results = MusicResults(
+        tracks=[
+            TrackResult(
+                status=ResultStatus.RESOLVED,
+                track_mention=resolved_track_mention,
+                track=_enriched_track(resolved_track_mention),
+            ),
+            TrackResult(
+                status=ResultStatus.UNRESOLVED,
+                track_mention=unresolved_track_mention,
+                track=None,
+            ),
+        ]
+    )
     pipeline = _pipeline(
         SourceMetadataService(
             extractor=metadata_extractor,
@@ -323,6 +404,8 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_results(
         ),
         mentions,
         results,
+        music_mentions=music_mentions,
+        music_results=music_results,
     )
     _install_pipeline(app, pipeline)
 
@@ -346,11 +429,13 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_results(
     assert payload.transcript.text == "Router caption text."
 
     raw_results = response.json()["results"]
-    assert set(raw_results) == {"movies", "tv_series"}
+    assert set(raw_results) == {"movies", "tv_series", "tracks"}
     assert [item["status"] for item in raw_results["movies"]] == ["resolved", "unresolved"]
     assert [item["status"] for item in raw_results["tv_series"]] == ["resolved", "unresolved"]
+    assert [item["status"] for item in raw_results["tracks"]] == ["resolved", "unresolved"]
     assert raw_results["movies"][1]["movie"] is None
     assert raw_results["tv_series"][1]["tv_series"] is None
+    assert raw_results["tracks"][1]["track"] is None
     assert set(raw_results["tv_series"][0]["tv_series"]) == {
         "title",
         "first_air_year",
@@ -406,6 +491,21 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_results(
     assert resolved_tv_series.tv_series.imdb_url == "https://www.imdb.com/title/tt3581920/"
     assert resolved_tv_series.tv_series.tmdb_score == 8.6
     assert payload.results.tv_series[1].tv_series is None
+    resolved_track = payload.results.tracks[0]
+    assert resolved_track.status is ResultStatus.RESOLVED
+    assert resolved_track.track_mention.track_title == resolved_track_mention.track_title
+    assert resolved_track.track_mention.artists == resolved_track_mention.artists
+    assert resolved_track.track_mention.release_title == resolved_track_mention.release_title
+    assert resolved_track.track_mention.release_year == resolved_track_mention.release_year
+    assert resolved_track.track is not None
+    assert resolved_track.track.track_title == "One More Time"
+    assert resolved_track.track.artists[0].spotify_artist_id == "4tZwfgrHOc3mvqYlEYSvVi"
+    assert resolved_track.track.artists[0].name == "Daft Punk"
+    assert resolved_track.track.spotify_track_id == "0DiWol3AO6WpXZgp0goxAV"
+    assert (
+        resolved_track.track.spotify_url == "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV"
+    )
+    assert payload.results.tracks[1].track is None
 
 
 async def test_extract_maps_unavailable_captions_to_502(
@@ -478,7 +578,7 @@ async def test_extract_groups_screen_work_results(
     expected_movies: list[str],
     expected_tv_series: list[str],
 ) -> None:
-    """Serialize always-present independently ordered Movie and TV Series lists."""
+    """Serialize always-present independently ordered result lists, including Tracks."""
     pipeline = _pipeline(
         SourceMetadataService(
             extractor=_MetadataExtractor(),
@@ -493,11 +593,12 @@ async def test_extract_groups_screen_work_results(
 
     assert response.status_code == 200
     results = response.json()["results"]
-    assert set(results) == {"movies", "tv_series"}
+    assert set(results) == {"movies", "tv_series", "tracks"}
     assert [item["movie_mention"]["title"] for item in results["movies"]] == expected_movies
     assert [
         item["tv_series_mention"]["title"] for item in results["tv_series"]
     ] == expected_tv_series
+    assert results["tracks"] == []
     assert all(set(item) == {"status", "movie_mention", "movie"} for item in results["movies"])
     assert all(
         set(item) == {"status", "tv_series_mention", "tv_series"} for item in results["tv_series"]
@@ -781,7 +882,7 @@ async def test_unhandled_failures_do_not_leak_internals() -> None:
 
 
 async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
-    """Document grouped resolution, complete TV metadata, and atomic provider failure."""
+    """Document grouped Track resolution, complete TV metadata, and atomic failures."""
     response = await client.get("/openapi.json")
 
     assert response.status_code == 200
@@ -816,7 +917,7 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
 
     example = responses["200"]["content"]["application/json"]["example"]
     assert example["market"] == "US"
-    assert set(example["results"]) == {"movies", "tv_series"}
+    assert set(example["results"]) == {"movies", "tv_series", "tracks"}
     resolved_tv_series_example = example["results"]["tv_series"][0]
     assert resolved_tv_series_example["status"] == "resolved"
     assert set(resolved_tv_series_example["tv_series"]) == {
@@ -836,25 +937,44 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     unresolved_tv_series_example = example["results"]["tv_series"][1]
     assert unresolved_tv_series_example["status"] == "unresolved"
     assert "tv_series" not in unresolved_tv_series_example
+    resolved_track_example = example["results"]["tracks"][0]
+    assert resolved_track_example["status"] == "resolved"
+    assert resolved_track_example["track_mention"] == {
+        "track_title": "One More Time",
+        "artists": ["Daft Punk"],
+        "release_title": "Discovery",
+        "release_year": 2001,
+    }
+    assert set(resolved_track_example["track"]) == {
+        "track_title",
+        "artists",
+        "spotify_track_id",
+        "spotify_url",
+    }
 
     assert "ResultModel" not in schemas
     extract_response_properties = schemas["ExtractResponse"]["properties"]
     assert "market" in schemas["ExtractResponse"]["required"]
     assert extract_response_properties["market"]["pattern"] == "^[A-Z]{2}$"
     assert extract_response_properties["results"] == {
-        "$ref": "#/components/schemas/ScreenWorkResultsModel"
+        "$ref": "#/components/schemas/ExtractionResultsModel"
     }
-    screen_work_results = schemas["ScreenWorkResultsModel"]
-    assert screen_work_results["required"] == ["movies", "tv_series"]
-    assert screen_work_results["properties"]["movies"] == {
+    extraction_results = schemas["ExtractionResultsModel"]
+    assert extraction_results["required"] == ["movies", "tv_series", "tracks"]
+    assert extraction_results["properties"]["movies"] == {
         "items": {"$ref": "#/components/schemas/MovieResultModel"},
         "type": "array",
         "title": "Movies",
     }
-    assert screen_work_results["properties"]["tv_series"] == {
+    assert extraction_results["properties"]["tv_series"] == {
         "items": {"$ref": "#/components/schemas/TVSeriesResultModel"},
         "type": "array",
         "title": "Tv Series",
+    }
+    assert extraction_results["properties"]["tracks"] == {
+        "items": {"$ref": "#/components/schemas/TrackResultModel"},
+        "type": "array",
+        "title": "Tracks",
     }
 
     movie_result_schema = schemas["MovieResultModel"]
@@ -870,6 +990,17 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert tv_series_result_schema["properties"]["tv_series"] == {
         "anyOf": [
             {"$ref": "#/components/schemas/TVSeriesModel"},
+            {"type": "null"},
+        ],
+    }
+    track_result_schema = schemas["TrackResultModel"]
+    assert {"status", "track_mention", "track"} <= set(track_result_schema["required"])
+    assert track_result_schema["properties"]["track_mention"] == {
+        "$ref": "#/components/schemas/TrackMentionModel"
+    }
+    assert track_result_schema["properties"]["track"] == {
+        "anyOf": [
+            {"$ref": "#/components/schemas/TrackModel"},
             {"type": "null"},
         ],
     }
@@ -908,6 +1039,27 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert tv_series_mention_schema["properties"]["year"]["description"] == "TV First Air Year."
     movie_schema = schemas["MovieModel"]
     assert {"year", "tmdb_score"} <= set(movie_schema["required"])
+    track_mention_schema = schemas["TrackMentionModel"]
+    assert track_mention_schema["required"] == [
+        "track_title",
+        "artists",
+        "release_title",
+        "release_year",
+    ]
+    track_schema = schemas["TrackModel"]
+    assert track_schema["required"] == [
+        "track_title",
+        "artists",
+        "spotify_track_id",
+        "spotify_url",
+    ]
+    assert track_schema["properties"]["artists"] == {
+        "items": {"$ref": "#/components/schemas/ArtistCreditModel"},
+        "type": "array",
+        "title": "Artists",
+    }
+    artist_credit_schema = schemas["ArtistCreditModel"]
+    assert artist_credit_schema["required"] == ["spotify_artist_id", "name"]
     assert set(document["components"]["schemas"]["Platform"]["enum"]) == {
         "youtube",
         "instagram",
@@ -917,9 +1069,14 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     }
     assert "YouTube, Instagram, Facebook, TikTok, or X" in operation["description"]
     assert "first-reference order" in operation["description"]
-    assert "Any TMDB provider failure fails the complete request." in operation["description"]
+    assert "Track Results retain their interpreted Track Mention" in operation["description"]
     assert (
-        "Any TMDB provider failure fails the complete request." in responses["502"]["description"]
+        "Any TMDB or Spotify provider failure fails the complete request."
+        in operation["description"]
+    )
+    assert (
+        "Any TMDB or Spotify provider failure fails the complete request."
+        in responses["502"]["description"]
     )
 
 
@@ -953,6 +1110,7 @@ class _MarketPipeline:
             ),
             results=ExtractionResults(
                 screen_works=ScreenWorkResults(movies=[], tv_series=[]),
+                music=MusicResults(tracks=[]),
             ),
             market=market or _DEFAULT_MARKET,
         )

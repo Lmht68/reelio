@@ -21,15 +21,19 @@ from reelio.extraction.services.interpretation.prompt import (
     build_interpretation_material,
     build_system_prompt,
 )
-from reelio.extraction.services.interpretation.schemas import ScreenWorkInterpretationResponse
+from reelio.extraction.services.interpretation.schemas import InterpretationResponse
 from reelio.extraction.services.interpretation.types import LLMMessage
 from reelio.extraction.types import (
     ExtractionMentions,
     MovieMention,
+    MusicMentions,
+    MusicReleaseMention,
     ScreenWorkMentions,
     Source,
+    TrackMention,
     Transcript,
     TVSeriesMention,
+    normalize_music_identity,
     normalize_screen_work_title,
 )
 
@@ -142,7 +146,7 @@ class MentionInterpretationService:
             raise
 
         try:
-            response = ScreenWorkInterpretationResponse.model_validate_json(response_content)
+            response = InterpretationResponse.model_validate_json(response_content)
         except ValidationError as exc:
             logger.error(
                 "mention interpretation response validation failed",
@@ -156,17 +160,19 @@ class MentionInterpretationService:
             )
             raise InvalidLLMResponseError(_INVALID_RESPONSE_MESSAGE) from exc
 
-        screen_work_mentions = _deduplicate(response)
+        mentions = _deduplicate(response)
         logger.debug(
             "mention interpretation completed",
             extra={
                 "stage": _STAGE,
                 "duration_ms": _duration_ms(started_at),
-                "movie_mention_count": len(screen_work_mentions.movies),
-                "tv_series_mention_count": len(screen_work_mentions.tv_series),
+                "movie_mention_count": len(mentions.screen_works.movies),
+                "tv_series_mention_count": len(mentions.screen_works.tv_series),
+                "track_mention_count": len(mentions.music.tracks),
+                "music_release_mention_count": len(mentions.music.music_releases),
             },
         )
-        return ExtractionMentions(screen_works=screen_work_mentions)
+        return mentions
 
     async def aclose(self) -> None:
         """Close the lifespan-owned interpretation provider."""
@@ -201,30 +207,73 @@ class MentionInterpretationService:
             raise InterpretationInputTooLargeError(_INPUT_LIMIT_MESSAGE)
 
 
-def _deduplicate(response: ScreenWorkInterpretationResponse) -> ScreenWorkMentions:
+def _deduplicate(response: InterpretationResponse) -> ExtractionMentions:
     seen_movie_identities: set[tuple[str, int]] = set()
     movie_mentions: list[MovieMention] = []
     for movie in response.movies:
         title = normalize_screen_work_title(movie.title)
-        identity = (title, movie.year)
-        if identity in seen_movie_identities:
+        movie_identity = (title, movie.year)
+        if movie_identity in seen_movie_identities:
             continue
-        seen_movie_identities.add(identity)
+        seen_movie_identities.add(movie_identity)
         movie_mentions.append(MovieMention(title=title, year=movie.year))
 
     seen_tv_series_identities: set[tuple[str, int]] = set()
     tv_series_mentions: list[TVSeriesMention] = []
     for tv_series in response.tv_series:
         title = normalize_screen_work_title(tv_series.title)
-        identity = (title, tv_series.year)
-        if identity in seen_tv_series_identities:
+        tv_series_identity = (title, tv_series.year)
+        if tv_series_identity in seen_tv_series_identities:
             continue
-        seen_tv_series_identities.add(identity)
+        seen_tv_series_identities.add(tv_series_identity)
         tv_series_mentions.append(TVSeriesMention(title=title, year=tv_series.year))
 
-    return ScreenWorkMentions(
-        movies=movie_mentions,
-        tv_series=tv_series_mentions,
+    seen_track_identities: set[tuple[str, tuple[str, ...]]] = set()
+    track_mentions: list[TrackMention] = []
+    for track in response.tracks:
+        track_identity = (
+            normalize_music_identity(track.track_title),
+            tuple(normalize_music_identity(artist) for artist in track.artists),
+        )
+        if track_identity in seen_track_identities:
+            continue
+        seen_track_identities.add(track_identity)
+        track_mentions.append(
+            TrackMention(
+                track_title=track.track_title,
+                artists=track.artists,
+                release_title=track.release_title,
+                release_year=track.release_year,
+            )
+        )
+
+    seen_music_release_identities: set[tuple[str, tuple[str, ...]]] = set()
+    music_release_mentions: list[MusicReleaseMention] = []
+    for music_release in response.music_releases:
+        music_release_identity = (
+            normalize_music_identity(music_release.release_title),
+            tuple(normalize_music_identity(artist) for artist in music_release.artists),
+        )
+        if music_release_identity in seen_music_release_identities:
+            continue
+        seen_music_release_identities.add(music_release_identity)
+        music_release_mentions.append(
+            MusicReleaseMention(
+                release_title=music_release.release_title,
+                artists=music_release.artists,
+                release_year=music_release.release_year,
+            )
+        )
+
+    return ExtractionMentions(
+        screen_works=ScreenWorkMentions(
+            movies=movie_mentions,
+            tv_series=tv_series_mentions,
+        ),
+        music=MusicMentions(
+            tracks=track_mentions,
+            music_releases=music_release_mentions,
+        ),
     )
 
 

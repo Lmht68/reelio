@@ -24,6 +24,8 @@ from reelio.extraction.types import (
     ExtractionResults,
     MovieMention,
     MovieResult,
+    MusicMentions,
+    MusicResults,
     Platform,
     ResultStatus,
     ScreenWorkMentions,
@@ -158,7 +160,10 @@ async def test_pipeline_returns_empty_grouped_results_and_aggregates_once() -> N
     metadata_service = _FakeSourceMetadataService(source)
     transcription_service = _FakeTranscriptionService(transcript)
     screen_work_mentions = ScreenWorkMentions(movies=[], tv_series=[])
-    extraction_mentions = ExtractionMentions(screen_works=screen_work_mentions)
+    extraction_mentions = ExtractionMentions(
+        screen_works=screen_work_mentions,
+        music=MusicMentions(tracks=[], music_releases=[]),
+    )
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator()
     pipeline = _pipeline(
@@ -193,8 +198,14 @@ async def test_pipeline_returns_ordered_movie_results_unchanged() -> None:
     ]
     screen_work_mentions = ScreenWorkMentions(movies=movie_mentions, tv_series=[])
     screen_work_results = ScreenWorkResults(movies=movie_results, tv_series=[])
-    extraction_mentions = ExtractionMentions(screen_works=screen_work_mentions)
-    extraction_results = ExtractionResults(screen_works=screen_work_results)
+    extraction_mentions = ExtractionMentions(
+        screen_works=screen_work_mentions,
+        music=MusicMentions(tracks=[], music_releases=[]),
+    )
+    extraction_results = ExtractionResults(
+        screen_works=screen_work_results,
+        music=MusicResults(tracks=[]),
+    )
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator(results=extraction_results)
     pipeline = _pipeline(
@@ -221,7 +232,10 @@ async def test_pipeline_returns_tv_only_results_from_aggregator() -> None:
         TVSeriesMention(title="Arcane", year=2021),
     ]
     screen_work_mentions = ScreenWorkMentions(movies=[], tv_series=tv_series_mentions)
-    extraction_mentions = ExtractionMentions(screen_works=screen_work_mentions)
+    extraction_mentions = ExtractionMentions(
+        screen_works=screen_work_mentions,
+        music=MusicMentions(tracks=[], music_releases=[]),
+    )
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator()
     pipeline = _pipeline(
@@ -261,8 +275,14 @@ async def test_pipeline_groups_mixed_interpretation_results() -> None:
         movies=[movie_result],
         tv_series=[tv_series_result],
     )
-    extraction_mentions = ExtractionMentions(screen_works=screen_work_mentions)
-    extraction_results = ExtractionResults(screen_works=screen_work_results)
+    extraction_mentions = ExtractionMentions(
+        screen_works=screen_work_mentions,
+        music=MusicMentions(tracks=[], music_releases=[]),
+    )
+    extraction_results = ExtractionResults(
+        screen_works=screen_work_results,
+        music=MusicResults(tracks=[]),
+    )
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator(results=extraction_results)
     pipeline = _pipeline(
@@ -378,7 +398,10 @@ async def test_pipeline_propagates_aggregation_errors_unchanged() -> None:
         movies=[MovieMention(title="Dune: Part One", year=2021)],
         tv_series=[TVSeriesMention(title="The Last of Us", year=2023)],
     )
-    extraction_mentions = ExtractionMentions(screen_works=screen_work_mentions)
+    extraction_mentions = ExtractionMentions(
+        screen_works=screen_work_mentions,
+        music=MusicMentions(tracks=[], music_releases=[]),
+    )
     result_aggregator = _FakeResultAggregator(error=aggregation_error)
     pipeline = _pipeline(
         _FakeSourceMetadataService(_source()),
@@ -503,9 +526,11 @@ async def test_pipeline_uses_configured_market_until_the_request_overrides_it() 
     """Expose the configured market unless the API supplies an explicit one."""
     source = _source()
     transcript = _transcript()
+    result_aggregator = _FakeResultAggregator()
     pipeline = _pipeline(
         _FakeSourceMetadataService(source),
         _FakeTranscriptionService(transcript),
+        result_aggregator=result_aggregator,
         default_market=SpotifyMarket("CA"),
     )
 
@@ -514,3 +539,4 @@ async def test_pipeline_uses_configured_market_until_the_request_overrides_it() 
 
     assert default_result.market == "CA"
     assert explicit_result.market == "JP"
+    assert result_aggregator.markets == [SpotifyMarket("CA"), SpotifyMarket("JP")]

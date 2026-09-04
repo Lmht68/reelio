@@ -27,10 +27,10 @@ from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.services.catalog.config import SpotifyConfig
 from reelio.extraction.services.catalog.types import (
     AlbumCandidate,
-    ArtistCredit,
     ImageCandidate,
     TrackCandidate,
 )
+from reelio.extraction.types import ArtistCredit
 
 logger = logging.getLogger(__name__)
 

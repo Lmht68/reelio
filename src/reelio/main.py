@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
+from typing import cast
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -17,9 +18,10 @@ from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.router import router as extraction_router
 from reelio.extraction.service import ExtractionPipeline, ExtractionPipelineProtocol
 from reelio.extraction.services.catalog.config import SpotifyConfig
-from reelio.extraction.services.catalog.spotify import create_spotify_catalog
+from reelio.extraction.services.catalog.spotify import SpotifyCatalog, create_spotify_catalog
 from reelio.extraction.services.enrichment.config import tmdb_settings as _tmdb_settings
 from reelio.extraction.services.enrichment.service import ExtractionResultAggregator
+from reelio.extraction.services.enrichment.spotify import SpotifyTrackResolver
 from reelio.extraction.services.enrichment.tmdb import create_tmdb_screen_work_resolver
 from reelio.extraction.services.interpretation.config import (
     InterpretationConfig,
@@ -57,11 +59,13 @@ _SpotifyCatalogFactory = Callable[
 
 async def _create_production_pipeline(
     default_market: SpotifyMarket,
+    spotify_catalog: SpotifyCatalog,
 ) -> ExtractionPipelineProtocol:
     """Load production dependencies and compose one extraction pipeline.
 
     Args:
         default_market: Validated Spotify market used when an API request omits it.
+        spotify_catalog: Lifespan-owned Spotify catalog used without transferring ownership.
     """
     interpretation_settings = InterpretationConfig()
     llm_provider_selection = LLMProviderSelectionConfig()  # type: ignore[call-arg]
@@ -92,7 +96,8 @@ async def _create_production_pipeline(
         )
         screen_work_resolver = create_tmdb_screen_work_resolver(_tmdb_settings)
         cleanup.push_async_callback(screen_work_resolver.aclose)
-        result_aggregator = ExtractionResultAggregator(screen_work_resolver)
+        track_resolver = SpotifyTrackResolver(spotify_catalog)
+        result_aggregator = ExtractionResultAggregator(screen_work_resolver, track_resolver)
         pipeline = ExtractionPipeline(
             source_metadata_service=source_metadata_service,
             transcription_service=transcription_service,
@@ -152,7 +157,11 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
 
     async def create_pipeline() -> ExtractionPipelineProtocol:
         """Compose the pipeline with the lifespan's validated default market."""
-        return await _create_production_pipeline(spotify_settings.default_market)
+        spotify_catalog = cast(SpotifyCatalog, application.state.spotify_catalog)
+        return await _create_production_pipeline(
+            spotify_settings.default_market,
+            spotify_catalog,
+        )
 
     async with _managed_spotify_lifespan(
         application,

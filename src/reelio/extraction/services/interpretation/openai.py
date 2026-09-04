@@ -12,12 +12,12 @@ from reelio.extraction.exceptions import (
     PipelineTimeoutError,
 )
 from reelio.extraction.services.interpretation.config import LLMProvider, OpenAIConfig
-from reelio.extraction.services.interpretation.schemas import ScreenWorkInterpretationResponse
+from reelio.extraction.services.interpretation.schemas import InterpretationResponse
 from reelio.extraction.services.interpretation.types import LLMMessage
 
 _PROVIDER_ERROR_MESSAGE = "Movie Mention interpretation provider failed."
 _PROVIDER_TIMEOUT_MESSAGE = "Movie Mention interpretation timed out."
-_RESPONSE_SCHEMA_NAME = "screen_work_mention_interpretation"
+_RESPONSE_SCHEMA_NAME = "mention_interpretation"
 _OFFICIAL_BASE_URL = "https://api.openai.com/v1"
 
 
@@ -68,7 +68,7 @@ class OpenAIProvider:
                 "format": {
                     "type": "json_schema",
                     "name": _RESPONSE_SCHEMA_NAME,
-                    "schema": ScreenWorkInterpretationResponse.model_json_schema(),
+                    "schema": InterpretationResponse.model_json_schema(),
                     "strict": True,
                 }
             },

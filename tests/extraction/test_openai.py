@@ -18,7 +18,7 @@ from reelio.extraction.services.interpretation.openai import (
     OpenAIProvider,
     create_openai_provider,
 )
-from reelio.extraction.services.interpretation.schemas import ScreenWorkInterpretationResponse
+from reelio.extraction.services.interpretation.schemas import InterpretationResponse
 from reelio.extraction.services.interpretation.types import LLMMessage
 
 
@@ -90,7 +90,8 @@ async def test_openai_adapter_sends_strict_responses_request_and_closes_client()
     """Map trusted messages to a private strict Structured Outputs request."""
     response_json = (
         '{"movies":[{"title":"Dune: Part One","year":2021}],'
-        '"tv_series":[{"title":"The Last of Us","year":2023}]}'
+        '"tv_series":[{"title":"The Last of Us","year":2023}],"tracks":[],'
+        '"music_releases":[]}'
     )
     fake_responses = _FakeResponses(SimpleNamespace(status="completed", output_text=response_json))
     fake_client = _FakeOpenAIClient(fake_responses)
@@ -110,8 +111,8 @@ async def test_openai_adapter_sends_strict_responses_request_and_closes_client()
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": "screen_work_mention_interpretation",
-                "schema": ScreenWorkInterpretationResponse.model_json_schema(),
+                "name": "mention_interpretation",
+                "schema": InterpretationResponse.model_json_schema(),
                 "strict": True,
             }
         },
@@ -120,10 +121,23 @@ async def test_openai_adapter_sends_strict_responses_request_and_closes_client()
     assert provider.model_name == "gpt-5-nano"
     assert fake_client.closed is True
 
-    schema = ScreenWorkInterpretationResponse.model_json_schema()
-    assert schema["required"] == ["movies", "tv_series"]
+    schema = InterpretationResponse.model_json_schema()
+    assert schema["required"] == ["movies", "tv_series", "tracks", "music_releases"]
     assert schema["additionalProperties"] is False
     assert schema["$defs"]["InterpretedScreenWorkMention"]["additionalProperties"] is False
+    assert schema["$defs"]["InterpretedTrackMention"]["additionalProperties"] is False
+    assert schema["$defs"]["InterpretedTrackMention"]["required"] == [
+        "track_title",
+        "artists",
+        "release_title",
+        "release_year",
+    ]
+    assert schema["$defs"]["InterpretedMusicReleaseMention"]["additionalProperties"] is False
+    assert schema["$defs"]["InterpretedMusicReleaseMention"]["required"] == [
+        "release_title",
+        "artists",
+        "release_year",
+    ]
 
 
 async def test_openai_adapter_maps_refusal_response() -> None:

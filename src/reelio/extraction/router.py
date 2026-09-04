@@ -7,11 +7,15 @@ from fastapi import APIRouter, Depends, Request, status
 from reelio.extraction import schemas as extraction_schemas
 from reelio.extraction.service import ExtractionPipelineProtocol
 from reelio.extraction.types import (
+    ArtistCredit,
     EnrichedMovie,
+    EnrichedTrack,
     EnrichedTVSeries,
     MovieMention,
     MovieResult,
     PipelineResult,
+    TrackMention,
+    TrackResult,
     TVSeriesMention,
     TVSeriesResult,
 )
@@ -82,6 +86,28 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                 "tv_series": None,
             },
         ],
+        "tracks": [
+            {
+                "status": "resolved",
+                "track_mention": {
+                    "track_title": "One More Time",
+                    "artists": ["Daft Punk"],
+                    "release_title": "Discovery",
+                    "release_year": 2001,
+                },
+                "track": {
+                    "track_title": "One More Time",
+                    "artists": [
+                        {
+                            "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
+                            "name": "Daft Punk",
+                        }
+                    ],
+                    "spotify_track_id": "0DiWol3AO6WpXZgp0goxAV",
+                    "spotify_url": "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV",
+                },
+            }
+        ],
     },
 }
 
@@ -114,6 +140,26 @@ def _to_tv_series_mention_schema(
     return extraction_schemas.TVSeriesMentionModel(
         title=mention.title,
         year=mention.year,
+    )
+
+
+def _to_track_mention_schema(
+    mention: TrackMention,
+) -> extraction_schemas.TrackMentionModel:
+    return extraction_schemas.TrackMentionModel(
+        track_title=mention.track_title,
+        artists=mention.artists,
+        release_title=mention.release_title,
+        release_year=mention.release_year,
+    )
+
+
+def _to_artist_credit_schema(
+    artist_credit: ArtistCredit,
+) -> extraction_schemas.ArtistCreditModel:
+    return extraction_schemas.ArtistCreditModel(
+        spotify_artist_id=artist_credit.spotify_artist_id,
+        name=artist_credit.name,
     )
 
 
@@ -152,6 +198,15 @@ def _to_tv_series_schema(
     )
 
 
+def _to_track_schema(track: EnrichedTrack) -> extraction_schemas.TrackModel:
+    return extraction_schemas.TrackModel(
+        track_title=track.track_title,
+        artists=[_to_artist_credit_schema(artist) for artist in track.artists],
+        spotify_track_id=track.spotify_track_id,
+        spotify_url=track.spotify_url,
+    )
+
+
 def _to_movie_result_schema(
     result: MovieResult,
 ) -> extraction_schemas.MovieResultModel:
@@ -174,6 +229,17 @@ def _to_tv_series_result_schema(
     )
 
 
+def _to_track_result_schema(
+    result: TrackResult,
+) -> extraction_schemas.TrackResultModel:
+    track = _to_track_schema(result.track) if result.track is not None else None
+    return extraction_schemas.TrackResultModel(
+        status=result.status,
+        track_mention=_to_track_mention_schema(result.track_mention),
+        track=track,
+    )
+
+
 def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
     return extraction_schemas.ExtractResponse(
         market=result.market,
@@ -191,11 +257,12 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
             language=result.transcript.language,
             method=result.transcript.method,
         ),
-        results=extraction_schemas.ScreenWorkResultsModel(
+        results=extraction_schemas.ExtractionResultsModel(
             movies=[_to_movie_result_schema(item) for item in result.results.screen_works.movies],
             tv_series=[
                 _to_tv_series_result_schema(item) for item in result.results.screen_works.tv_series
             ],
+            tracks=[_to_track_result_schema(item) for item in result.results.music.tracks],
         ),
     )
 
@@ -204,23 +271,27 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
     "/extract",
     status_code=status.HTTP_200_OK,
     response_model=extraction_schemas.ExtractResponse,
-    summary="Extract mentioned Screen Works from a public video Source",
+    summary="Extract mentioned Movies, TV Series, and Tracks from a public video Source",
     description=(
         "Accept a public YouTube, Instagram, Facebook, TikTok, or X video URL and "
         "return the normalized Source, the Transcript with its acquisition method, "
-        "the effective Spotify market, and grouped Movie and TV Series results. Each "
-        "list preserves first-reference order within its kind, with no cross-kind "
-        "ordering. The optional market must use uppercase ISO 3166-1 alpha-2 syntax; "
-        "an omitted market uses configured US. Resolved TV Series report their TV "
-        "First Air Year, an optional final air year where null means unavailable "
-        "rather than proof of continuation, Creators from TMDB created_by, and up to "
-        "five aggregate cast names in provider order without role filtering or person "
-        "deduplication. Any TMDB provider failure fails the complete request."
+        "the effective Spotify market, and grouped Movie, TV Series, and Track "
+        "results. Each list preserves first-reference order within its kind, with no "
+        "cross-kind ordering. The optional market must use uppercase ISO 3166-1 "
+        "alpha-2 syntax; an omitted market uses configured US. Resolved TV Series "
+        "report their TV First Air Year, an optional final air year where null means "
+        "unavailable rather than proof of continuation, Creators from TMDB "
+        "created_by, and up to five aggregate cast names in provider order without "
+        "role filtering or person deduplication. Track Results retain their "
+        "interpreted Track Mention and expose Spotify's canonical Track title, "
+        "ordered artist credits, playable Track ID, and direct URL only after a "
+        "verified match. Any TMDB or Spotify provider failure fails the complete "
+        "request."
     ),
-    response_description="Effective market, Source, transcript, and grouped Screen Work Results.",
+    response_description="Effective market, Source, transcript, and grouped results.",
     responses={
         200: {
-            "description": "Grouped Movie and TV Series results.",
+            "description": "Grouped Movie, TV Series, and Track results.",
             "content": {
                 "application/json": {"example": _EXTRACT_RESPONSE_EXAMPLE},
             },
@@ -244,8 +315,8 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         502: {
             "model": extraction_schemas.ErrorResponse,
             "description": (
-                "Metadata, transcript, LLM, or TMDB provider failure. Any TMDB "
-                "provider failure fails the complete request."
+                "Metadata, transcript, LLM, TMDB, or Spotify provider failure. Any "
+                "TMDB or Spotify provider failure fails the complete request."
             ),
         },
         504: {
@@ -258,7 +329,7 @@ async def extract(
     payload: extraction_schemas.ExtractRequest,
     pipeline: Annotated[ExtractionPipelineProtocol, Depends(get_pipeline)],
 ) -> extraction_schemas.ExtractResponse:
-    """Extract structured Screen Work Mentions from a submitted source URL.
+    """Extract structured Movie, TV Series, and Track Mentions from a source URL.
 
     Args:
         payload: Validated extraction request containing source URL and optional market.
