@@ -7,11 +7,10 @@ from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.types import (
     ExtractionMentions,
     ExtractionResults,
+    MusicMentions,
     MusicResults,
     ScreenWorkMentions,
     ScreenWorkResults,
-    TrackMention,
-    TrackResult,
 )
 
 
@@ -30,15 +29,15 @@ class _ScreenWorkResolver(Protocol):
         ...
 
 
-class _TrackResolver(Protocol):
-    """Resolve Track Mentions with Spotify-backed enrichment."""
+class _MusicResolver(Protocol):
+    """Resolve grouped Music Mentions with Spotify-backed enrichment."""
 
     async def resolve(
         self,
-        track_mentions: list[TrackMention],
+        music_mentions: MusicMentions,
         market: SpotifyMarket,
-    ) -> list[TrackResult]:
-        """Return ordered Track Results for one effective market."""
+    ) -> MusicResults:
+        """Return grouped Music Results for one effective market."""
         ...
 
 
@@ -47,22 +46,22 @@ class ExtractionResultAggregator:
 
     Args:
         screen_work_resolver: Resolver for Movie and TV Series mentions.
-        track_resolver: Resolver for Spotify Track Mentions.
+        music_resolver: Resolver for Spotify Track and Music Release mentions.
     """
 
     def __init__(
         self,
         screen_work_resolver: _ScreenWorkResolver,
-        track_resolver: _TrackResolver,
+        music_resolver: _MusicResolver,
     ) -> None:
-        """Initialize aggregation with resolvers for each public result kind.
-
+        """Initialize aggregation with resolvers for each service scope.
+ badsd
         Args:
             screen_work_resolver: Resolver for Movie and TV Series mentions.
-            track_resolver: Resolver for Spotify Track Mentions.
+            music_resolver: Resolver for Spotify Track and Music Release mentions.
         """
         self._screen_work_resolver = screen_work_resolver
-        self._track_resolver = track_resolver
+        self._music_resolver = music_resolver
 
     async def aggregate(
         self,
@@ -73,18 +72,18 @@ class ExtractionResultAggregator:
 
         Args:
             mentions: Interpreted mentions grouped by service scope.
-            market: Effective Spotify market used for Track resolution.
+            market: Effective Spotify market used for Spotify resolution.
 
         Returns:
             ExtractionResults: Results grouped by service scope.
         """
-        resolved_screen_works, resolved_tracks = await asyncio.gather(
+        resolved_screen_works, resolved_music = await asyncio.gather(
             self._screen_work_resolver.resolve(mentions.screen_works),
-            self._track_resolver.resolve(mentions.music.tracks, market),
+            self._music_resolver.resolve(mentions.music, market),
         )
         return ExtractionResults(
             screen_works=resolved_screen_works,
-            music=MusicResults(tracks=resolved_tracks),
+            music=resolved_music,
         )
 
     async def aclose(self) -> None:

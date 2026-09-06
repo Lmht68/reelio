@@ -1,4 +1,4 @@
-"""In-process HTTP coverage for Spotify-backed Track extraction."""
+"""In-process HTTP coverage for Spotify-backed Music extraction."""
 
 import json
 from collections.abc import Callable, Iterator, Sequence
@@ -13,7 +13,7 @@ from reelio.extraction.service import ExtractionPipeline
 from reelio.extraction.services.catalog.config import SpotifyConfig
 from reelio.extraction.services.catalog.spotify import SpotifyCatalog
 from reelio.extraction.services.enrichment.service import ExtractionResultAggregator
-from reelio.extraction.services.enrichment.spotify import SpotifyTrackResolver
+from reelio.extraction.services.enrichment.spotify import SpotifyMusicResolver
 from reelio.extraction.services.interpretation.config import (
     InterpretationConfig,
     LLMProvider,
@@ -94,7 +94,7 @@ class _InterpretationProvider:
         return "deterministic-track-provider"
 
     async def complete(self, messages: Sequence[LLMMessage]) -> str:
-        """Return one response with a single release-contextualized Track Mention."""
+        """Return one response with a Track and a Music Release Mention."""
         self.calls.append(tuple(messages))
         return json.dumps(
             {
@@ -108,7 +108,13 @@ class _InterpretationProvider:
                         "release_year": 2001,
                     }
                 ],
-                "music_releases": [],
+                "music_releases": [
+                    {
+                        "release_title": "Discovery",
+                        "artists": ["Daft Punk"],
+                        "release_year": 2001,
+                    }
+                ],
             }
         )
 
@@ -155,8 +161,22 @@ def _spotify_track_payload() -> dict[str, object]:
     }
 
 
-async def test_extract_resolves_a_track_through_mocked_spotify_catalog() -> None:
-    """Expose a resolved Track through the in-process HTTP endpoint without live I/O."""
+def _spotify_album_payload() -> dict[str, object]:
+    """Return one Spotify Album payload matching the interpreted Music Release."""
+    return {
+        "id": "2noRn2Aes5aoNVsU6iWThc",
+        "name": "Discovery",
+        "artists": [{"id": "4tZwfgrHOc3mvqYlEYSvVi", "name": "Daft Punk"}],
+        "external_urls": {"spotify": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc"},
+        "release_date": "2001-02-26",
+        "release_date_precision": "day",
+        "album_type": "album",
+        "images": [],
+    }
+
+
+async def test_extract_resolves_music_through_mocked_spotify_catalog() -> None:
+    """Expose a resolved Track and Music Release through the in-process HTTP endpoint."""
     requests: list[httpx.Request] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
@@ -171,15 +191,20 @@ async def test_extract_resolves_a_track_through_mocked_spotify_catalog() -> None
         assert request.method == "GET"
         assert request.url.path == "/v1/search"
         assert request.headers["authorization"] == "Bearer test-access-token"
-        assert dict(request.url.params) == {
-            "q": "track:One More Time artist:Daft Punk album:Discovery year:2001",
-            "type": "track",
-            "market": "JP",
-            "limit": "3",
-        }
+        params = dict(request.url.params)
+        assert params["market"] == "JP"
+        assert params["limit"] == "3"
+        if params["type"] == "track":
+            assert params["q"] == ("track:One More Time artist:Daft Punk album:Discovery year:2001")
+            return httpx.Response(
+                200,
+                json={"tracks": {"items": [_spotify_track_payload()]}},
+            )
+        assert params["type"] == "album"
+        assert params["q"] == "album:Discovery artist:Daft Punk year:2001"
         return httpx.Response(
             200,
-            json={"tracks": {"items": [_spotify_track_payload()]}},
+            json={"albums": {"items": [_spotify_album_payload()]}},
         )
 
     http_client = httpx.AsyncClient(
@@ -194,7 +219,7 @@ async def test_extract_resolves_a_track_through_mocked_spotify_catalog() -> None
         MentionInterpretationService(interpretation_provider, _interpretation_settings()),
         ExtractionResultAggregator(
             FakeScreenWorkResolver(),
-            SpotifyTrackResolver(catalog),
+            SpotifyMusicResolver(catalog),
         ),
         SpotifyMarket("US"),
     )
@@ -215,9 +240,14 @@ async def test_extract_resolves_a_track_through_mocked_spotify_catalog() -> None
     assert interpretation_provider.closed is True
     assert http_client.is_closed is True
     assert len(interpretation_provider.calls) == 1
-    assert len(requests) == 2
+    assert len(requests) == 3
     assert response.json()["market"] == "JP"
-    assert set(response.json()["results"]) == {"movies", "tv_series", "tracks"}
+    assert set(response.json()["results"]) == {
+        "movies",
+        "tv_series",
+        "tracks",
+        "music_releases",
+    }
     assert response.json()["results"]["movies"] == []
     assert response.json()["results"]["tv_series"] == []
     assert response.json()["results"]["tracks"] == [
@@ -239,6 +269,30 @@ async def test_extract_resolves_a_track_through_mocked_spotify_catalog() -> None
                 ],
                 "spotify_track_id": "0DiWol3AO6WpXZgp0goxAV",
                 "spotify_url": "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV",
+            },
+        }
+    ]
+    assert response.json()["results"]["music_releases"] == [
+        {
+            "status": "resolved",
+            "music_release_mention": {
+                "release_title": "Discovery",
+                "artists": ["Daft Punk"],
+                "release_year": 2001,
+            },
+            "music_release": {
+                "release_title": "Discovery",
+                "artists": [
+                    {
+                        "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
+                        "name": "Daft Punk",
+                    }
+                ],
+                "release_date": "2001-02-26",
+                "release_date_precision": "day",
+                "album_type": "album",
+                "spotify_album_id": "2noRn2Aes5aoNVsU6iWThc",
+                "spotify_url": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc",
             },
         }
     ]

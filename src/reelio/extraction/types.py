@@ -4,6 +4,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
+from typing import Literal
 
 from reelio.extraction.market import SpotifyMarket
 
@@ -56,6 +57,10 @@ def normalize_music_identity(text: str) -> str:
         str: Display-normalized text with Unicode case folding applied.
     """
     return normalize_music_text(text).casefold()
+
+
+ReleaseDatePrecision = Literal["year", "month", "day"]
+AlbumType = Literal["album", "single", "compilation"]
 
 
 class Platform(StrEnum):
@@ -315,6 +320,29 @@ class EnrichedTrack:
 
 
 @dataclass
+class EnrichedMusicRelease:
+    """Contain Spotify-verified metadata for one Album Music Release.
+
+    Attributes:
+        release_title: Spotify-authoritative Music Release title.
+        artists: Ordered Spotify Music Release artist credits.
+        release_date: Spotify-reported release date for the verified precision.
+        release_date_precision: Granularity of the Spotify release date.
+        album_type: Spotify album classification.
+        spotify_album_id: Spotify Album identifier for the effective market.
+        spotify_url: Direct Spotify URL for the Album.
+    """
+
+    release_title: str
+    artists: list[ArtistCredit]
+    release_date: str
+    release_date_precision: ReleaseDatePrecision
+    album_type: AlbumType
+    spotify_album_id: str
+    spotify_url: str
+
+
+@dataclass
 class MovieResult:
     """Represent one Movie Mention and its resolution outcome.
 
@@ -360,6 +388,21 @@ class TrackResult:
 
 
 @dataclass
+class MusicReleaseResult:
+    """Represent one Music Release Mention and its resolution outcome.
+
+    Attributes:
+        status: Current resolution state of the Music Release Mention.
+        music_release_mention: Canonical Music Release Mention.
+        music_release: Enriched Music Release, or ``None`` when unresolved.
+    """
+
+    status: ResultStatus
+    music_release_mention: MusicReleaseMention
+    music_release: EnrichedMusicRelease | None
+
+
+@dataclass
 class ScreenWorkResults:
     """Contain ordered Screen Work Results grouped by kind.
 
@@ -381,9 +424,11 @@ class MusicResults:
 
     Attributes:
         tracks: Track Results in first-reference order.
+        music_releases: Music Release Results in first-reference order.
     """
 
     tracks: list[TrackResult]
+    music_releases: list[MusicReleaseResult]
 
 
 @dataclass

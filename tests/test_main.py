@@ -276,10 +276,10 @@ async def test_production_lifespan_closes_resolver_after_aggregation_setup_failu
 
     def fail_aggregation_setup(
         screen_work_resolver: object,
-        track_resolver: object,
+        music_resolver: object,
     ) -> NoReturn:
         assert screen_work_resolver is resolver
-        assert track_resolver is not None
+        assert music_resolver is not None
         raise RuntimeError("aggregation setup failed")
 
     monkeypatch.setattr(main_module, "create_mention_interpretation_provider", create_provider)

@@ -30,7 +30,7 @@ from reelio.extraction.services.catalog.types import (
     ImageCandidate,
     TrackCandidate,
 )
-from reelio.extraction.types import ArtistCredit
+from reelio.extraction.types import AlbumType, ArtistCredit, ReleaseDatePrecision
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +76,8 @@ class _SpotifyAlbum(_SpotifyModel):
     artists: list[_SpotifyArtist] = Field(min_length=1)
     external_urls: _SpotifyExternalUrls
     release_date: _NON_BLANK_TEXT
-    release_date_precision: Literal["year", "month", "day"]
-    album_type: Literal["album", "single", "compilation"]
+    release_date_precision: ReleaseDatePrecision
+    album_type: AlbumType
     images: list[_SpotifyImage] = Field(default_factory=list)
 
     @model_validator(mode="after")

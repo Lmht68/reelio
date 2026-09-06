@@ -15,6 +15,9 @@ from reelio.extraction.types import (
     MovieMention,
     MovieResult,
     MusicMentions,
+    MusicReleaseMention,
+    MusicReleaseResult,
+    MusicResults,
     ResultStatus,
     ScreenWorkMentions,
     ScreenWorkResults,
@@ -23,13 +26,13 @@ from reelio.extraction.types import (
     TVSeriesMention,
     TVSeriesResult,
 )
-from tests.extraction.fakes import FakeScreenWorkResolver, FakeTrackResolver
+from tests.extraction.fakes import FakeMusicResolver, FakeScreenWorkResolver
 
 _MARKET = SpotifyMarket("JP")
 
 
-async def test_aggregator_resolves_both_scopes_with_the_effective_market() -> None:
-    """Pass grouped mentions unchanged to both resolvers and preserve their results."""
+async def test_aggregator_resolves_all_scopes_with_the_effective_market() -> None:
+    """Pass grouped mentions unchanged to every resolver and preserve their results."""
     screen_work_mentions = ScreenWorkMentions(
         movies=[MovieMention(title="Dune: Part One", year=2021)],
         tv_series=[TVSeriesMention(title="The Last of Us", year=2023)],
@@ -40,9 +43,14 @@ async def test_aggregator_resolves_both_scopes_with_the_effective_market() -> No
         release_title=None,
         release_year=None,
     )
+    music_release_mention = MusicReleaseMention(
+        release_title="Discovery",
+        artists=["Daft Punk"],
+        release_year=2001,
+    )
     music_mentions = MusicMentions(
         tracks=[track_mention],
-        music_releases=[],
+        music_releases=[music_release_mention],
     )
     resolved_screen_works = ScreenWorkResults(movies=[], tv_series=[])
     resolved_tracks = [
@@ -52,9 +60,20 @@ async def test_aggregator_resolves_both_scopes_with_the_effective_market() -> No
             track=None,
         )
     ]
+    resolved_music_releases = [
+        MusicReleaseResult(
+            status=ResultStatus.UNRESOLVED,
+            music_release_mention=music_release_mention,
+            music_release=None,
+        )
+    ]
+    resolved_music = MusicResults(
+        tracks=resolved_tracks,
+        music_releases=resolved_music_releases,
+    )
     screen_work_resolver = FakeScreenWorkResolver(results=resolved_screen_works)
-    track_resolver = FakeTrackResolver(results=resolved_tracks)
-    aggregator = ExtractionResultAggregator(screen_work_resolver, track_resolver)
+    music_resolver = FakeMusicResolver(results=resolved_music)
+    aggregator = ExtractionResultAggregator(screen_work_resolver, music_resolver)
 
     results = await aggregator.aggregate(
         ExtractionMentions(
@@ -65,10 +84,12 @@ async def test_aggregator_resolves_both_scopes_with_the_effective_market() -> No
     )
 
     assert screen_work_resolver.calls == [screen_work_mentions]
-    assert track_resolver.calls == [(music_mentions.tracks, _MARKET)]
-    assert track_resolver.calls[0][0] is music_mentions.tracks
+    assert music_resolver.calls == [(music_mentions, _MARKET)]
+    assert music_resolver.calls[0][0] is music_mentions
     assert results.screen_works is resolved_screen_works
+    assert results.music is resolved_music
     assert results.music.tracks is resolved_tracks
+    assert results.music.music_releases is resolved_music_releases
 
 
 async def test_aggregator_preserves_nested_results_and_kind_list_identity() -> None:
@@ -80,6 +101,11 @@ async def test_aggregator_preserves_nested_results_and_kind_list_identity() -> N
         artists=["Daft Punk"],
         release_title=None,
         release_year=None,
+    )
+    music_release_mention = MusicReleaseMention(
+        release_title="Discovery",
+        artists=["Daft Punk"],
+        release_year=2001,
     )
     movie_results = [
         MovieResult(
@@ -114,13 +140,25 @@ async def test_aggregator_preserves_nested_results_and_kind_list_identity() -> N
             track=None,
         )
     ]
+    music_release_results = [
+        MusicReleaseResult(
+            status=ResultStatus.UNRESOLVED,
+            music_release_mention=music_release_mention,
+            music_release=None,
+        )
+    ]
     resolved_screen_works = ScreenWorkResults(
         movies=movie_results,
         tv_series=tv_series_results,
     )
     aggregator = ExtractionResultAggregator(
         FakeScreenWorkResolver(results=resolved_screen_works),
-        FakeTrackResolver(results=track_results),
+        FakeMusicResolver(
+            results=MusicResults(
+                tracks=track_results,
+                music_releases=music_release_results,
+            )
+        ),
     )
 
     results = await aggregator.aggregate(
@@ -129,7 +167,10 @@ async def test_aggregator_preserves_nested_results_and_kind_list_identity() -> N
                 movies=[movie_mention],
                 tv_series=[tv_series_mention],
             ),
-            music=MusicMentions(tracks=[track_mention], music_releases=[]),
+            music=MusicMentions(
+                tracks=[track_mention],
+                music_releases=[music_release_mention],
+            ),
         ),
         _MARKET,
     )
@@ -138,6 +179,7 @@ async def test_aggregator_preserves_nested_results_and_kind_list_identity() -> N
     assert results.screen_works.movies is movie_results
     assert results.screen_works.tv_series is tv_series_results
     assert results.music.tracks is track_results
+    assert results.music.music_releases is music_release_results
 
 
 @pytest.mark.parametrize(
@@ -151,14 +193,14 @@ async def test_aggregator_preserves_nested_results_and_kind_list_identity() -> N
 async def test_aggregator_propagates_resolver_errors_without_partial_results(
     resolver_error: Exception,
 ) -> None:
-    """Propagate either resolver failure without constructing partial grouped results."""
+    """Propagate any resolver failure without constructing partial grouped results."""
     screen_work_resolver = FakeScreenWorkResolver()
-    track_resolver = FakeTrackResolver()
+    music_resolver = FakeMusicResolver()
     if isinstance(resolver_error, EnrichmentError):
         screen_work_resolver = FakeScreenWorkResolver(error=resolver_error)
     else:
-        track_resolver = FakeTrackResolver(error=resolver_error)
-    aggregator = ExtractionResultAggregator(screen_work_resolver, track_resolver)
+        music_resolver = FakeMusicResolver(error=resolver_error)
+    aggregator = ExtractionResultAggregator(screen_work_resolver, music_resolver)
 
     with pytest.raises(type(resolver_error)) as error:
         await aggregator.aggregate(
@@ -194,7 +236,7 @@ class _ClosingScreenWorkResolver:
 async def test_aggregator_closes_only_the_screen_work_resolver() -> None:
     """Leave lifespan-owned Spotify catalog closure outside the aggregator."""
     resolver = _ClosingScreenWorkResolver()
-    aggregator = ExtractionResultAggregator(resolver, FakeTrackResolver())
+    aggregator = ExtractionResultAggregator(resolver, FakeMusicResolver())
 
     await aggregator.aclose()
 

@@ -42,6 +42,7 @@ from reelio.extraction.services.transcription.service import (
 from reelio.extraction.types import (
     ArtistCredit,
     EnrichedMovie,
+    EnrichedMusicRelease,
     EnrichedTrack,
     EnrichedTVSeries,
     ExtractionMentions,
@@ -49,6 +50,8 @@ from reelio.extraction.types import (
     MovieMention,
     MovieResult,
     MusicMentions,
+    MusicReleaseMention,
+    MusicReleaseResult,
     MusicResults,
     PipelineResult,
     Platform,
@@ -248,6 +251,25 @@ def _enriched_track(track_mention: TrackMention) -> EnrichedTrack:
     )
 
 
+def _enriched_music_release(
+    music_release_mention: MusicReleaseMention,
+) -> EnrichedMusicRelease:
+    return EnrichedMusicRelease(
+        release_title=music_release_mention.release_title,
+        artists=[
+            ArtistCredit(
+                spotify_artist_id="4tZwfgrHOc3mvqYlEYSvVi",
+                name=music_release_mention.artists[0],
+            )
+        ],
+        release_date="2001-02-26",
+        release_date_precision="day",
+        album_type="album",
+        spotify_album_id="2noRn2Aes5aoNVsU6iWThc",
+        spotify_url="https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc",
+    )
+
+
 def _pipeline(
     metadata_service: SourceMetadataService,
     transcription_service: TranscriptionService,
@@ -300,7 +322,15 @@ def _pipeline(
                     track=None,
                 )
                 for track_mention in interpreted_music.tracks
-            ]
+            ],
+            music_releases=[
+                MusicReleaseResult(
+                    status=ResultStatus.UNRESOLVED,
+                    music_release_mention=music_release_mention,
+                    music_release=None,
+                )
+                for music_release_mention in interpreted_music.music_releases
+            ],
         )
     )
     return ExtractionPipeline(
@@ -325,10 +355,10 @@ def _install_pipeline(application: FastAPI, pipeline: ExtractionPipelineProtocol
     application.dependency_overrides[get_pipeline] = lambda: pipeline
 
 
-async def test_extract_returns_resolved_and_unresolved_screen_work_and_track_results(
+async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_results(
     client: AsyncClient,
 ) -> None:
-    """Return a complete mixed Screen Work contract with resolved and null entities."""
+    """Return a complete mixed Screen Work and Music contract with resolved and null entities."""
     metadata_extractor = _MetadataExtractor()
     resolved_movie_mention = MovieMention(title="Dune: Part One", year=2021)
     unresolved_movie_mention = MovieMention(title="Unknown Movie", year=2024)
@@ -376,9 +406,22 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_track_res
         release_title=None,
         release_year=None,
     )
+    resolved_music_release_mention = MusicReleaseMention(
+        release_title="Discovery",
+        artists=["Daft Punk"],
+        release_year=2001,
+    )
+    unresolved_music_release_mention = MusicReleaseMention(
+        release_title="Unknown Album",
+        artists=["Unknown Artist"],
+        release_year=None,
+    )
     music_mentions = MusicMentions(
         tracks=[resolved_track_mention, unresolved_track_mention],
-        music_releases=[],
+        music_releases=[
+            resolved_music_release_mention,
+            unresolved_music_release_mention,
+        ],
     )
     music_results = MusicResults(
         tracks=[
@@ -392,7 +435,19 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_track_res
                 track_mention=unresolved_track_mention,
                 track=None,
             ),
-        ]
+        ],
+        music_releases=[
+            MusicReleaseResult(
+                status=ResultStatus.RESOLVED,
+                music_release_mention=resolved_music_release_mention,
+                music_release=_enriched_music_release(resolved_music_release_mention),
+            ),
+            MusicReleaseResult(
+                status=ResultStatus.UNRESOLVED,
+                music_release_mention=unresolved_music_release_mention,
+                music_release=None,
+            ),
+        ],
     )
     pipeline = _pipeline(
         SourceMetadataService(
@@ -429,13 +484,36 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_track_res
     assert payload.transcript.text == "Router caption text."
 
     raw_results = response.json()["results"]
-    assert set(raw_results) == {"movies", "tv_series", "tracks"}
+    assert set(raw_results) == {"movies", "tv_series", "tracks", "music_releases"}
     assert [item["status"] for item in raw_results["movies"]] == ["resolved", "unresolved"]
     assert [item["status"] for item in raw_results["tv_series"]] == ["resolved", "unresolved"]
     assert [item["status"] for item in raw_results["tracks"]] == ["resolved", "unresolved"]
+    assert [item["status"] for item in raw_results["music_releases"]] == [
+        "resolved",
+        "unresolved",
+    ]
     assert raw_results["movies"][1]["movie"] is None
+    assert "movie" in raw_results["movies"][1]
     assert raw_results["tv_series"][1]["tv_series"] is None
+    assert "tv_series" in raw_results["tv_series"][1]
     assert raw_results["tracks"][1]["track"] is None
+    assert "track" in raw_results["tracks"][1]
+    assert raw_results["music_releases"][1]["music_release"] is None
+    assert "music_release" in raw_results["music_releases"][1]
+    assert raw_results["music_releases"][0]["music_release_mention"] == {
+        "release_title": "Discovery",
+        "artists": ["Daft Punk"],
+        "release_year": 2001,
+    }
+    assert set(raw_results["music_releases"][0]["music_release"]) == {
+        "release_title",
+        "artists",
+        "release_date",
+        "release_date_precision",
+        "album_type",
+        "spotify_album_id",
+        "spotify_url",
+    }
     assert set(raw_results["tv_series"][0]["tv_series"]) == {
         "title",
         "first_air_year",
@@ -506,6 +584,48 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_track_res
         resolved_track.track.spotify_url == "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV"
     )
     assert payload.results.tracks[1].track is None
+    resolved_music_release = payload.results.music_releases[0]
+    assert resolved_music_release.status is ResultStatus.RESOLVED
+    assert (
+        resolved_music_release.music_release_mention.release_title
+        == resolved_music_release_mention.release_title
+    )
+    assert (
+        resolved_music_release.music_release_mention.artists
+        == resolved_music_release_mention.artists
+    )
+    assert (
+        resolved_music_release.music_release_mention.release_year
+        == resolved_music_release_mention.release_year
+    )
+    assert resolved_music_release.music_release is not None
+    assert resolved_music_release.music_release.release_title == "Discovery"
+    assert resolved_music_release.music_release.artists[0].spotify_artist_id == (
+        "4tZwfgrHOc3mvqYlEYSvVi"
+    )
+    assert resolved_music_release.music_release.artists[0].name == "Daft Punk"
+    assert resolved_music_release.music_release.release_date == "2001-02-26"
+    assert resolved_music_release.music_release.release_date_precision == "day"
+    assert resolved_music_release.music_release.album_type == "album"
+    assert resolved_music_release.music_release.spotify_album_id == ("2noRn2Aes5aoNVsU6iWThc")
+    assert (
+        resolved_music_release.music_release.spotify_url
+        == "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc"
+    )
+    assert payload.results.music_releases[1].status is ResultStatus.UNRESOLVED
+    assert (
+        payload.results.music_releases[1].music_release_mention.release_title
+        == unresolved_music_release_mention.release_title
+    )
+    assert (
+        payload.results.music_releases[1].music_release_mention.artists
+        == unresolved_music_release_mention.artists
+    )
+    assert (
+        payload.results.music_releases[1].music_release_mention.release_year
+        == unresolved_music_release_mention.release_year
+    )
+    assert payload.results.music_releases[1].music_release is None
 
 
 async def test_extract_maps_unavailable_captions_to_502(
@@ -593,12 +713,13 @@ async def test_extract_groups_screen_work_results(
 
     assert response.status_code == 200
     results = response.json()["results"]
-    assert set(results) == {"movies", "tv_series", "tracks"}
+    assert set(results) == {"movies", "tv_series", "tracks", "music_releases"}
     assert [item["movie_mention"]["title"] for item in results["movies"]] == expected_movies
     assert [
         item["tv_series_mention"]["title"] for item in results["tv_series"]
     ] == expected_tv_series
     assert results["tracks"] == []
+    assert results["music_releases"] == []
     assert all(set(item) == {"status", "movie_mention", "movie"} for item in results["movies"])
     assert all(
         set(item) == {"status", "tv_series_mention", "tv_series"} for item in results["tv_series"]
@@ -882,7 +1003,7 @@ async def test_unhandled_failures_do_not_leak_internals() -> None:
 
 
 async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
-    """Document grouped Track resolution, complete TV metadata, and atomic failures."""
+    """Document grouped Music resolution, complete TV metadata, and atomic failures."""
     response = await client.get("/openapi.json")
 
     assert response.status_code == 200
@@ -917,7 +1038,12 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
 
     example = responses["200"]["content"]["application/json"]["example"]
     assert example["market"] == "US"
-    assert set(example["results"]) == {"movies", "tv_series", "tracks"}
+    assert set(example["results"]) == {
+        "movies",
+        "tv_series",
+        "tracks",
+        "music_releases",
+    }
     resolved_tv_series_example = example["results"]["tv_series"][0]
     assert resolved_tv_series_example["status"] == "resolved"
     assert set(resolved_tv_series_example["tv_series"]) == {
@@ -936,7 +1062,7 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     }
     unresolved_tv_series_example = example["results"]["tv_series"][1]
     assert unresolved_tv_series_example["status"] == "unresolved"
-    assert "tv_series" not in unresolved_tv_series_example
+    assert unresolved_tv_series_example.get("tv_series") is None
     resolved_track_example = example["results"]["tracks"][0]
     assert resolved_track_example["status"] == "resolved"
     assert resolved_track_example["track_mention"] == {
@@ -951,6 +1077,32 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "spotify_track_id",
         "spotify_url",
     }
+    resolved_music_release_example = example["results"]["music_releases"][0]
+    assert resolved_music_release_example["status"] == "resolved"
+    assert resolved_music_release_example["music_release_mention"] == {
+        "release_title": "Discovery",
+        "artists": ["Daft Punk"],
+        "release_year": 2001,
+    }
+    assert set(resolved_music_release_example["music_release"]) == {
+        "release_title",
+        "artists",
+        "release_date",
+        "release_date_precision",
+        "album_type",
+        "spotify_album_id",
+        "spotify_url",
+    }
+    unresolved_music_release_example = example["results"]["music_releases"][1]
+    assert unresolved_music_release_example["status"] == "unresolved"
+    assert (
+        unresolved_music_release_example["music_release_mention"]["release_title"]
+        == "Unknown Album"
+    )
+    assert unresolved_music_release_example["music_release_mention"]["artists"] == [
+        "Unknown Artist"
+    ]
+    assert unresolved_music_release_example.get("music_release") is None
 
     assert "ResultModel" not in schemas
     extract_response_properties = schemas["ExtractResponse"]["properties"]
@@ -960,7 +1112,12 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "$ref": "#/components/schemas/ExtractionResultsModel"
     }
     extraction_results = schemas["ExtractionResultsModel"]
-    assert extraction_results["required"] == ["movies", "tv_series", "tracks"]
+    assert extraction_results["required"] == [
+        "movies",
+        "tv_series",
+        "tracks",
+        "music_releases",
+    ]
     assert extraction_results["properties"]["movies"] == {
         "items": {"$ref": "#/components/schemas/MovieResultModel"},
         "type": "array",
@@ -975,6 +1132,11 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "items": {"$ref": "#/components/schemas/TrackResultModel"},
         "type": "array",
         "title": "Tracks",
+    }
+    assert extraction_results["properties"]["music_releases"] == {
+        "items": {"$ref": "#/components/schemas/MusicReleaseResultModel"},
+        "type": "array",
+        "title": "Music Releases",
     }
 
     movie_result_schema = schemas["MovieResultModel"]
@@ -1003,6 +1165,50 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
             {"$ref": "#/components/schemas/TrackModel"},
             {"type": "null"},
         ],
+    }
+    music_release_result_schema = schemas["MusicReleaseResultModel"]
+    assert {"status", "music_release_mention", "music_release"} <= set(
+        music_release_result_schema["required"]
+    )
+    assert music_release_result_schema["properties"]["music_release_mention"] == {
+        "$ref": "#/components/schemas/MusicReleaseMentionModel"
+    }
+    assert music_release_result_schema["properties"]["music_release"] == {
+        "anyOf": [
+            {"$ref": "#/components/schemas/MusicReleaseModel"},
+            {"type": "null"},
+        ],
+    }
+    music_release_mention_schema = schemas["MusicReleaseMentionModel"]
+    assert music_release_mention_schema["required"] == [
+        "release_title",
+        "artists",
+        "release_year",
+    ]
+    music_release_schema = schemas["MusicReleaseModel"]
+    assert music_release_schema["required"] == [
+        "release_title",
+        "artists",
+        "release_date",
+        "release_date_precision",
+        "album_type",
+        "spotify_album_id",
+        "spotify_url",
+    ]
+    assert music_release_schema["properties"]["artists"] == {
+        "items": {"$ref": "#/components/schemas/ArtistCreditModel"},
+        "type": "array",
+        "title": "Artists",
+    }
+    assert set(music_release_schema["properties"]["release_date_precision"]["enum"]) == {
+        "year",
+        "month",
+        "day",
+    }
+    assert set(music_release_schema["properties"]["album_type"]["enum"]) == {
+        "album",
+        "single",
+        "compilation",
     }
 
     tv_series_schema = schemas["TVSeriesModel"]
@@ -1071,6 +1277,13 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert "first-reference order" in operation["description"]
     assert "Track Results retain their interpreted Track Mention" in operation["description"]
     assert (
+        "Music Release Results retain their interpreted Music Release Mention"
+        in operation["description"]
+    )
+    assert "provider-reported release date and precision" in operation["description"]
+    assert "worldwide-edition" in operation["description"]
+    assert "Music Releases" in operation["summary"]
+    assert (
         "Any TMDB or Spotify provider failure fails the complete request."
         in operation["description"]
     )
@@ -1110,7 +1323,7 @@ class _MarketPipeline:
             ),
             results=ExtractionResults(
                 screen_works=ScreenWorkResults(movies=[], tv_series=[]),
-                music=MusicResults(tracks=[]),
+                music=MusicResults(tracks=[], music_releases=[]),
             ),
             market=market or _DEFAULT_MARKET,
         )

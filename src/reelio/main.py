@@ -21,7 +21,7 @@ from reelio.extraction.services.catalog.config import SpotifyConfig
 from reelio.extraction.services.catalog.spotify import SpotifyCatalog, create_spotify_catalog
 from reelio.extraction.services.enrichment.config import tmdb_settings as _tmdb_settings
 from reelio.extraction.services.enrichment.service import ExtractionResultAggregator
-from reelio.extraction.services.enrichment.spotify import SpotifyTrackResolver
+from reelio.extraction.services.enrichment.spotify import SpotifyMusicResolver
 from reelio.extraction.services.enrichment.tmdb import create_tmdb_screen_work_resolver
 from reelio.extraction.services.interpretation.config import (
     InterpretationConfig,
@@ -96,8 +96,11 @@ async def _create_production_pipeline(
         )
         screen_work_resolver = create_tmdb_screen_work_resolver(_tmdb_settings)
         cleanup.push_async_callback(screen_work_resolver.aclose)
-        track_resolver = SpotifyTrackResolver(spotify_catalog)
-        result_aggregator = ExtractionResultAggregator(screen_work_resolver, track_resolver)
+        music_resolver = SpotifyMusicResolver(spotify_catalog)
+        result_aggregator = ExtractionResultAggregator(
+            screen_work_resolver,
+            music_resolver,
+        )
         pipeline = ExtractionPipeline(
             source_metadata_service=source_metadata_service,
             transcription_service=transcription_service,

@@ -1,11 +1,14 @@
 """Extraction domain identity primitive contract tests."""
 
 from datetime import date
+from typing import get_args
 
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.types import (
     MINIMUM_SCREEN_WORK_MENTION_YEAR,
+    AlbumType,
     ArtistCredit,
+    EnrichedMusicRelease,
     EnrichedTrack,
     EnrichedTVSeries,
     ExtractionMentions,
@@ -14,9 +17,11 @@ from reelio.extraction.types import (
     MovieResult,
     MusicMentions,
     MusicReleaseMention,
+    MusicReleaseResult,
     MusicResults,
     PipelineResult,
     Platform,
+    ReleaseDatePrecision,
     ResultStatus,
     ScreenWorkMentions,
     ScreenWorkResults,
@@ -46,6 +51,12 @@ def test_normalize_music_text_and_identity_canonicalize_unicode_case_and_whitesp
     """Separate display normalization from case-insensitive music identity."""
     assert normalize_music_text("  AME\u0301LIE:\tSong  ") == "AMÉLIE: Song"
     assert normalize_music_identity("  AME\u0301LIE:\tSong  ") == "amélie: song"
+
+
+def test_music_release_date_and_album_type_aliases_match_spotify_values() -> None:
+    """Share one provider-value vocabulary across the domain and catalog layers."""
+    assert get_args(ReleaseDatePrecision) == ("year", "month", "day")
+    assert get_args(AlbumType) == ("album", "single", "compilation")
 
 
 def test_screen_work_mention_year_policy() -> None:
@@ -116,11 +127,28 @@ def test_extraction_domain_types_preserve_nested_service_scope_identity() -> Non
         track_mention=track_mention,
         track=enriched_track,
     )
+    enriched_music_release = EnrichedMusicRelease(
+        release_title="Discovery",
+        artists=[ArtistCredit(spotify_artist_id="spotify-artist", name="Daft Punk")],
+        release_date="2001-02-26",
+        release_date_precision="day",
+        album_type="album",
+        spotify_album_id="spotify-album",
+        spotify_url="https://open.spotify.com/album/spotify-album",
+    )
+    music_release_result = MusicReleaseResult(
+        status=ResultStatus.RESOLVED,
+        music_release_mention=music_release_mention,
+        music_release=enriched_music_release,
+    )
     screen_work_results = ScreenWorkResults(
         movies=[movie_result],
         tv_series=[tv_series_result],
     )
-    music_results = MusicResults(tracks=[track_result])
+    music_results = MusicResults(
+        tracks=[track_result],
+        music_releases=[music_release_result],
+    )
     results = ExtractionResults(
         screen_works=screen_work_results,
         music=music_results,
@@ -150,6 +178,8 @@ def test_extraction_domain_types_preserve_nested_service_scope_identity() -> Non
     assert pipeline_result.results.screen_works.tv_series == [tv_series_result]
     assert pipeline_result.results.music is music_results
     assert pipeline_result.results.music.tracks == [track_result]
+    assert pipeline_result.results.music.music_releases == [music_release_result]
+    assert pipeline_result.results.music.music_releases[0].music_release is enriched_music_release
     assert mentions.screen_works is screen_work_mentions
     assert mentions.music is music_mentions
     assert mentions.music.tracks == [track_mention]

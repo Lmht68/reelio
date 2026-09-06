@@ -8,8 +8,15 @@ import pytest
 from reelio.extraction.exceptions import CatalogProviderError, PipelineTimeoutError
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.services.catalog.types import AlbumCandidate, TrackCandidate
-from reelio.extraction.services.enrichment.spotify import SpotifyTrackResolver
-from reelio.extraction.types import ArtistCredit, ResultStatus, TrackMention
+from reelio.extraction.services.enrichment.spotify import SpotifyMusicResolver
+from reelio.extraction.types import (
+    ArtistCredit,
+    MusicMentions,
+    MusicReleaseMention,
+    ResultStatus,
+    TrackMention,
+    TrackResult,
+)
 
 _MARKET = SpotifyMarket("JP")
 
@@ -20,17 +27,21 @@ class _FakeTrackCatalog:
     def __init__(
         self,
         candidate_groups: Sequence[tuple[TrackCandidate, ...]] = (),
+        album_candidate_groups: Sequence[tuple[AlbumCandidate, ...]] = (),
         error: CatalogProviderError | PipelineTimeoutError | None = None,
     ) -> None:
         """Configure candidate groups or one operational error.
 
         Args:
-            candidate_groups: Search results returned in call order.
+            candidate_groups: Track search results returned in call order.
+            album_candidate_groups: Album search results returned in call order.
             error: Typed catalog failure raised on every search when supplied.
         """
         self._candidate_groups = deque(candidate_groups)
+        self._album_candidate_groups = deque(album_candidate_groups)
         self._error = error
         self.calls: list[tuple[str, SpotifyMarket]] = []
+        self.album_calls: list[tuple[str, SpotifyMarket]] = []
 
     async def search_tracks(
         self,
@@ -44,6 +55,19 @@ class _FakeTrackCatalog:
         if not self._candidate_groups:
             return ()
         return self._candidate_groups.popleft()
+
+    async def search_albums(
+        self,
+        query: str,
+        market: SpotifyMarket,
+    ) -> tuple[AlbumCandidate, ...]:
+        """Record a search and return its configured provider result."""
+        self.album_calls.append((query, market))
+        if self._error is not None:
+            raise self._error
+        if not self._album_candidate_groups:
+            return ()
+        return self._album_candidate_groups.popleft()
 
 
 def _mention(
@@ -90,6 +114,61 @@ def _candidate(
     )
 
 
+async def _resolve_tracks(
+    resolver: SpotifyMusicResolver,
+    track_mentions: list[TrackMention],
+) -> list[TrackResult]:
+    """Resolve Track Mentions through the grouped Music Resolver interface."""
+    music_results = await resolver.resolve(
+        MusicMentions(tracks=track_mentions, music_releases=[]),
+        _MARKET,
+    )
+    return music_results.tracks
+
+
+async def test_resolver_resolves_grouped_music_mentions() -> None:
+    """Resolve Tracks and Music Releases from one grouped Music Mention input."""
+    track_mention = _mention()
+    music_release_mention = MusicReleaseMention(
+        release_title="Discovery",
+        artists=["Daft Punk"],
+        release_year=2001,
+    )
+    album_candidate = AlbumCandidate(
+        spotify_album_id="album-identity",
+        spotify_url="https://open.spotify.com/album/album-identity",
+        title="Discovery",
+        artists=(ArtistCredit(spotify_artist_id="artist-0", name="Daft Punk"),),
+        release_date="2001-02-26",
+        release_date_precision="day",
+        album_type="album",
+        images=(),
+    )
+    catalog = _FakeTrackCatalog(
+        candidate_groups=((_candidate(),),),
+        album_candidate_groups=((album_candidate,),),
+    )
+
+    results = await SpotifyMusicResolver(catalog).resolve(
+        MusicMentions(
+            tracks=[track_mention],
+            music_releases=[music_release_mention],
+        ),
+        _MARKET,
+    )
+
+    assert catalog.calls == [
+        ("track:One More Time artist:Daft Punk", _MARKET),
+    ]
+    assert catalog.album_calls == [
+        ("album:Discovery artist:Daft Punk year:2001", _MARKET),
+    ]
+    assert results.tracks[0].track is not None
+    assert results.tracks[0].track.spotify_track_id == "track-1"
+    assert results.music_releases[0].music_release is not None
+    assert results.music_releases[0].music_release.spotify_album_id == "album-identity"
+
+
 async def test_resolver_builds_field_scoped_query_and_forwards_effective_market() -> None:
     """Pass an unescaped ordered field query and effective market to Spotify."""
     catalog = _FakeTrackCatalog(
@@ -102,7 +181,7 @@ async def test_resolver_builds_field_scoped_query_and_forwards_effective_market(
             ),
         )
     )
-    resolver = SpotifyTrackResolver(catalog)
+    resolver = SpotifyMusicResolver(catalog)
     mention = _mention(
         track_title="One More Time (Radio Edit)",
         artists=("Daft Punk", "Romanthony"),
@@ -110,7 +189,7 @@ async def test_resolver_builds_field_scoped_query_and_forwards_effective_market(
         release_year=2001,
     )
 
-    results = await resolver.resolve([mention], _MARKET)
+    results = await _resolve_tracks(resolver, [mention])
 
     assert catalog.calls == [
         (
@@ -135,7 +214,7 @@ async def test_resolver_ignores_album_context_when_the_mention_omits_it() -> Non
         )
     )
 
-    results = await SpotifyTrackResolver(catalog).resolve([_mention()], _MARKET)
+    results = await _resolve_tracks(SpotifyMusicResolver(catalog), [_mention()])
 
     assert results[0].status is ResultStatus.RESOLVED
 
@@ -149,9 +228,8 @@ async def test_resolver_inspects_only_the_first_three_candidates() -> None:
         _candidate("track-4"),
     )
 
-    results = await SpotifyTrackResolver(_FakeTrackCatalog((candidates,))).resolve(
-        [_mention()],
-        _MARKET,
+    results = await _resolve_tracks(
+        SpotifyMusicResolver(_FakeTrackCatalog((candidates,))), [_mention()]
     )
 
     assert results[0].status is ResultStatus.UNRESOLVED
@@ -171,7 +249,7 @@ async def test_resolver_searches_all_exact_candidates_before_fuzzy_candidates() 
         )
     )
 
-    results = await SpotifyTrackResolver(catalog).resolve([mention], _MARKET)
+    results = await _resolve_tracks(SpotifyMusicResolver(catalog), [mention])
 
     assert results[0].track is not None
     assert results[0].track.spotify_track_id == "exact"
@@ -204,7 +282,7 @@ async def test_fuzzy_matching_requires_same_length_positional_artist_sequence(
         )
     )
 
-    results = await SpotifyTrackResolver(catalog).resolve([mention], _MARKET)
+    results = await _resolve_tracks(SpotifyMusicResolver(catalog), [mention])
 
     assert results[0].status is ResultStatus.UNRESOLVED
 
@@ -222,7 +300,7 @@ async def test_resolver_applies_optional_album_title_and_year_to_exact_matches()
         )
     )
 
-    results = await SpotifyTrackResolver(catalog).resolve([mention], _MARKET)
+    results = await _resolve_tracks(SpotifyMusicResolver(catalog), [mention])
 
     assert results[0].track is not None
     assert results[0].track.spotify_track_id == "exact"
@@ -233,7 +311,7 @@ async def test_fuzzy_matching_accepts_the_inclusive_ninety_percent_threshold() -
     mention = _mention(track_title="abcdefghij", artists=("Queen",))
     catalog = _FakeTrackCatalog(((_candidate(title="abcdefghiX", artists=("Queenz",)),),))
 
-    results = await SpotifyTrackResolver(catalog).resolve([mention], _MARKET)
+    results = await _resolve_tracks(SpotifyMusicResolver(catalog), [mention])
 
     assert results[0].status is ResultStatus.RESOLVED
 
@@ -259,7 +337,7 @@ async def test_fuzzy_matching_ignores_release_year() -> None:
         )
     )
 
-    results = await SpotifyTrackResolver(catalog).resolve([mention], _MARKET)
+    results = await _resolve_tracks(SpotifyMusicResolver(catalog), [mention])
 
     assert results[0].status is ResultStatus.RESOLVED
 
@@ -279,7 +357,7 @@ async def test_resolver_uses_provider_corrected_track_and_artist_values() -> Non
         )
     )
 
-    results = await SpotifyTrackResolver(catalog).resolve([mention], _MARKET)
+    results = await _resolve_tracks(SpotifyMusicResolver(catalog), [mention])
 
     assert results[0].track is not None
     assert results[0].track.track_title == "Bohemian Rhapsody"
@@ -292,7 +370,7 @@ async def test_resolver_returns_unresolved_result_without_candidates() -> None:
     """Keep the original Mention when Spotify returns no eligible Track."""
     mention = _mention()
 
-    results = await SpotifyTrackResolver(_FakeTrackCatalog()).resolve([mention], _MARKET)
+    results = await _resolve_tracks(SpotifyMusicResolver(_FakeTrackCatalog()), [mention])
 
     assert results[0].status is ResultStatus.UNRESOLVED
     assert results[0].track_mention is mention
@@ -310,10 +388,10 @@ async def test_resolver_propagates_operational_catalog_failures(
     catalog_error: CatalogProviderError | PipelineTimeoutError,
 ) -> None:
     """Leave typed catalog failures available to enforce atomic aggregation."""
-    resolver = SpotifyTrackResolver(_FakeTrackCatalog(error=catalog_error))
+    resolver = SpotifyMusicResolver(_FakeTrackCatalog(error=catalog_error))
 
     with pytest.raises(type(catalog_error)) as error:
-        await resolver.resolve([_mention()], _MARKET)
+        await _resolve_tracks(resolver, [_mention()])
 
     assert error.value is catalog_error
 
@@ -330,7 +408,7 @@ async def test_resolver_keeps_the_first_provider_ordered_fuzzy_candidate() -> No
         )
     )
 
-    results = await SpotifyTrackResolver(catalog).resolve([mention], _MARKET)
+    results = await _resolve_tracks(SpotifyMusicResolver(catalog), [mention])
 
     assert results[0].track is not None
     assert results[0].track.spotify_track_id == "first"
@@ -349,9 +427,8 @@ async def test_resolver_drops_later_duplicate_playable_ids_but_keeps_unresolved(
         )
     )
 
-    results = await SpotifyTrackResolver(catalog).resolve(
-        [first_mention, duplicate_mention, unresolved_mention],
-        _MARKET,
+    results = await _resolve_tracks(
+        SpotifyMusicResolver(catalog), [first_mention, duplicate_mention, unresolved_mention]
     )
 
     assert [result.track_mention for result in results] == [

@@ -204,7 +204,7 @@ async def test_pipeline_returns_ordered_movie_results_unchanged() -> None:
     )
     extraction_results = ExtractionResults(
         screen_works=screen_work_results,
-        music=MusicResults(tracks=[]),
+        music=MusicResults(tracks=[], music_releases=[]),
     )
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator(results=extraction_results)
@@ -281,7 +281,7 @@ async def test_pipeline_groups_mixed_interpretation_results() -> None:
     )
     extraction_results = ExtractionResults(
         screen_works=screen_work_results,
-        music=MusicResults(tracks=[]),
+        music=MusicResults(tracks=[], music_releases=[]),
     )
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator(results=extraction_results)

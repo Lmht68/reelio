@@ -9,10 +9,13 @@ from reelio.extraction.service import ExtractionPipelineProtocol
 from reelio.extraction.types import (
     ArtistCredit,
     EnrichedMovie,
+    EnrichedMusicRelease,
     EnrichedTrack,
     EnrichedTVSeries,
     MovieMention,
     MovieResult,
+    MusicReleaseMention,
+    MusicReleaseResult,
     PipelineResult,
     TrackMention,
     TrackResult,
@@ -26,13 +29,13 @@ _EXTRACT_RESPONSE_EXAMPLE = {
         "platform": "youtube",
         "video_id": "dQw4w9WgXcQ",
         "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        "title": "Screen Work review",
-        "description": "A review mentioning Movies and TV Series.",
+        "title": "Screen Work and Music review",
+        "description": "A review mentioning Movies, TV Series, and Music.",
         "channel": "Example channel",
         "duration_seconds": 42,
     },
     "transcript": {
-        "text": "Dune: Part One and The Last of Us are excellent.",
+        "text": "Dune: Part One, The Last of Us, One More Time, and Discovery are excellent.",
         "language": "en",
         "method": "youtube_captions",
     },
@@ -107,6 +110,39 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                     "spotify_url": "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV",
                 },
             }
+        ],
+        "music_releases": [
+            {
+                "status": "resolved",
+                "music_release_mention": {
+                    "release_title": "Discovery",
+                    "artists": ["Daft Punk"],
+                    "release_year": 2001,
+                },
+                "music_release": {
+                    "release_title": "Discovery",
+                    "artists": [
+                        {
+                            "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
+                            "name": "Daft Punk",
+                        }
+                    ],
+                    "release_date": "2001-02-26",
+                    "release_date_precision": "day",
+                    "album_type": "album",
+                    "spotify_album_id": "2noRn2Aes5aoNVsU6iWThc",
+                    "spotify_url": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc",
+                },
+            },
+            {
+                "status": "unresolved",
+                "music_release_mention": {
+                    "release_title": "Unknown Album",
+                    "artists": ["Unknown Artist"],
+                    "release_year": None,
+                },
+                "music_release": None,
+            },
         ],
     },
 }
@@ -240,6 +276,43 @@ def _to_track_result_schema(
     )
 
 
+def _to_music_release_mention_schema(
+    mention: MusicReleaseMention,
+) -> extraction_schemas.MusicReleaseMentionModel:
+    return extraction_schemas.MusicReleaseMentionModel(
+        release_title=mention.release_title,
+        artists=mention.artists,
+        release_year=mention.release_year,
+    )
+
+
+def _to_music_release_schema(
+    music_release: EnrichedMusicRelease,
+) -> extraction_schemas.MusicReleaseModel:
+    return extraction_schemas.MusicReleaseModel(
+        release_title=music_release.release_title,
+        artists=[_to_artist_credit_schema(artist) for artist in music_release.artists],
+        release_date=music_release.release_date,
+        release_date_precision=music_release.release_date_precision,
+        album_type=music_release.album_type,
+        spotify_album_id=music_release.spotify_album_id,
+        spotify_url=music_release.spotify_url,
+    )
+
+
+def _to_music_release_result_schema(
+    result: MusicReleaseResult,
+) -> extraction_schemas.MusicReleaseResultModel:
+    music_release = (
+        _to_music_release_schema(result.music_release) if result.music_release is not None else None
+    )
+    return extraction_schemas.MusicReleaseResultModel(
+        status=result.status,
+        music_release_mention=_to_music_release_mention_schema(result.music_release_mention),
+        music_release=music_release,
+    )
+
+
 def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
     return extraction_schemas.ExtractResponse(
         market=result.market,
@@ -263,6 +336,10 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
                 _to_tv_series_result_schema(item) for item in result.results.screen_works.tv_series
             ],
             tracks=[_to_track_result_schema(item) for item in result.results.music.tracks],
+            music_releases=[
+                _to_music_release_result_schema(item)
+                for item in result.results.music.music_releases
+            ],
         ),
     )
 
@@ -271,27 +348,35 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
     "/extract",
     status_code=status.HTTP_200_OK,
     response_model=extraction_schemas.ExtractResponse,
-    summary="Extract mentioned Movies, TV Series, and Tracks from a public video Source",
+    summary="Extract mentioned Movies, TV Series, Tracks, and Music Releases from a public video Source",
     description=(
         "Accept a public YouTube, Instagram, Facebook, TikTok, or X video URL and "
         "return the normalized Source, the Transcript with its acquisition method, "
-        "the effective Spotify market, and grouped Movie, TV Series, and Track "
-        "results. Each list preserves first-reference order within its kind, with no "
-        "cross-kind ordering. The optional market must use uppercase ISO 3166-1 "
-        "alpha-2 syntax; an omitted market uses configured US. Resolved TV Series "
-        "report their TV First Air Year, an optional final air year where null means "
-        "unavailable rather than proof of continuation, Creators from TMDB "
-        "created_by, and up to five aggregate cast names in provider order without "
-        "role filtering or person deduplication. Track Results retain their "
-        "interpreted Track Mention and expose Spotify's canonical Track title, "
-        "ordered artist credits, playable Track ID, and direct URL only after a "
-        "verified match. Any TMDB or Spotify provider failure fails the complete "
-        "request."
+        "the effective Spotify market, and grouped Movie, TV Series, Track, and "
+        "Music Release results. Each list preserves first-reference order within "
+        "its kind, with no cross-kind ordering. The optional market must use "
+        "uppercase ISO 3166-1 alpha-2 syntax; an omitted market uses configured "
+        "US. Resolved TV Series report their TV First Air Year, an optional final "
+        "air year where null means unavailable rather than proof of continuation, "
+        "Creators from TMDB created_by, and up to five aggregate cast names in "
+        "provider order without role filtering or person deduplication. Track "
+        "Results retain their interpreted Track Mention and expose Spotify's "
+        "canonical Track title, ordered artist credits, playable Track ID, and "
+        "direct URL only after a verified match. Music Release Results retain "
+        "their interpreted Music Release Mention and expose one market-specific "
+        "Spotify Album identity, provider-reported release date and precision, "
+        "album type, and direct URL only after a verified match; the contract "
+        "makes no worldwide-edition, sibling-release, release-family, "
+        "inferred-subtype, or earliest-worldwide-date claims. Any TMDB or Spotify "
+        "provider failure fails the complete request."
     ),
-    response_description="Effective market, Source, transcript, and grouped results.",
+    response_description=(
+        "Effective market, Source, transcript, and grouped Movie, TV Series, "
+        "Track, and Music Release results."
+    ),
     responses={
         200: {
-            "description": "Grouped Movie, TV Series, and Track results.",
+            "description": ("Grouped Movie, TV Series, Track, and Music Release results."),
             "content": {
                 "application/json": {"example": _EXTRACT_RESPONSE_EXAMPLE},
             },
@@ -329,7 +414,7 @@ async def extract(
     payload: extraction_schemas.ExtractRequest,
     pipeline: Annotated[ExtractionPipelineProtocol, Depends(get_pipeline)],
 ) -> extraction_schemas.ExtractResponse:
-    """Extract structured Movie, TV Series, and Track Mentions from a source URL.
+    """Extract structured Movie, TV Series, Track, and Music Release Mentions from a source URL.
 
     Args:
         payload: Validated extraction request containing source URL and optional market.

@@ -6,12 +6,12 @@ from reelio.extraction.types import (
     ExtractionResults,
     MovieResult,
     MusicMentions,
+    MusicReleaseResult,
     MusicResults,
     ResultStatus,
     ScreenWorkMentions,
     ScreenWorkResults,
     Source,
-    TrackMention,
     TrackResult,
     Transcript,
     TVSeriesResult,
@@ -103,7 +103,15 @@ def _unresolved_music_results(music_mentions: MusicMentions) -> MusicResults:
                 track=None,
             )
             for track_mention in music_mentions.tracks
-        ]
+        ],
+        music_releases=[
+            MusicReleaseResult(
+                status=ResultStatus.UNRESOLVED,
+                music_release_mention=music_release_mention,
+                music_release=None,
+            )
+            for music_release_mention in music_mentions.music_releases
+        ],
     )
 
 
@@ -154,15 +162,15 @@ class FakeScreenWorkResolver:
         self.closed = True
 
 
-class FakeTrackResolver:
-    """Provide deterministic Track resolution for aggregation tests."""
+class FakeMusicResolver:
+    """Provide deterministic grouped Music resolution for aggregation tests."""
 
     def __init__(
         self,
-        results: list[TrackResult] | None = None,
+        results: MusicResults | None = None,
         error: Exception | None = None,
     ) -> None:
-        """Configure returned Track Results or a raised exception.
+        """Configure returned Music Results or a raised exception.
 
         Args:
             results: Results returned by ``resolve`` when provided.
@@ -170,27 +178,20 @@ class FakeTrackResolver:
         """
         self.results = results
         self.error = error
-        self.calls: list[tuple[list[TrackMention], SpotifyMarket]] = []
+        self.calls: list[tuple[MusicMentions, SpotifyMarket]] = []
 
     async def resolve(
         self,
-        track_mentions: list[TrackMention],
+        music_mentions: MusicMentions,
         market: SpotifyMarket,
-    ) -> list[TrackResult]:
-        """Record and resolve ordered Track Mentions for one effective market."""
-        self.calls.append((track_mentions, market))
+    ) -> MusicResults:
+        """Record and resolve grouped Music Mentions for one effective market."""
+        self.calls.append((music_mentions, market))
         if self.error is not None:
             raise self.error
         if self.results is not None:
             return self.results
-        return [
-            TrackResult(
-                status=ResultStatus.UNRESOLVED,
-                track_mention=track_mention,
-                track=None,
-            )
-            for track_mention in track_mentions
-        ]
+        return _unresolved_music_results(music_mentions)
 
 
 class FakeResultAggregator:

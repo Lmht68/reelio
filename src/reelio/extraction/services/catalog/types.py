@@ -1,12 +1,8 @@
 """Application-owned candidates returned by catalog provider boundaries."""
 
 from dataclasses import dataclass
-from typing import Literal
 
-from reelio.extraction.types import ArtistCredit
-
-ReleaseDatePrecision = Literal["year", "month", "day"]
-AlbumType = Literal["album", "single", "compilation"]
+from reelio.extraction.types import AlbumType, ArtistCredit, ReleaseDatePrecision
 
 
 @dataclass(frozen=True, slots=True)

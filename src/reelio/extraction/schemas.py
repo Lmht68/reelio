@@ -3,7 +3,13 @@
 from pydantic import BaseModel, Field
 
 from reelio.extraction.market import SpotifyMarket
-from reelio.extraction.types import Platform, ResultStatus, TranscriptMethod
+from reelio.extraction.types import (
+    AlbumType,
+    Platform,
+    ReleaseDatePrecision,
+    ResultStatus,
+    TranscriptMethod,
+)
 
 
 class ExtractRequest(BaseModel):
@@ -163,12 +169,41 @@ class TrackResultModel(BaseModel):
     track: TrackModel | None
 
 
+class MusicReleaseMentionModel(BaseModel):
+    """One interpreted Music Release Mention with explicit optional year."""
+
+    release_title: str
+    artists: list[str]
+    release_year: int | None
+
+
+class MusicReleaseModel(BaseModel):
+    """Spotify-verified metadata for one Album Music Release."""
+
+    release_title: str
+    artists: list[ArtistCreditModel]
+    release_date: str
+    release_date_precision: ReleaseDatePrecision
+    album_type: AlbumType
+    spotify_album_id: str
+    spotify_url: str
+
+
+class MusicReleaseResultModel(BaseModel):
+    """One interpreted Music Release Mention and its resolution outcome."""
+
+    status: ResultStatus
+    music_release_mention: MusicReleaseMentionModel
+    music_release: MusicReleaseModel | None
+
+
 class ExtractionResultsModel(BaseModel):
     """Resolved results grouped in independent first-reference order."""
 
     movies: list[MovieResultModel]
     tv_series: list[TVSeriesResultModel]
     tracks: list[TrackResultModel]
+    music_releases: list[MusicReleaseResultModel]
 
 
 class ExtractResponse(BaseModel):

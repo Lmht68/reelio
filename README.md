@@ -1,6 +1,6 @@
 # Reelio
 
-Reelio is a FastAPI service that extracts Movie, TV Series, and Track Mentions from public social-media videos, verifies Screen Works against TMDB and Tracks against Spotify, and returns grouped enriched results.
+Reelio is a FastAPI service that extracts Movie, TV Series, Track, and Music Release Mentions from public social-media videos, verifies Screen Works against TMDB and Music against Spotify, and returns grouped enriched results.
 
 ## Overview
 
@@ -14,11 +14,13 @@ The extraction pipeline:
 6. Validates the structured LLM response, deduplicates Mentions independently per kind, and preserves first-reference order within each kind.
 7. Searches TMDB's Movie and TV endpoints and resolves a Screen Work Mention only when its canonical title or a provider alternative title matches together with its release or first air year.
 8. Searches Spotify's Track endpoint in the effective market and resolves a Track Mention only after a verified candidate match.
-9. Returns grouped `movies`, `tv_series`, and `tracks` result lists, resolving each Mention to enriched metadata or `null` independently within its kind.
+9. Searches Spotify's Album endpoint in the effective market and resolves a direct Music Release Mention only after a verified candidate match.
+10. Returns grouped `movies`, `tv_series`, `tracks`, and `music_releases` result lists, resolving each Mention to enriched metadata or `null` independently within its kind.
 
 Movie results can include the title, release year, cast, directors, description, poster URL, TMDB and IMDb identifiers and links, and the TMDB score.
 TV Series results can include the title, first air year, optional final air year, aggregate cast, Creators, description, poster URL, TMDB and IMDb identifiers and links, and the TMDB score.
 Track results can include Spotify's canonical Track title, ordered artist credits, a playable Spotify Track ID, and a direct Spotify URL.
+Music Release results can include Spotify's canonical Album title, ordered artist credits, provider-reported release date and precision, album type, a Spotify Album ID, and a direct Spotify URL.
 
 Mention interpretation supports two explicitly selected providers:
 
@@ -91,7 +93,7 @@ Successful response:
 {"status": "ok"}
 ```
 
-### Extract Movie, TV Series, and Track Mentions
+### Extract Movie, TV Series, Track, and Music Release Mentions
 
 ```http
 POST /api/extract
@@ -113,7 +115,7 @@ The response contains:
   Omit it to use configured `REELIO_SPOTIFY_DEFAULT_MARKET`, which defaults to `US`.
 - `source`: The canonical platform, external video ID, URL, title, description, channel, and duration.
 - `transcript`: The normalized transcript text, detected language, and acquisition method.
-- `results`: A grouped object with three always-present lists, `movies`, `tv_series`, and `tracks`.
+- `results`: A grouped object with four always-present lists, `movies`, `tv_series`, `tracks`, and `music_releases`.
   Each list is deduplicated independently and preserves first-reference order within its kind.
   There is no cross-kind ordering.
 - `results.movies[].movie_mention`: The canonical Movie title and release year interpreted by the LLM.
@@ -130,6 +132,12 @@ The response contains:
   A resolved Track has Spotify's canonical Track title, ordered artist credits, playable Track ID, and direct URL.
   Spotify searches use the effective market, examine only the first three provider-ordered candidates, and require an exact or every-field fuzzy identity match.
   An unresolved Track preserves its original Track Mention.
+- `results.music_releases[].music_release_mention`: The interpreted direct Music Release title, ordered release artists, and explicit nullable release year.
+- `results.music_releases[].music_release`: Spotify-backed enrichment for a resolved Mention, or `null` for an unresolved Mention.
+  A resolved Music Release is one market-available Spotify Album with Spotify's canonical Album title, ordered artist credits, provider-reported `release_date` and `release_date_precision`, `album_type`, a Spotify Album ID, and a direct URL.
+  Spotify Album searches use the effective market, examine only the first three provider-ordered candidates, and require an exact or every-textual-field fuzzy identity match.
+  The contract makes no worldwide-edition, sibling-release, release-family, inferred-subtype, or earliest-worldwide-date claims.
+  An unresolved Music Release preserves its original Mention.
 - Any TMDB or Spotify provider HTTP, timeout, or required-response validation failure fails the complete request rather than returning partial category results.
 
 Compact success example:
@@ -141,13 +149,13 @@ Compact success example:
     "platform": "youtube",
     "video_id": "dQw4w9WgXcQ",
     "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    "title": "Movie, TV Series, and Track review",
-    "description": "A review mentioning a Movie, a TV Series, and a Track.",
+    "title": "Movie, TV Series, Track, and Music Release review",
+    "description": "A review mentioning a Movie, a TV Series, a Track, and a Music Release.",
     "channel": "Example channel",
     "duration_seconds": 42
   },
   "transcript": {
-    "text": "Dune: Part One, The Last of Us, and One More Time are excellent.",
+    "text": "Dune: Part One, The Last of Us, One More Time, and Discovery are excellent.",
     "language": "en",
     "method": "youtube_captions"
   },
@@ -226,6 +234,39 @@ Compact success example:
           "release_year": null
         },
         "track": null
+      }
+    ],
+    "music_releases": [
+      {
+        "status": "resolved",
+        "music_release_mention": {
+          "release_title": "Discovery",
+          "artists": ["Daft Punk"],
+          "release_year": 2001
+        },
+        "music_release": {
+          "release_title": "Discovery",
+          "artists": [
+            {
+              "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
+              "name": "Daft Punk"
+            }
+          ],
+          "release_date": "2001-02-26",
+          "release_date_precision": "day",
+          "album_type": "album",
+          "spotify_album_id": "2noRn2Aes5aoNVsU6iWThc",
+          "spotify_url": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc"
+        }
+      },
+      {
+        "status": "unresolved",
+        "music_release_mention": {
+          "release_title": "Unknown Album",
+          "artists": ["Unknown Artist"],
+          "release_year": null
+        },
+        "music_release": null
       }
     ]
   }
