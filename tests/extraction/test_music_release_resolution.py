@@ -2,13 +2,16 @@
 
 from collections import deque
 from collections.abc import Sequence
-from typing import Literal
 
 import pytest
 
 from reelio.extraction.exceptions import CatalogProviderError, PipelineTimeoutError
 from reelio.extraction.market import SpotifyMarket
-from reelio.extraction.services.catalog.types import AlbumCandidate, TrackCandidate
+from reelio.extraction.services.catalog.types import (
+    AlbumCandidate,
+    ImageCandidate,
+    TrackCandidate,
+)
 from reelio.extraction.services.enrichment.spotify import SpotifyMusicResolver
 from reelio.extraction.types import (
     ArtistCredit,
@@ -79,8 +82,7 @@ def _candidate(
     title: str = "Discovery",
     artists: Sequence[str] = ("Daft Punk",),
     release_date: str = "2001-02-26",
-    release_date_precision: Literal["year", "month", "day"] = "day",
-    album_type: Literal["album", "single", "compilation"] = "album",
+    images: tuple[ImageCandidate, ...] = (),
 ) -> AlbumCandidate:
     """Create one Spotify Album Candidate for resolver tests."""
     return AlbumCandidate(
@@ -92,9 +94,9 @@ def _candidate(
             for index, artist in enumerate(artists)
         ),
         release_date=release_date,
-        release_date_precision=release_date_precision,
-        album_type=album_type,
-        images=(),
+        release_date_precision="day",
+        album_type="album",
+        images=images,
     )
 
 
@@ -340,8 +342,18 @@ async def test_resolver_uses_provider_corrected_release_and_artist_values() -> N
                     title="Discovery",
                     artists=("Daft Punk",),
                     release_date="2001-02-26",
-                    release_date_precision="day",
-                    album_type="album",
+                    images=(
+                        ImageCandidate(
+                            url="https://i.scdn.co/image/primary",
+                            width=640,
+                            height=640,
+                        ),
+                        ImageCandidate(
+                            url="https://i.scdn.co/image/secondary",
+                            width=300,
+                            height=300,
+                        ),
+                    ),
                 ),
             ),
         )
@@ -359,6 +371,19 @@ async def test_resolver_uses_provider_corrected_release_and_artist_values() -> N
     assert results[0].music_release.album_type == "album"
     assert results[0].music_release.spotify_album_id == "album-identity"
     assert results[0].music_release.spotify_url == "https://open.spotify.com/album/album-identity"
+    assert results[0].music_release.cover_url == "https://i.scdn.co/image/primary"
+
+
+async def test_resolver_keeps_music_releases_resolved_without_album_images() -> None:
+    """Expose a null cover without changing a direct Music Release status."""
+    catalog = _FakeAlbumCatalog(((_candidate(images=()),),))
+
+    results = await _resolve_music_releases(SpotifyMusicResolver(catalog), [_mention()])
+
+    resolved_music_release = results[0].music_release
+    assert results[0].status is ResultStatus.RESOLVED
+    assert resolved_music_release is not None
+    assert resolved_music_release.cover_url is None
 
 
 async def test_resolver_returns_unresolved_result_without_candidates() -> None:

@@ -134,6 +134,23 @@ def _build_album_query(music_release_mention: MusicReleaseMention) -> str:
     return " ".join(query_terms)
 
 
+def _to_enriched_music_release(
+    album_candidate: AlbumCandidate,
+) -> EnrichedMusicRelease:
+    """Translate one accepted Spotify Album Candidate into a Music Release."""
+    cover_url = album_candidate.images[0].url if album_candidate.images else None
+    return EnrichedMusicRelease(
+        release_title=album_candidate.title,
+        artists=list(album_candidate.artists),
+        release_date=album_candidate.release_date,
+        release_date_precision=album_candidate.release_date_precision,
+        album_type=album_candidate.album_type,
+        spotify_album_id=album_candidate.spotify_album_id,
+        spotify_url=album_candidate.spotify_url,
+        cover_url=cover_url,
+    )
+
+
 def _resolve_track_mention(
     track_mention: TrackMention,
     candidates: tuple[TrackCandidate, ...],
@@ -163,6 +180,8 @@ def _resolve_track_mention(
             track_mention=track_mention,
             track=None,
         )
+    preferred_music_release = _to_enriched_music_release(candidate.album)
+
     return TrackResult(
         status=ResultStatus.RESOLVED,
         track_mention=track_mention,
@@ -171,6 +190,8 @@ def _resolve_track_mention(
             artists=list(candidate.artists),
             spotify_track_id=candidate.spotify_track_id,
             spotify_url=candidate.spotify_url,
+            preferred_music_release=preferred_music_release,
+            cover_url=preferred_music_release.cover_url,
         ),
     )
 
@@ -207,15 +228,7 @@ def _resolve_music_release_mention(
     return MusicReleaseResult(
         status=ResultStatus.RESOLVED,
         music_release_mention=music_release_mention,
-        music_release=EnrichedMusicRelease(
-            release_title=candidate.title,
-            artists=list(candidate.artists),
-            release_date=candidate.release_date,
-            release_date_precision=candidate.release_date_precision,
-            album_type=candidate.album_type,
-            spotify_album_id=candidate.spotify_album_id,
-            spotify_url=candidate.spotify_url,
-        ),
+        music_release=_to_enriched_music_release(candidate),
     )
 
 

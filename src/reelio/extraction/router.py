@@ -108,8 +108,34 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                     ],
                     "spotify_track_id": "0DiWol3AO6WpXZgp0goxAV",
                     "spotify_url": "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV",
+                    "preferred_music_release": {
+                        "release_title": "Discovery",
+                        "artists": [
+                            {
+                                "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
+                                "name": "Daft Punk",
+                            }
+                        ],
+                        "release_date": "2001-02-26",
+                        "release_date_precision": "day",
+                        "album_type": "album",
+                        "spotify_album_id": "2noRn2Aes5aoNVsU6iWThc",
+                        "spotify_url": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc",
+                        "cover_url": "https://i.scdn.co/image/discovery-cover",
+                    },
+                    "cover_url": "https://i.scdn.co/image/discovery-cover",
                 },
-            }
+            },
+            {
+                "status": "unresolved",
+                "track_mention": {
+                    "track_title": "Unknown Track",
+                    "artists": ["Unknown Artist"],
+                    "release_title": None,
+                    "release_year": None,
+                },
+                "track": None,
+            },
         ],
         "music_releases": [
             {
@@ -132,6 +158,7 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                     "album_type": "album",
                     "spotify_album_id": "2noRn2Aes5aoNVsU6iWThc",
                     "spotify_url": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc",
+                    "cover_url": "https://i.scdn.co/image/discovery-cover",
                 },
             },
             {
@@ -234,12 +261,29 @@ def _to_tv_series_schema(
     )
 
 
+def _to_music_release_schema(
+    music_release: EnrichedMusicRelease,
+) -> extraction_schemas.MusicReleaseModel:
+    return extraction_schemas.MusicReleaseModel(
+        release_title=music_release.release_title,
+        artists=[_to_artist_credit_schema(artist) for artist in music_release.artists],
+        release_date=music_release.release_date,
+        release_date_precision=music_release.release_date_precision,
+        album_type=music_release.album_type,
+        spotify_album_id=music_release.spotify_album_id,
+        spotify_url=music_release.spotify_url,
+        cover_url=music_release.cover_url,
+    )
+
+
 def _to_track_schema(track: EnrichedTrack) -> extraction_schemas.TrackModel:
     return extraction_schemas.TrackModel(
         track_title=track.track_title,
         artists=[_to_artist_credit_schema(artist) for artist in track.artists],
         spotify_track_id=track.spotify_track_id,
         spotify_url=track.spotify_url,
+        preferred_music_release=_to_music_release_schema(track.preferred_music_release),
+        cover_url=track.cover_url,
     )
 
 
@@ -283,20 +327,6 @@ def _to_music_release_mention_schema(
         release_title=mention.release_title,
         artists=mention.artists,
         release_year=mention.release_year,
-    )
-
-
-def _to_music_release_schema(
-    music_release: EnrichedMusicRelease,
-) -> extraction_schemas.MusicReleaseModel:
-    return extraction_schemas.MusicReleaseModel(
-        release_title=music_release.release_title,
-        artists=[_to_artist_credit_schema(artist) for artist in music_release.artists],
-        release_date=music_release.release_date,
-        release_date_precision=music_release.release_date_precision,
-        album_type=music_release.album_type,
-        spotify_album_id=music_release.spotify_album_id,
-        spotify_url=music_release.spotify_url,
     )
 
 
@@ -362,13 +392,21 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         "provider order without role filtering or person deduplication. Track "
         "Results retain their interpreted Track Mention and expose Spotify's "
         "canonical Track title, ordered artist credits, playable Track ID, and "
-        "direct URL only after a verified match. Music Release Results retain "
-        "their interpreted Music Release Mention and expose one market-specific "
-        "Spotify Album identity, provider-reported release date and precision, "
-        "album type, and direct URL only after a verified match; the contract "
-        "makes no worldwide-edition, sibling-release, release-family, "
-        "inferred-subtype, or earliest-worldwide-date claims. Any TMDB or Spotify "
-        "provider failure fails the complete request."
+        "direct URL after a verified match. A resolved Track's "
+        "preferred_music_release is the Spotify Album attached to its accepted "
+        "Track Candidate. Mention release context constrains Track Candidate "
+        "matching, while the preferred Music Release always comes from that "
+        "accepted attached Album. Track and Music Release cover_url values are "
+        "the first provider-ordered Spotify-hosted Album image URL, or null when "
+        "Spotify returns no Album images; a Track's cover_url equals its preferred "
+        "Music Release cover_url, and the Album spotify_url is its artwork "
+        "link-back. Music Release Results retain their interpreted Music Release "
+        "Mention and expose one independently matched, market-specific Spotify "
+        "Album identity, provider-reported release date and precision, album type, "
+        "and direct URL after a verified match; the contract makes no "
+        "worldwide-edition, sibling-release, release-family, inferred-subtype, or "
+        "earliest-worldwide-date claims. Any TMDB or Spotify provider failure "
+        "fails the complete request."
     ),
     response_description=(
         "Effective market, Source, transcript, and grouped Movie, TV Series, "

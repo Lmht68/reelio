@@ -54,10 +54,15 @@ def _track_payload(track_id: str) -> dict[str, object]:
             "album_type": "album",
             "images": [
                 {
-                    "url": "https://i.scdn.co/image/cover",
+                    "url": "https://i.scdn.co/image/cover-primary",
                     "width": 640,
                     "height": 640,
-                }
+                },
+                {
+                    "url": "https://i.scdn.co/image/cover-secondary",
+                    "width": 300,
+                    "height": 300,
+                },
             ],
         },
     }
@@ -110,7 +115,10 @@ async def test_catalog_reuses_token_and_returns_playable_track_candidate() -> No
     assert candidate.album.release_date == "1989-04-25"
     assert candidate.album.release_date_precision == "day"
     assert candidate.album.album_type == "album"
-    assert candidate.album.images[0].url == "https://i.scdn.co/image/cover"
+    assert [image.url for image in candidate.album.images] == [
+        "https://i.scdn.co/image/cover-primary",
+        "https://i.scdn.co/image/cover-secondary",
+    ]
     assert not hasattr(candidate, "linked_from")
     assert len([request for request in requests if request.method == "POST"]) == 1
     assert len([request for request in requests if request.method == "GET"]) == 2

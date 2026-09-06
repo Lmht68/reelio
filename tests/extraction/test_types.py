@@ -116,17 +116,6 @@ def test_extraction_domain_types_preserve_nested_service_scope_identity() -> Non
         tv_series_mention=tv_series_mention,
         tv_series=enriched_tv_series,
     )
-    enriched_track = EnrichedTrack(
-        track_title="One More Time",
-        artists=[ArtistCredit(spotify_artist_id="spotify-artist", name="Daft Punk")],
-        spotify_track_id="spotify-track",
-        spotify_url="https://open.spotify.com/track/spotify-track",
-    )
-    track_result = TrackResult(
-        status=ResultStatus.RESOLVED,
-        track_mention=track_mention,
-        track=enriched_track,
-    )
     enriched_music_release = EnrichedMusicRelease(
         release_title="Discovery",
         artists=[ArtistCredit(spotify_artist_id="spotify-artist", name="Daft Punk")],
@@ -135,6 +124,20 @@ def test_extraction_domain_types_preserve_nested_service_scope_identity() -> Non
         album_type="album",
         spotify_album_id="spotify-album",
         spotify_url="https://open.spotify.com/album/spotify-album",
+        cover_url="https://i.scdn.co/image/discovery-cover",
+    )
+    enriched_track = EnrichedTrack(
+        track_title="One More Time",
+        artists=[ArtistCredit(spotify_artist_id="spotify-artist", name="Daft Punk")],
+        spotify_track_id="spotify-track",
+        spotify_url="https://open.spotify.com/track/spotify-track",
+        preferred_music_release=enriched_music_release,
+        cover_url=enriched_music_release.cover_url,
+    )
+    track_result = TrackResult(
+        status=ResultStatus.RESOLVED,
+        track_mention=track_mention,
+        track=enriched_track,
     )
     music_release_result = MusicReleaseResult(
         status=ResultStatus.RESOLVED,
@@ -179,7 +182,13 @@ def test_extraction_domain_types_preserve_nested_service_scope_identity() -> Non
     assert pipeline_result.results.music is music_results
     assert pipeline_result.results.music.tracks == [track_result]
     assert pipeline_result.results.music.music_releases == [music_release_result]
-    assert pipeline_result.results.music.music_releases[0].music_release is enriched_music_release
+    resolved_track = pipeline_result.results.music.tracks[0].track
+    resolved_music_release = pipeline_result.results.music.music_releases[0].music_release
+    assert resolved_track is enriched_track
+    assert resolved_music_release is enriched_music_release
+    assert resolved_track.preferred_music_release is enriched_music_release
+    assert resolved_track.cover_url == enriched_music_release.cover_url
+    assert resolved_music_release.cover_url == enriched_music_release.cover_url
     assert mentions.screen_works is screen_work_mentions
     assert mentions.music is music_mentions
     assert mentions.music.tracks == [track_mention]

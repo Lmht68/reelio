@@ -19,8 +19,8 @@ The extraction pipeline:
 
 Movie results can include the title, release year, cast, directors, description, poster URL, TMDB and IMDb identifiers and links, and the TMDB score.
 TV Series results can include the title, first air year, optional final air year, aggregate cast, Creators, description, poster URL, TMDB and IMDb identifiers and links, and the TMDB score.
-Track results can include Spotify's canonical Track title, ordered artist credits, a playable Spotify Track ID, and a direct Spotify URL.
-Music Release results can include Spotify's canonical Album title, ordered artist credits, provider-reported release date and precision, album type, a Spotify Album ID, and a direct Spotify URL.
+Track results can include Spotify's canonical Track title, ordered artist credits, a playable Spotify Track ID and URL, the accepted Candidate's attached Album as `preferred_music_release`, and a Spotify-hosted cover URL.
+Music Release results can include Spotify's canonical Album title, ordered artist credits, provider-reported release date and precision, album type, a Spotify Album ID and URL, and a Spotify-hosted cover URL.
 
 Mention interpretation supports two explicitly selected providers:
 
@@ -129,12 +129,17 @@ The response contains:
   TMDB and IMDb identifiers and links are included when available, along with the TMDB score.
 - `results.tracks[].track_mention`: The interpreted Track title, ordered Track artists, and explicit nullable release title and year context.
 - `results.tracks[].track`: Spotify-backed enrichment for a resolved Mention, or `null` for an unresolved Mention.
-  A resolved Track has Spotify's canonical Track title, ordered artist credits, playable Track ID, and direct URL.
+  A resolved Track has Spotify's canonical Track title, ordered artist credits, playable Track ID and URL, `preferred_music_release`, and `cover_url`.
+  `preferred_music_release` is the Album attached to the accepted Spotify Track Candidate and contains its canonical title, ordered artist credits, provider-reported release metadata, Spotify Album identity, and Album `spotify_url`.
+  The Track `cover_url` equals its Preferred Music Release `cover_url`, which is the first provider-ordered Spotify-hosted Album image URL or `null` when Spotify returns no Album images.
+  Mention release context only constrains Track Candidate matching; the Preferred Music Release always comes from the accepted Candidate's attached Album.
   Spotify searches use the effective market, examine only the first three provider-ordered candidates, and require an exact or every-field fuzzy identity match.
   An unresolved Track preserves its original Track Mention.
 - `results.music_releases[].music_release_mention`: The interpreted direct Music Release title, ordered release artists, and explicit nullable release year.
 - `results.music_releases[].music_release`: Spotify-backed enrichment for a resolved Mention, or `null` for an unresolved Mention.
-  A resolved Music Release is one market-available Spotify Album with Spotify's canonical Album title, ordered artist credits, provider-reported `release_date` and `release_date_precision`, `album_type`, a Spotify Album ID, and a direct URL.
+  A resolved Music Release is one independently matched market-available Spotify Album with Spotify's canonical Album title, ordered artist credits, provider-reported `release_date` and `release_date_precision`, `album_type`, a Spotify Album ID and URL, and `cover_url`.
+  `cover_url` is the first provider-ordered Spotify-hosted Album image URL or `null` when Spotify returns no Album images, and the Album `spotify_url` is the direct artwork link-back.
+  A direct Music Release is never synthesized from a Track's Preferred Music Release.
   Spotify Album searches use the effective market, examine only the first three provider-ordered candidates, and require an exact or every-textual-field fuzzy identity match.
   The contract makes no worldwide-edition, sibling-release, release-family, inferred-subtype, or earliest-worldwide-date claims.
   An unresolved Music Release preserves its original Mention.
@@ -222,7 +227,23 @@ Compact success example:
             }
           ],
           "spotify_track_id": "0DiWol3AO6WpXZgp0goxAV",
-          "spotify_url": "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV"
+          "spotify_url": "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV",
+          "preferred_music_release": {
+            "release_title": "Discovery",
+            "artists": [
+              {
+                "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
+                "name": "Daft Punk"
+              }
+            ],
+            "release_date": "2001-02-26",
+            "release_date_precision": "day",
+            "album_type": "album",
+            "spotify_album_id": "2noRn2Aes5aoNVsU6iWThc",
+            "spotify_url": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc",
+            "cover_url": "https://i.scdn.co/image/discovery-cover"
+          },
+          "cover_url": "https://i.scdn.co/image/discovery-cover"
         }
       },
       {
@@ -256,7 +277,8 @@ Compact success example:
           "release_date_precision": "day",
           "album_type": "album",
           "spotify_album_id": "2noRn2Aes5aoNVsU6iWThc",
-          "spotify_url": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc"
+          "spotify_url": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc",
+          "cover_url": "https://i.scdn.co/image/discovery-cover"
         }
       },
       {

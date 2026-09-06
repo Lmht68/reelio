@@ -152,23 +152,6 @@ class TrackMentionModel(BaseModel):
     release_year: int | None
 
 
-class TrackModel(BaseModel):
-    """Spotify-verified metadata for one playable Track."""
-
-    track_title: str
-    artists: list[ArtistCreditModel]
-    spotify_track_id: str
-    spotify_url: str
-
-
-class TrackResultModel(BaseModel):
-    """One interpreted Track Mention and its resolution outcome."""
-
-    status: ResultStatus
-    track_mention: TrackMentionModel
-    track: TrackModel | None
-
-
 class MusicReleaseMentionModel(BaseModel):
     """One interpreted Music Release Mention with explicit optional year."""
 
@@ -187,6 +170,38 @@ class MusicReleaseModel(BaseModel):
     album_type: AlbumType
     spotify_album_id: str
     spotify_url: str
+    cover_url: str | None = Field(
+        description=(
+            "First provider-ordered Spotify Album image URL. Null when Spotify "
+            "does not return Album images."
+        )
+    )
+
+
+class TrackModel(BaseModel):
+    """Spotify-verified metadata for one playable Track and its preferred release."""
+
+    track_title: str
+    artists: list[ArtistCreditModel]
+    spotify_track_id: str
+    spotify_url: str
+    preferred_music_release: MusicReleaseModel = Field(
+        description="Album attached to the accepted Spotify Track Candidate."
+    )
+    cover_url: str | None = Field(
+        description=(
+            "First provider-ordered Spotify Album image URL from the preferred "
+            "Music Release. Null when Spotify does not return Album images."
+        )
+    )
+
+
+class TrackResultModel(BaseModel):
+    """One interpreted Track Mention and its resolution outcome."""
+
+    status: ResultStatus
+    track_mention: TrackMentionModel
+    track: TrackModel | None
 
 
 class MusicReleaseResultModel(BaseModel):

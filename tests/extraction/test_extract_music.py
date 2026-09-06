@@ -141,41 +141,74 @@ def _interpretation_settings() -> InterpretationConfig:
     return settings_type(_env_file=None)
 
 
-def _spotify_track_payload() -> dict[str, object]:
-    """Return one Spotify Track payload that exactly matches the interpreted Track."""
+def _spotify_images(image_set: str) -> list[dict[str, int | str]]:
+    """Return provider-ordered Spotify image payloads for one Album."""
+    return [
+        {
+            "url": f"https://i.scdn.co/image/{image_set}-primary",
+            "width": 640,
+            "height": 640,
+        },
+        {
+            "url": f"https://i.scdn.co/image/{image_set}-secondary",
+            "width": 300,
+            "height": 300,
+        },
+    ]
+
+
+def _spotify_track_payload(include_images: bool) -> dict[str, object]:
+    """Return one relinked Spotify Track payload matching the interpreted Track."""
     return {
-        "id": "0DiWol3AO6WpXZgp0goxAV",
+        "id": "playable-track",
         "name": "One More Time",
         "artists": [{"id": "4tZwfgrHOc3mvqYlEYSvVi", "name": "Daft Punk"}],
-        "external_urls": {"spotify": "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV"},
+        "external_urls": {"spotify": "https://open.spotify.com/track/playable-track"},
+        "linked_from": {"id": "original-track"},
         "album": {
-            "id": "2noRn2Aes5aoNVsU6iWThc",
+            "id": "attached-album",
             "name": "Discovery",
             "artists": [{"id": "4tZwfgrHOc3mvqYlEYSvVi", "name": "Daft Punk"}],
-            "external_urls": {"spotify": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc"},
+            "external_urls": {"spotify": "https://open.spotify.com/album/attached-album"},
             "release_date": "2001-02-26",
             "release_date_precision": "day",
             "album_type": "album",
-            "images": [],
+            "images": _spotify_images("attached") if include_images else [],
         },
     }
 
 
-def _spotify_album_payload() -> dict[str, object]:
+def _spotify_album_payload(include_images: bool) -> dict[str, object]:
     """Return one Spotify Album payload matching the interpreted Music Release."""
     return {
-        "id": "2noRn2Aes5aoNVsU6iWThc",
+        "id": "direct-album",
         "name": "Discovery",
         "artists": [{"id": "4tZwfgrHOc3mvqYlEYSvVi", "name": "Daft Punk"}],
-        "external_urls": {"spotify": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc"},
+        "external_urls": {"spotify": "https://open.spotify.com/album/direct-album"},
         "release_date": "2001-02-26",
         "release_date_precision": "day",
         "album_type": "album",
-        "images": [],
+        "images": _spotify_images("direct") if include_images else [],
     }
 
 
-async def test_extract_resolves_music_through_mocked_spotify_catalog() -> None:
+@pytest.mark.parametrize(
+    ("include_images", "attached_cover_url", "direct_cover_url"),
+    [
+        (
+            True,
+            "https://i.scdn.co/image/attached-primary",
+            "https://i.scdn.co/image/direct-primary",
+        ),
+        (False, None, None),
+    ],
+    ids=["provider-images", "no-provider-images"],
+)
+async def test_extract_resolves_music_through_mocked_spotify_catalog(
+    include_images: bool,
+    attached_cover_url: str | None,
+    direct_cover_url: str | None,
+) -> None:
     """Expose a resolved Track and Music Release through the in-process HTTP endpoint."""
     requests: list[httpx.Request] = []
 
@@ -198,13 +231,13 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog() -> None:
             assert params["q"] == ("track:One More Time artist:Daft Punk album:Discovery year:2001")
             return httpx.Response(
                 200,
-                json={"tracks": {"items": [_spotify_track_payload()]}},
+                json={"tracks": {"items": [_spotify_track_payload(include_images)]}},
             )
         assert params["type"] == "album"
         assert params["q"] == "album:Discovery artist:Daft Punk year:2001"
         return httpx.Response(
             200,
-            json={"albums": {"items": [_spotify_album_payload()]}},
+            json={"albums": {"items": [_spotify_album_payload(include_images)]}},
         )
 
     http_client = httpx.AsyncClient(
@@ -241,6 +274,8 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog() -> None:
     assert http_client.is_closed is True
     assert len(interpretation_provider.calls) == 1
     assert len(requests) == 3
+    assert sum(request.method == "POST" for request in requests) == 1
+    assert sum(request.method == "GET" for request in requests) == 2
     assert response.json()["market"] == "JP"
     assert set(response.json()["results"]) == {
         "movies",
@@ -267,8 +302,24 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog() -> None:
                         "name": "Daft Punk",
                     }
                 ],
-                "spotify_track_id": "0DiWol3AO6WpXZgp0goxAV",
-                "spotify_url": "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV",
+                "spotify_track_id": "playable-track",
+                "spotify_url": "https://open.spotify.com/track/playable-track",
+                "preferred_music_release": {
+                    "release_title": "Discovery",
+                    "artists": [
+                        {
+                            "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
+                            "name": "Daft Punk",
+                        }
+                    ],
+                    "release_date": "2001-02-26",
+                    "release_date_precision": "day",
+                    "album_type": "album",
+                    "spotify_album_id": "attached-album",
+                    "spotify_url": "https://open.spotify.com/album/attached-album",
+                    "cover_url": attached_cover_url,
+                },
+                "cover_url": attached_cover_url,
             },
         }
     ]
@@ -291,8 +342,9 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog() -> None:
                 "release_date": "2001-02-26",
                 "release_date_precision": "day",
                 "album_type": "album",
-                "spotify_album_id": "2noRn2Aes5aoNVsU6iWThc",
-                "spotify_url": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc",
+                "spotify_album_id": "direct-album",
+                "spotify_url": "https://open.spotify.com/album/direct-album",
+                "cover_url": direct_cover_url,
             },
         }
     ]

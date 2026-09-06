@@ -7,7 +7,11 @@ import pytest
 
 from reelio.extraction.exceptions import CatalogProviderError, PipelineTimeoutError
 from reelio.extraction.market import SpotifyMarket
-from reelio.extraction.services.catalog.types import AlbumCandidate, TrackCandidate
+from reelio.extraction.services.catalog.types import (
+    AlbumCandidate,
+    ImageCandidate,
+    TrackCandidate,
+)
 from reelio.extraction.services.enrichment.spotify import SpotifyMusicResolver
 from reelio.extraction.types import (
     ArtistCredit,
@@ -85,12 +89,29 @@ def _mention(
     )
 
 
+def _album_candidate(
+    title: str = "Discovery",
+    release_date: str = "2001-02-26",
+    images: tuple[ImageCandidate, ...] = (),
+) -> AlbumCandidate:
+    """Create one attached Spotify Album Candidate for resolver tests."""
+    return AlbumCandidate(
+        spotify_album_id="album-1",
+        spotify_url="https://open.spotify.com/album/album-1",
+        title=title,
+        artists=(ArtistCredit(spotify_artist_id="album-artist", name="Album Artist"),),
+        release_date=release_date,
+        release_date_precision="day",
+        album_type="album",
+        images=images,
+    )
+
+
 def _candidate(
     spotify_track_id: str = "track-1",
     title: str = "One More Time",
     artists: Sequence[str] = ("Daft Punk",),
-    album_title: str = "Discovery",
-    release_date: str = "2001-02-26",
+    album: AlbumCandidate | None = None,
 ) -> TrackCandidate:
     """Create one playable Spotify Track Candidate for resolver tests."""
     return TrackCandidate(
@@ -101,16 +122,7 @@ def _candidate(
             ArtistCredit(spotify_artist_id=f"artist-{index}", name=artist)
             for index, artist in enumerate(artists)
         ),
-        album=AlbumCandidate(
-            spotify_album_id="album-1",
-            spotify_url="https://open.spotify.com/album/album-1",
-            title=album_title,
-            artists=(ArtistCredit(spotify_artist_id="album-artist", name="Album Artist"),),
-            release_date=release_date,
-            release_date_precision="day",
-            album_type="album",
-            images=(),
-        ),
+        album=_album_candidate() if album is None else album,
     )
 
 
@@ -207,8 +219,10 @@ async def test_resolver_ignores_album_context_when_the_mention_omits_it() -> Non
         (
             (
                 _candidate(
-                    album_title="Unrelated Release",
-                    release_date="2025-01-01",
+                    album=_album_candidate(
+                        title="Unrelated Release",
+                        release_date="2025-01-01",
+                    )
                 ),
             ),
         )
@@ -217,6 +231,9 @@ async def test_resolver_ignores_album_context_when_the_mention_omits_it() -> Non
     results = await _resolve_tracks(SpotifyMusicResolver(catalog), [_mention()])
 
     assert results[0].status is ResultStatus.RESOLVED
+    assert results[0].track is not None
+    assert results[0].track.preferred_music_release.release_title == "Unrelated Release"
+    assert catalog.album_calls == []
 
 
 async def test_resolver_inspects_only_the_first_three_candidates() -> None:
@@ -293,9 +310,15 @@ async def test_resolver_applies_optional_album_title_and_year_to_exact_matches()
     catalog = _FakeTrackCatalog(
         (
             (
-                _candidate("wrong-year", release_date="2000-01-01"),
-                _candidate("exact", release_date="2001-02-26"),
-                _candidate("wrong-album", album_title="Homework"),
+                _candidate(
+                    "wrong-year",
+                    album=_album_candidate(release_date="2000-01-01"),
+                ),
+                _candidate(
+                    "exact",
+                    album=_album_candidate(release_date="2001-02-26"),
+                ),
+                _candidate("wrong-album", album=_album_candidate(title="Homework")),
             ),
         )
     )
@@ -330,8 +353,10 @@ async def test_fuzzy_matching_ignores_release_year() -> None:
                 _candidate(
                     title="abcdefghiX",
                     artists=("Queen",),
-                    album_title="A Night at the Opera",
-                    release_date="1976-01-01",
+                    album=_album_candidate(
+                        title="A Night at the Opera",
+                        release_date="1976-01-01",
+                    ),
                 ),
             ),
         )
@@ -342,9 +367,38 @@ async def test_fuzzy_matching_ignores_release_year() -> None:
     assert results[0].status is ResultStatus.RESOLVED
 
 
-async def test_resolver_uses_provider_corrected_track_and_artist_values() -> None:
-    """Return Spotify's display strings and playable identity after an exact match."""
-    mention = _mention(track_title="bohemian rhapsody", artists=("queen",))
+async def test_resolver_uses_provider_corrected_track_and_attached_album_values() -> None:
+    """Return Spotify's display values, playable Track, and attached Album."""
+    mention = _mention(
+        track_title="bohemian rhapsody",
+        artists=("queen",),
+        release_title="a night at the opera",
+        release_year=1975,
+    )
+    attached_album = AlbumCandidate(
+        spotify_album_id="album-identity",
+        spotify_url="https://open.spotify.com/album/album-identity",
+        title="A Night at the Opera",
+        artists=(
+            ArtistCredit(spotify_artist_id="album-artist-0", name="Queen"),
+            ArtistCredit(spotify_artist_id="album-artist-1", name="Opera Singers"),
+        ),
+        release_date="1975",
+        release_date_precision="year",
+        album_type="album",
+        images=(
+            ImageCandidate(
+                url="https://i.scdn.co/image/primary",
+                width=640,
+                height=640,
+            ),
+            ImageCandidate(
+                url="https://i.scdn.co/image/secondary",
+                width=300,
+                height=300,
+            ),
+        ),
+    )
     catalog = _FakeTrackCatalog(
         (
             (
@@ -352,18 +406,54 @@ async def test_resolver_uses_provider_corrected_track_and_artist_values() -> Non
                     spotify_track_id="playable-id",
                     title="Bohemian Rhapsody",
                     artists=("Queen",),
+                    album=attached_album,
                 ),
             ),
         )
     )
 
-    results = await _resolve_tracks(SpotifyMusicResolver(catalog), [mention])
+    music_results = await SpotifyMusicResolver(catalog).resolve(
+        MusicMentions(tracks=[mention], music_releases=[]),
+        _MARKET,
+    )
 
-    assert results[0].track is not None
-    assert results[0].track.track_title == "Bohemian Rhapsody"
-    assert results[0].track.artists == [ArtistCredit(spotify_artist_id="artist-0", name="Queen")]
-    assert results[0].track.spotify_track_id == "playable-id"
-    assert results[0].track.spotify_url == "https://open.spotify.com/track/playable-id"
+    resolved_track = music_results.tracks[0].track
+    assert resolved_track is not None
+    assert resolved_track.track_title == "Bohemian Rhapsody"
+    assert resolved_track.artists == [ArtistCredit(spotify_artist_id="artist-0", name="Queen")]
+    assert resolved_track.spotify_track_id == "playable-id"
+    assert resolved_track.spotify_url == "https://open.spotify.com/track/playable-id"
+    assert resolved_track.preferred_music_release.release_title == "A Night at the Opera"
+    assert resolved_track.preferred_music_release.artists == [
+        ArtistCredit(spotify_artist_id="album-artist-0", name="Queen"),
+        ArtistCredit(spotify_artist_id="album-artist-1", name="Opera Singers"),
+    ]
+    assert resolved_track.preferred_music_release.release_date == "1975"
+    assert resolved_track.preferred_music_release.release_date_precision == "year"
+    assert resolved_track.preferred_music_release.album_type == "album"
+    assert resolved_track.preferred_music_release.spotify_album_id == "album-identity"
+    assert (
+        resolved_track.preferred_music_release.spotify_url
+        == "https://open.spotify.com/album/album-identity"
+    )
+    assert resolved_track.preferred_music_release.cover_url == "https://i.scdn.co/image/primary"
+    assert resolved_track.cover_url == resolved_track.preferred_music_release.cover_url
+    assert music_results.music_releases == []
+    assert catalog.album_calls == []
+
+
+async def test_resolver_keeps_track_resolved_without_attached_album_images() -> None:
+    """Expose null Track and Preferred Music Release covers without changing status."""
+    catalog = _FakeTrackCatalog(((_candidate(album=_album_candidate(images=())),),))
+
+    results = await _resolve_tracks(SpotifyMusicResolver(catalog), [_mention()])
+
+    resolved_track = results[0].track
+    assert results[0].status is ResultStatus.RESOLVED
+    assert resolved_track is not None
+    assert resolved_track.preferred_music_release.cover_url is None
+    assert resolved_track.cover_url is None
+    assert catalog.album_calls == []
 
 
 async def test_resolver_returns_unresolved_result_without_candidates() -> None:

@@ -303,23 +303,6 @@ class EnrichedTVSeries:
 
 
 @dataclass
-class EnrichedTrack:
-    """Contain Spotify-verified metadata for a playable Track.
-
-    Attributes:
-        track_title: Spotify-authoritative Track title.
-        artists: Ordered Spotify Track artist credits.
-        spotify_track_id: Playable Spotify Track identifier for the effective market.
-        spotify_url: Direct Spotify URL for the playable Track.
-    """
-
-    track_title: str
-    artists: list[ArtistCredit]
-    spotify_track_id: str
-    spotify_url: str
-
-
-@dataclass
 class EnrichedMusicRelease:
     """Contain Spotify-verified metadata for one Album Music Release.
 
@@ -331,6 +314,7 @@ class EnrichedMusicRelease:
         album_type: Spotify album classification.
         spotify_album_id: Spotify Album identifier for the effective market.
         spotify_url: Direct Spotify URL for the Album.
+        cover_url: First provider-ordered Spotify Album image URL when available.
     """
 
     release_title: str
@@ -340,6 +324,28 @@ class EnrichedMusicRelease:
     album_type: AlbumType
     spotify_album_id: str
     spotify_url: str
+    cover_url: str | None
+
+
+@dataclass
+class EnrichedTrack:
+    """Contain Spotify-verified metadata for a playable Track.
+
+    Attributes:
+        track_title: Spotify-authoritative Track title.
+        artists: Ordered Spotify Track artist credits.
+        spotify_track_id: Playable Spotify Track identifier for the effective market.
+        spotify_url: Direct Spotify URL for the playable Track.
+        preferred_music_release: Album attached to the accepted Track Candidate.
+        cover_url: First provider-ordered Spotify Album image URL when available.
+    """
+
+    track_title: str
+    artists: list[ArtistCredit]
+    spotify_track_id: str
+    spotify_url: str
+    preferred_music_release: EnrichedMusicRelease
+    cover_url: str | None
 
 
 @dataclass
