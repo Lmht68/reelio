@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 _ENRICHMENT_ERROR_MESSAGE = "TMDB candidate resolution and enrichment failed."
 _ENRICHMENT_TIMEOUT_MESSAGE = "TMDB candidate resolution timed out."
 _STAGE = "candidate_resolution"
+_CANDIDATE_LIMIT = 3
 
 
 class _TMDBModel(BaseModel):
@@ -222,7 +223,7 @@ class TMDBScreenWorkResolver:
         )
 
         # Limit to the first three candidates to reduce TMDB requests
-        for candidate in search_response.results[:3]:
+        for candidate in search_response.results[:_CANDIDATE_LIMIT]:
             candidate_year = _year_from_date(candidate.release_date)
             if candidate_year is None or candidate_year != search_year:
                 continue
@@ -275,7 +276,7 @@ class TMDBScreenWorkResolver:
             _TVSearchResponse,
         )
 
-        for candidate in search_response.results[:3]:
+        for candidate in search_response.results[:_CANDIDATE_LIMIT]:
             candidate_year = _year_from_date(candidate.first_air_date)
             if candidate_year is None or candidate_year != tv_series_mention.year:
                 continue
