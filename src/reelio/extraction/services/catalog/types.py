@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from reelio.extraction.types import AlbumType, ArtistCredit, ReleaseDatePrecision
+from reelio.extraction.types import AlbumType, ArtistCredit
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,8 +29,7 @@ class AlbumCandidate:
         spotify_url: Returned direct Spotify Album URL.
         title: Provider-authoritative album title.
         artists: Ordered provider Artist Credits.
-        release_date: Spotify release date.
-        release_date_precision: Granularity of the Spotify release date.
+        release_date: Spotify-reported release date without transformation.
         album_type: Spotify album classification.
         images: Provider-ordered hosted image candidates.
     """
@@ -40,7 +39,6 @@ class AlbumCandidate:
     title: str
     artists: tuple[ArtistCredit, ...]
     release_date: str
-    release_date_precision: ReleaseDatePrecision
     album_type: AlbumType
     images: tuple[ImageCandidate, ...]
 

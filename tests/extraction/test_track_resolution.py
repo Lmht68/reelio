@@ -101,7 +101,6 @@ def _album_candidate(
         title=title,
         artists=(ArtistCredit(spotify_artist_id="album-artist", name="Album Artist"),),
         release_date=release_date,
-        release_date_precision="day",
         album_type="album",
         images=images,
     )
@@ -152,7 +151,6 @@ async def test_resolver_resolves_grouped_music_mentions() -> None:
         title="Discovery",
         artists=(ArtistCredit(spotify_artist_id="artist-0", name="Daft Punk"),),
         release_date="2001-02-26",
-        release_date_precision="day",
         album_type="album",
         images=(),
     )
@@ -384,7 +382,6 @@ async def test_resolver_uses_provider_corrected_track_and_attached_album_values(
             ArtistCredit(spotify_artist_id="album-artist-1", name="Opera Singers"),
         ),
         release_date="1975",
-        release_date_precision="year",
         album_type="album",
         images=(
             ImageCandidate(
@@ -429,7 +426,6 @@ async def test_resolver_uses_provider_corrected_track_and_attached_album_values(
         ArtistCredit(spotify_artist_id="album-artist-1", name="Opera Singers"),
     ]
     assert resolved_track.preferred_music_release.release_date == "1975"
-    assert resolved_track.preferred_music_release.release_date_precision == "year"
     assert resolved_track.preferred_music_release.album_type == "album"
     assert resolved_track.preferred_music_release.spotify_album_id == "album-identity"
     assert (

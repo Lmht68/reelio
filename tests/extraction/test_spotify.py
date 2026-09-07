@@ -50,7 +50,6 @@ def _track_payload(track_id: str) -> dict[str, object]:
             "artists": [{"id": "artist-1", "name": "Yumi Arai"}],
             "external_urls": {"spotify": "https://open.spotify.com/album/album-1"},
             "release_date": "1989-04-25",
-            "release_date_precision": "day",
             "album_type": "album",
             "images": [
                 {
@@ -113,7 +112,6 @@ async def test_catalog_reuses_token_and_returns_playable_track_candidate() -> No
     assert candidate.artists[0].name == "Yumi Arai"
     assert candidate.album.spotify_album_id == "album-1"
     assert candidate.album.release_date == "1989-04-25"
-    assert candidate.album.release_date_precision == "day"
     assert candidate.album.album_type == "album"
     assert [image.url for image in candidate.album.images] == [
         "https://i.scdn.co/image/cover-primary",
@@ -125,6 +123,31 @@ async def test_catalog_reuses_token_and_returns_playable_track_candidate() -> No
 
     await catalog.aclose()
     assert client.is_closed is True
+
+
+async def test_catalog_returns_year_only_release_date_unchanged() -> None:
+    """Return Spotify's year-only release date unchanged."""
+    track = _track_payload("playable-track")
+    album = track["album"]
+    assert isinstance(album, dict)
+    album["release_date"] = "1975"
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token", "expires_in": 3600},
+            )
+        return httpx.Response(200, json={"tracks": {"items": [track]}})
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings())
+
+    candidates = await catalog.search_tracks("Kiki", _MARKET)
+
+    assert len(candidates) == 1
+    assert candidates[0].album.release_date == "1975"
+
+    await catalog.aclose()
 
 
 class _FakeClock:
@@ -413,13 +436,35 @@ def test_spotify_configuration_defaults_to_us_market() -> None:
     assert _settings().default_market == "US"
 
 
-async def test_catalog_rejects_impossible_month_precision_release_dates() -> None:
+async def test_catalog_rejects_calendar_invalid_release_dates() -> None:
     """Treat calendar-invalid required Spotify release data as a provider failure."""
     track = _track_payload("playable-track")
     album = track["album"]
     assert isinstance(album, dict)
     album["release_date"] = "2024-13"
-    album["release_date_precision"] = "month"
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token", "expires_in": 3600},
+            )
+        return httpx.Response(200, json={"tracks": {"items": [track]}})
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings())
+
+    with pytest.raises(CatalogProviderError, match="Spotify catalog request failed"):
+        await catalog.search_tracks("Kiki", _MARKET)
+
+    await catalog.aclose()
+
+
+async def test_catalog_rejects_non_ascii_release_date_digits() -> None:
+    """Treat non-ASCII release-date digits as invalid provider data."""
+    track = _track_payload("playable-track")
+    album = track["album"]
+    assert isinstance(album, dict)
+    album["release_date"] = "２０２４"
 
     async def handle(request: httpx.Request) -> httpx.Response:
         if request.url.host == "accounts.spotify.test":

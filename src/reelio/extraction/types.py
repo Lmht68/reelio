@@ -59,7 +59,6 @@ def normalize_music_identity(text: str) -> str:
     return normalize_music_text(text).casefold()
 
 
-ReleaseDatePrecision = Literal["year", "month", "day"]
 AlbumType = Literal["album", "single", "compilation"]
 
 
@@ -309,8 +308,7 @@ class EnrichedMusicRelease:
     Attributes:
         release_title: Spotify-authoritative Music Release title.
         artists: Ordered Spotify Music Release artist credits.
-        release_date: Spotify-reported release date for the verified precision.
-        release_date_precision: Granularity of the Spotify release date.
+        release_date: Spotify-reported release date without transformation.
         album_type: Spotify album classification.
         spotify_album_id: Spotify Album identifier for the effective market.
         spotify_url: Direct Spotify URL for the Album.
@@ -320,7 +318,6 @@ class EnrichedMusicRelease:
     release_title: str
     artists: list[ArtistCredit]
     release_date: str
-    release_date_precision: ReleaseDatePrecision
     album_type: AlbumType
     spotify_album_id: str
     spotify_url: str

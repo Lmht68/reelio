@@ -19,7 +19,7 @@ from pydantic import (
     HttpUrl,
     StringConstraints,
     ValidationError,
-    model_validator,
+    field_validator,
 )
 
 from reelio.extraction.exceptions import CatalogProviderError, PipelineTimeoutError
@@ -30,7 +30,7 @@ from reelio.extraction.services.catalog.types import (
     ImageCandidate,
     TrackCandidate,
 )
-from reelio.extraction.types import AlbumType, ArtistCredit, ReleaseDatePrecision
+from reelio.extraction.types import AlbumType, ArtistCredit
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,9 @@ _CATALOG_ERROR_MESSAGE = "Spotify catalog request failed."
 _CATALOG_TIMEOUT_MESSAGE = "Spotify catalog request timed out."
 _STAGE = "spotify_catalog"
 _NON_BLANK_TEXT = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-_RELEASE_YEAR_PATTERN = re.compile(r"^\d{4}$")
+_RELEASE_YEAR_PATTERN = re.compile(r"^[0-9]{4}$")
+_RELEASE_MONTH_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}$")
+_RELEASE_DAY_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
 class _SpotifyModel(BaseModel):
@@ -75,31 +77,28 @@ class _SpotifyAlbum(_SpotifyModel):
     name: _NON_BLANK_TEXT
     artists: list[_SpotifyArtist] = Field(min_length=1)
     external_urls: _SpotifyExternalUrls
-    release_date: _NON_BLANK_TEXT
-    release_date_precision: ReleaseDatePrecision
+    release_date: str = Field(min_length=1)
     album_type: AlbumType
     images: list[_SpotifyImage] = Field(default_factory=list)
 
-    @model_validator(mode="after")
-    def _validate_release_date(self) -> _SpotifyAlbum:
-        """Require a release-date value compatible with its reported precision."""
-        if self.release_date_precision == "year":
-            is_valid = _RELEASE_YEAR_PATTERN.fullmatch(self.release_date) is not None
+    @field_validator("release_date")
+    @classmethod
+    def _validate_release_date(cls, release_date: str) -> str:
+        """Require Spotify's supported release-date formats."""
+        if _RELEASE_YEAR_PATTERN.fullmatch(release_date) is not None:
+            return release_date
+        if _RELEASE_MONTH_PATTERN.fullmatch(release_date) is not None:
+            date_value = f"{release_date}-01"
+        elif _RELEASE_DAY_PATTERN.fullmatch(release_date) is not None:
+            date_value = release_date
         else:
-            date_value = (
-                self.release_date
-                if self.release_date_precision == "day"
-                else f"{self.release_date}-01"
-            )
-            try:
-                date.fromisoformat(date_value)
-            except ValueError:
-                is_valid = False
-            else:
-                is_valid = True
-        if not is_valid:
-            raise ValueError("release_date does not match release_date_precision")
-        return self
+            raise ValueError("release_date must use YYYY, YYYY-MM, or YYYY-MM-DD")
+
+        try:
+            date.fromisoformat(date_value)
+        except ValueError as exc:
+            raise ValueError("release_date is not a valid calendar date") from exc
+        return release_date
 
 
 class _SpotifyTrack(_SpotifyModel):
@@ -388,7 +387,6 @@ def _to_album_candidate(album: _SpotifyAlbum) -> AlbumCandidate:
         title=album.name,
         artists=tuple(_to_artist_credit(artist) for artist in album.artists),
         release_date=album.release_date,
-        release_date_precision=album.release_date_precision,
         album_type=album.album_type,
         images=tuple(
             ImageCandidate(

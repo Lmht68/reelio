@@ -247,7 +247,6 @@ def _enriched_track(track_mention: TrackMention) -> EnrichedTrack:
             )
         ],
         release_date="2001-02-26",
-        release_date_precision="day",
         album_type="album",
         spotify_album_id="track-album",
         spotify_url="https://open.spotify.com/album/track-album",
@@ -280,7 +279,6 @@ def _enriched_music_release(
             )
         ],
         release_date="2001-02-26",
-        release_date_precision="day",
         album_type="album",
         spotify_album_id="direct-album",
         spotify_url="https://open.spotify.com/album/direct-album",
@@ -530,7 +528,6 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
         "release_title",
         "artists",
         "release_date",
-        "release_date_precision",
         "album_type",
         "spotify_album_id",
         "spotify_url",
@@ -546,7 +543,6 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
         "release_title",
         "artists",
         "release_date",
-        "release_date_precision",
         "album_type",
         "spotify_album_id",
         "spotify_url",
@@ -649,7 +645,6 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
     )
     assert resolved_music_release.music_release.artists[0].name == "Daft Punk"
     assert resolved_music_release.music_release.release_date == "2001-02-26"
-    assert resolved_music_release.music_release.release_date_precision == "day"
     assert resolved_music_release.music_release.album_type == "album"
     assert resolved_music_release.music_release.spotify_album_id == "direct-album"
     assert (
@@ -1128,7 +1123,6 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "release_title",
         "artists",
         "release_date",
-        "release_date_precision",
         "album_type",
         "spotify_album_id",
         "spotify_url",
@@ -1152,7 +1146,6 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "release_title",
         "artists",
         "release_date",
-        "release_date_precision",
         "album_type",
         "spotify_album_id",
         "spotify_url",
@@ -1260,7 +1253,6 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "release_title",
         "artists",
         "release_date",
-        "release_date_precision",
         "album_type",
         "spotify_album_id",
         "spotify_url",
@@ -1270,11 +1262,6 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "items": {"$ref": "#/components/schemas/ArtistCreditModel"},
         "type": "array",
         "title": "Artists",
-    }
-    assert set(music_release_schema["properties"]["release_date_precision"]["enum"]) == {
-        "year",
-        "month",
-        "day",
     }
     assert set(music_release_schema["properties"]["album_type"]["enum"]) == {
         "album",
@@ -1363,7 +1350,7 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "Music Release Results retain their interpreted Music Release Mention"
         in operation["description"]
     )
-    assert "provider-reported release date and precision" in operation["description"]
+    assert "provider-reported release date" in operation["description"]
     assert "preferred_music_release is the Spotify Album attached" in operation["description"]
     assert "first provider-ordered Spotify-hosted Album image URL" in operation["description"]
     assert "artwork link-back" in operation["description"]

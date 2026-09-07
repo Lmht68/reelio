@@ -143,7 +143,6 @@ def _to_enriched_music_release(
         release_title=album_candidate.title,
         artists=list(album_candidate.artists),
         release_date=album_candidate.release_date,
-        release_date_precision=album_candidate.release_date_precision,
         album_type=album_candidate.album_type,
         spotify_album_id=album_candidate.spotify_album_id,
         spotify_url=album_candidate.spotify_url,

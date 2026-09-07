@@ -21,7 +21,6 @@ from reelio.extraction.types import (
     MusicResults,
     PipelineResult,
     Platform,
-    ReleaseDatePrecision,
     ResultStatus,
     ScreenWorkMentions,
     ScreenWorkResults,
@@ -53,9 +52,8 @@ def test_normalize_music_text_and_identity_canonicalize_unicode_case_and_whitesp
     assert normalize_music_identity("  AME\u0301LIE:\tSong  ") == "amélie: song"
 
 
-def test_music_release_date_and_album_type_aliases_match_spotify_values() -> None:
-    """Share one provider-value vocabulary across the domain and catalog layers."""
-    assert get_args(ReleaseDatePrecision) == ("year", "month", "day")
+def test_album_type_alias_matches_spotify_values() -> None:
+    """Share the Spotify Album Type provider vocabulary."""
     assert get_args(AlbumType) == ("album", "single", "compilation")
 
 
@@ -120,7 +118,6 @@ def test_extraction_domain_types_preserve_nested_service_scope_identity() -> Non
         release_title="Discovery",
         artists=[ArtistCredit(spotify_artist_id="spotify-artist", name="Daft Punk")],
         release_date="2001-02-26",
-        release_date_precision="day",
         album_type="album",
         spotify_album_id="spotify-album",
         spotify_url="https://open.spotify.com/album/spotify-album",

@@ -3,13 +3,7 @@
 from pydantic import BaseModel, Field
 
 from reelio.extraction.market import SpotifyMarket
-from reelio.extraction.types import (
-    AlbumType,
-    Platform,
-    ReleaseDatePrecision,
-    ResultStatus,
-    TranscriptMethod,
-)
+from reelio.extraction.types import AlbumType, Platform, ResultStatus, TranscriptMethod
 
 
 class ExtractRequest(BaseModel):
@@ -166,7 +160,6 @@ class MusicReleaseModel(BaseModel):
     release_title: str
     artists: list[ArtistCreditModel]
     release_date: str
-    release_date_precision: ReleaseDatePrecision
     album_type: AlbumType
     spotify_album_id: str
     spotify_url: str

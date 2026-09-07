@@ -55,7 +55,6 @@ class ExtractionResultAggregator:
         music_resolver: _MusicResolver,
     ) -> None:
         """Initialize aggregation with resolvers for each service scope.
- badsd
         Args:
             screen_work_resolver: Resolver for Movie and TV Series mentions.
             music_resolver: Resolver for Spotify Track and Music Release mentions.

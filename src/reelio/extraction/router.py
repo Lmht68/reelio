@@ -117,7 +117,6 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                             }
                         ],
                         "release_date": "2001-02-26",
-                        "release_date_precision": "day",
                         "album_type": "album",
                         "spotify_album_id": "2noRn2Aes5aoNVsU6iWThc",
                         "spotify_url": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc",
@@ -154,7 +153,6 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                         }
                     ],
                     "release_date": "2001-02-26",
-                    "release_date_precision": "day",
                     "album_type": "album",
                     "spotify_album_id": "2noRn2Aes5aoNVsU6iWThc",
                     "spotify_url": "https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc",
@@ -268,7 +266,6 @@ def _to_music_release_schema(
         release_title=music_release.release_title,
         artists=[_to_artist_credit_schema(artist) for artist in music_release.artists],
         release_date=music_release.release_date,
-        release_date_precision=music_release.release_date_precision,
         album_type=music_release.album_type,
         spotify_album_id=music_release.spotify_album_id,
         spotify_url=music_release.spotify_url,
@@ -402,7 +399,7 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         "Music Release cover_url, and the Album spotify_url is its artwork "
         "link-back. Music Release Results retain their interpreted Music Release "
         "Mention and expose one independently matched, market-specific Spotify "
-        "Album identity, provider-reported release date and precision, album type, "
+        "Album identity, provider-reported release date, album type, "
         "and direct URL after a verified match; the contract makes no "
         "worldwide-edition, sibling-release, release-family, inferred-subtype, or "
         "earliest-worldwide-date claims. Any TMDB or Spotify provider failure "

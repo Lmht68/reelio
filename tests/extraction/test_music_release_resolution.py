@@ -94,7 +94,6 @@ def _candidate(
             for index, artist in enumerate(artists)
         ),
         release_date=release_date,
-        release_date_precision="day",
         album_type="album",
         images=images,
     )
@@ -367,7 +366,6 @@ async def test_resolver_uses_provider_corrected_release_and_artist_values() -> N
         ArtistCredit(spotify_artist_id="artist-0", name="Daft Punk")
     ]
     assert results[0].music_release.release_date == "2001-02-26"
-    assert results[0].music_release.release_date_precision == "day"
     assert results[0].music_release.album_type == "album"
     assert results[0].music_release.spotify_album_id == "album-identity"
     assert results[0].music_release.spotify_url == "https://open.spotify.com/album/album-identity"
