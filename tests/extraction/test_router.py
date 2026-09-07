@@ -1050,6 +1050,14 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     document = response.json()
     operation = document["paths"]["/api/extract"]["post"]
     responses = operation["responses"]
+    description = operation["description"]
+    assert "offset zero and limit three" in description
+    assert "first ordered Artist Credit only" in description
+    assert "at least one Artist Credit matches any Mention Artist Credit" in description
+    assert "matches exactly under Music Identity Normalization" in description
+    assert "Release year does not participate in retrieval or Candidate verification" in description
+    assert "fuzzy" not in description.lower()
+    assert "90 percent" not in description.lower()
     assert {"200", "400", "404", "413", "500", "502", "504", "422"} <= set(responses)
     for status_code in ("400", "404", "413", "500", "502", "504"):
         schema = responses[status_code]["content"]["application/json"]["schema"]

@@ -288,9 +288,16 @@ class SpotifyCatalog:
         access_token: str,
         deadline: float,
     ) -> httpx.Response:
+        request_params: dict[str, str | int] = {
+            "q": query,
+            "type": item_type,
+            "market": market,
+            "offset": 0,
+            "limit": 3,
+        }
         response = await self._client.get(
             "search",
-            params={"q": query, "type": item_type, "market": market, "limit": 3},
+            params=request_params,
             headers={"Authorization": f"Bearer {access_token}"},
         )
         if response.status_code != httpx.codes.TOO_MANY_REQUESTS:
@@ -303,7 +310,7 @@ class SpotifyCatalog:
         await self._sleep(retry_after)
         response = await self._client.get(
             "search",
-            params={"q": query, "type": item_type, "market": market, "limit": 3},
+            params=request_params,
             headers={"Authorization": f"Bearer {access_token}"},
         )
         if response.status_code == httpx.codes.TOO_MANY_REQUESTS:

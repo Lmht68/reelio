@@ -13,8 +13,8 @@ The extraction pipeline:
 5. Sends bounded source metadata and transcript material to the selected LLM provider.
 6. Validates the structured LLM response, deduplicates Mentions independently per kind, and preserves first-reference order within each kind.
 7. Searches TMDB's Movie and TV endpoints and resolves a Screen Work Mention only when its canonical title or a provider alternative title matches together with its release or first air year.
-8. Searches Spotify's Track endpoint in the effective market and resolves a Track Mention only after a verified candidate match.
-9. Searches Spotify's Album endpoint in the effective market and resolves a direct Music Release Mention only after a verified candidate match.
+8. Makes one bounded Spotify Track search for each Track Mention in the effective market, then resolves only the first artist-eligible Candidate with required exact titles.
+9. Makes one bounded Spotify Album search for each direct Music Release Mention in the effective market, then resolves only the first artist-eligible Candidate with an exact title.
 10. Returns grouped `movies`, `tv_series`, `tracks`, and `music_releases` result lists, resolving each Mention to enriched metadata or `null` independently within its kind.
 
 Movie results can include the title, release year, cast, directors, description, poster URL, TMDB and IMDb identifiers and links, and the TMDB score.
@@ -132,17 +132,24 @@ The response contains:
   A resolved Track has Spotify's canonical Track title, ordered artist credits, playable Track ID and URL, `preferred_music_release`, and `cover_url`.
   `preferred_music_release` is the Album attached to the accepted Spotify Track Candidate and contains its canonical title, ordered artist credits, provider-reported `release_date`, Spotify Album identity, and Album `spotify_url`.
   The Track `cover_url` equals its Preferred Music Release `cover_url`, which is the first provider-ordered Spotify-hosted Album image URL or `null` when Spotify returns no Album images.
-  Mention release context only constrains Track Candidate matching; the Preferred Music Release always comes from the accepted Candidate's attached Album.
-  Spotify searches use the effective market, examine only the first three provider-ordered candidates, and require an exact or every-field fuzzy identity match.
-  An unresolved Track preserves its original Track Mention.
+  Each Track Mention causes one Spotify search in the effective market with offset zero and limit three.
+  The Track query uses the Mention title and first ordered Artist Credit only.
+  A Candidate is artist-eligible when at least one Candidate Artist Credit matches any Mention Artist Credit under Music Identity Normalization, regardless of credit order, count, or unmatched additions.
+  Reelio selects the first provider-ordered artist-eligible Candidate whose Track title matches exactly under Music Identity Normalization.
+  An explicit Mention release title must also exactly match the accepted Candidate's attached Album title; without release context, that attached Album title does not constrain matching.
+  Release year remains nullable Mention context and does not participate in Spotify retrieval or Candidate verification.
+  An unresolved Track preserves its original Track Mention when no exact eligible Candidate appears.
 - `results.music_releases[].music_release_mention`: The interpreted direct Music Release title, ordered release artists, and explicit nullable release year.
 - `results.music_releases[].music_release`: Spotify-backed enrichment for a resolved Mention, or `null` for an unresolved Mention.
   A resolved Music Release is one independently matched market-available Spotify Album with Spotify's canonical Album title, ordered artist credits, provider-reported `release_date`, `album_type`, a Spotify Album ID and URL, and `cover_url`.
   `cover_url` is the first provider-ordered Spotify-hosted Album image URL or `null` when Spotify returns no Album images, and the Album `spotify_url` is the direct artwork link-back.
   A direct Music Release is never synthesized from a Track's Preferred Music Release.
-  Spotify Album searches use the effective market, examine only the first three provider-ordered candidates, and require an exact or every-textual-field fuzzy identity match.
+  Each Music Release Mention causes one Spotify Album search in the effective market with offset zero and limit three.
+  The Album query uses the Mention title and first ordered Artist Credit only.
+  The same shared normalized Artist Credit eligibility applies, and the first provider-ordered artist-eligible Candidate whose Music Release title matches exactly under Music Identity Normalization resolves.
+  Release year does not participate in Spotify retrieval or Candidate verification.
   The contract makes no worldwide-edition, sibling-release, release-family, inferred-subtype, or earliest-worldwide-date claims.
-  An unresolved Music Release preserves its original Mention.
+  An unresolved Music Release preserves its original Mention when no exact eligible Candidate appears.
 - Any TMDB or Spotify provider HTTP, timeout, or required-response validation failure fails the complete request rather than returning partial category results.
 
 Compact success example:

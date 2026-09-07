@@ -14,6 +14,7 @@ from reelio.extraction.services.catalog.types import (
 )
 from reelio.extraction.services.enrichment.spotify import SpotifyMusicResolver
 from reelio.extraction.types import (
+    AlbumType,
     ArtistCredit,
     MusicMentions,
     MusicReleaseMention,
@@ -82,6 +83,7 @@ def _candidate(
     title: str = "Discovery",
     artists: Sequence[str] = ("Daft Punk",),
     release_date: str = "2001-02-26",
+    album_type: AlbumType = "album",
     images: tuple[ImageCandidate, ...] = (),
 ) -> AlbumCandidate:
     """Create one Spotify Album Candidate for resolver tests."""
@@ -94,7 +96,7 @@ def _candidate(
             for index, artist in enumerate(artists)
         ),
         release_date=release_date,
-        album_type="album",
+        album_type=album_type,
         images=images,
     )
 
@@ -111,8 +113,8 @@ async def _resolve_music_releases(
     return music_results.music_releases
 
 
-async def test_resolver_builds_field_scoped_query_and_forwards_effective_market() -> None:
-    """Pass an unescaped ordered album and artist query and effective market to Spotify."""
+async def test_resolver_queries_release_title_and_first_artist_only() -> None:
+    """Pass the Music Release title and first Artist Credit to Spotify."""
     catalog = _FakeAlbumCatalog(
         (
             (
@@ -128,14 +130,12 @@ async def test_resolver_builds_field_scoped_query_and_forwards_effective_market(
 
     results = await _resolve_music_releases(resolver, [mention])
 
-    assert catalog.calls == [
-        ("album:Discovery artist:Daft Punk artist:Romanthony year:2001", _MARKET)
-    ]
+    assert catalog.calls == [("album:Discovery artist:Daft Punk", _MARKET)]
     assert results[0].status is ResultStatus.RESOLVED
 
 
-async def test_resolver_omits_the_year_term_when_the_mention_has_none() -> None:
-    """Keep null-year Mentions eligible and exclude year from the album query."""
+async def test_resolver_excludes_nullable_mention_year_from_the_query() -> None:
+    """Use the same query for a null Mention year."""
     catalog = _FakeAlbumCatalog(((_candidate(),),))
 
     results = await _resolve_music_releases(
@@ -174,14 +174,14 @@ async def test_resolver_inspects_only_the_first_three_candidates() -> None:
     assert results[0].music_release is None
 
 
-async def test_resolver_searches_all_exact_candidates_before_fuzzy_candidates() -> None:
-    """Choose a later exact Candidate over an earlier fuzzy Candidate."""
+async def test_resolver_keeps_the_first_provider_ordered_exact_candidate() -> None:
+    """Use provider order when multiple eligible Candidates have exact titles."""
     mention = _mention(release_title="Midnight Echo")
     catalog = _FakeAlbumCatalog(
         (
             (
-                _candidate("fuzzy", title="Midnight Echos"),
-                _candidate("exact", title="Midnight Echo"),
+                _candidate("first", title="Midnight Echo"),
+                _candidate("second", title="Midnight Echo"),
             ),
         )
     )
@@ -189,12 +189,12 @@ async def test_resolver_searches_all_exact_candidates_before_fuzzy_candidates() 
     results = await _resolve_music_releases(SpotifyMusicResolver(catalog), [mention])
 
     assert results[0].music_release is not None
-    assert results[0].music_release.spotify_album_id == "exact"
+    assert results[0].music_release.spotify_album_id == "first"
 
 
-async def test_exact_matching_ignores_a_missing_release_year() -> None:
-    """Resolve an exact Candidate when the Mention supplies no year."""
-    mention = _mention(release_year=None)
+async def test_resolver_ignores_mention_year_when_matching_exact_title() -> None:
+    """Resolve an exact shared-credit Candidate despite a different provider year."""
+    mention = _mention(release_year=2001)
     catalog = _FakeAlbumCatalog(
         (
             (
@@ -212,122 +212,63 @@ async def test_exact_matching_ignores_a_missing_release_year() -> None:
     assert results[0].music_release.spotify_album_id == "different-year"
 
 
-async def test_exact_matching_requires_the_supplied_release_year() -> None:
-    """Compare a supplied year only to the first four characters of the release date."""
-    mention = _mention(release_year=2001)
-    catalog = _FakeAlbumCatalog(
-        (
-            (
-                _candidate("wrong-year", release_date="2000-01-01"),
-                _candidate("exact", release_date="2001-02-26"),
-            ),
-        )
-    )
-
-    results = await _resolve_music_releases(SpotifyMusicResolver(catalog), [mention])
-
-    assert results[0].music_release is not None
-    assert results[0].music_release.spotify_album_id == "exact"
-
-
 @pytest.mark.parametrize(
     "candidate_artists",
     [
         ("Second Artist", "First Artist"),
         ("First Artist",),
+        ("Unmatched Artist", " first artist ", "Second Artist"),
     ],
-    ids=["reversed-order", "different-length"],
+    ids=["reordered", "shorter", "longer-with-normalized-shared-credit"],
 )
-async def test_exact_matching_requires_same_length_positional_artist_credits(
+async def test_resolver_accepts_any_shared_normalized_artist_credit(
     candidate_artists: Sequence[str],
 ) -> None:
-    """Reject exact candidates whose artist credits differ by order or length."""
+    """Resolve despite reordered, shorter, or additional Candidate Artist Credits."""
     mention = _mention(artists=("First Artist", "Second Artist"))
-    catalog = _FakeAlbumCatalog(
-        (
-            (
-                _candidate(
-                    artists=candidate_artists,
-                ),
-            ),
-        )
-    )
+    catalog = _FakeAlbumCatalog(((_candidate(artists=candidate_artists),),))
 
     results = await _resolve_music_releases(SpotifyMusicResolver(catalog), [mention])
 
+    assert results[0].status is ResultStatus.RESOLVED
+
+
+async def test_resolver_rejects_exact_title_without_shared_artist_credit() -> None:
+    """Leave an exact-title Candidate unresolved without a shared Artist Credit."""
+    catalog = _FakeAlbumCatalog(((_candidate(artists=("Other Artist",)),),))
+
+    results = await _resolve_music_releases(SpotifyMusicResolver(catalog), [_mention()])
+
     assert results[0].status is ResultStatus.UNRESOLVED
+    assert results[0].music_release is None
 
 
 @pytest.mark.parametrize(
-    "candidate_artists",
-    [
-        ("Second Artist", "First Artist"),
-        ("First Artist",),
-    ],
-    ids=["reversed-order", "different-length"],
+    "candidate_title",
+    ["Discoveries", "Discovery (Deluxe Edition)"],
+    ids=["near", "decorated"],
 )
-async def test_fuzzy_matching_requires_same_length_positional_artist_sequence(
-    candidate_artists: Sequence[str],
+async def test_resolver_rejects_nonexact_music_release_titles(
+    candidate_title: str,
 ) -> None:
-    """Reject fuzzy candidates whose artist credits differ by order or length."""
-    mention = _mention(
-        release_title="abcdefghij",
-        artists=("First Artist", "Second Artist"),
-        release_year=None,
-    )
-    catalog = _FakeAlbumCatalog(
-        (
-            (
-                _candidate(
-                    title="abcdefghiX",
-                    artists=candidate_artists,
-                ),
-            ),
-        )
-    )
+    """Leave a shared-credit Candidate unresolved when its title differs."""
+    catalog = _FakeAlbumCatalog(((_candidate(title=candidate_title),),))
 
-    results = await _resolve_music_releases(SpotifyMusicResolver(catalog), [mention])
+    results = await _resolve_music_releases(SpotifyMusicResolver(catalog), [_mention()])
 
     assert results[0].status is ResultStatus.UNRESOLVED
+    assert results[0].music_release is None
 
 
-async def test_fuzzy_matching_accepts_the_inclusive_ninety_percent_threshold() -> None:
-    """Resolve a Candidate whose title similarity is exactly 0.90."""
-    mention = _mention(release_title="abcdefghij", artists=("Queen",), release_year=None)
-    catalog = _FakeAlbumCatalog(
-        (
-            (
-                _candidate(
-                    title="abcdefghiX",
-                    artists=("Queenz",),
-                ),
-            ),
-        )
-    )
+async def test_resolver_accepts_an_exactly_named_compilation() -> None:
+    """Resolve a directly named Compilation without edition-specific filtering."""
+    catalog = _FakeAlbumCatalog(((_candidate(album_type="compilation"),),))
 
-    results = await _resolve_music_releases(SpotifyMusicResolver(catalog), [mention])
+    results = await _resolve_music_releases(SpotifyMusicResolver(catalog), [_mention()])
 
     assert results[0].status is ResultStatus.RESOLVED
-
-
-async def test_fuzzy_matching_ignores_release_year() -> None:
-    """Resolve textual fuzzy matches even when their release years differ."""
-    mention = _mention(release_title="abcdefghij", artists=("Queen",), release_year=1975)
-    catalog = _FakeAlbumCatalog(
-        (
-            (
-                _candidate(
-                    title="abcdefghiX",
-                    artists=("Queen",),
-                    release_date="2001-02-26",
-                ),
-            ),
-        )
-    )
-
-    results = await _resolve_music_releases(SpotifyMusicResolver(catalog), [mention])
-
-    assert results[0].status is ResultStatus.RESOLVED
+    assert results[0].music_release is not None
+    assert results[0].music_release.album_type == "compilation"
 
 
 async def test_resolver_uses_provider_corrected_release_and_artist_values() -> None:
@@ -412,24 +353,6 @@ async def test_resolver_propagates_operational_catalog_failures(
         await _resolve_music_releases(resolver, [_mention()])
 
     assert error.value is catalog_error
-
-
-async def test_resolver_keeps_the_first_provider_ordered_fuzzy_candidate() -> None:
-    """Use provider ordering when multiple fuzzy Candidates are eligible."""
-    mention = _mention(release_title="abcdefghij", artists=("Queen",), release_year=None)
-    catalog = _FakeAlbumCatalog(
-        (
-            (
-                _candidate("first", title="abcdefghiX", artists=("Queen",)),
-                _candidate("second", title="abcdefghiY", artists=("Queen",)),
-            ),
-        )
-    )
-
-    results = await _resolve_music_releases(SpotifyMusicResolver(catalog), [mention])
-
-    assert results[0].music_release is not None
-    assert results[0].music_release.spotify_album_id == "first"
 
 
 async def test_resolver_drops_later_duplicate_album_ids_but_keeps_unresolved() -> None:

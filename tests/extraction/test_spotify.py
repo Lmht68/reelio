@@ -89,6 +89,7 @@ async def test_catalog_reuses_token_and_returns_playable_track_candidate() -> No
             "q": "Kiki's Delivery Service Yumi Arai",
             "type": "track",
             "market": "JP",
+            "offset": "0",
             "limit": "3",
         }
         return httpx.Response(
@@ -169,17 +170,16 @@ class _FakeClock:
 
 async def test_catalog_retries_one_bounded_rate_limit_with_a_fake_clock() -> None:
     """Honor one fitting Spotify Retry-After without wall-clock waiting."""
-    search_requests = 0
+    search_requests: list[httpx.Request] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
-        nonlocal search_requests
         if request.url.host == "accounts.spotify.test":
             return httpx.Response(
                 200,
                 json={"access_token": "access-token", "expires_in": 3600},
             )
-        search_requests += 1
-        if search_requests == 1:
+        search_requests.append(request)
+        if len(search_requests) == 1:
             return httpx.Response(429, headers={"Retry-After": "2"})
         return httpx.Response(
             200,
@@ -197,7 +197,18 @@ async def test_catalog_retries_one_bounded_rate_limit_with_a_fake_clock() -> Non
     candidates = await catalog.search_tracks("Kiki", _MARKET)
 
     assert candidates[0].spotify_track_id == "playable-track"
-    assert search_requests == 2
+    assert len(search_requests) == 2
+    assert all(
+        dict(request.url.params)
+        == {
+            "q": "Kiki",
+            "type": "track",
+            "market": "JP",
+            "offset": "0",
+            "limit": "3",
+        }
+        for request in search_requests
+    )
     assert clock.delays == [2.0]
     await catalog.aclose()
 
@@ -308,6 +319,7 @@ async def test_catalog_returns_ordered_album_candidates_and_empty_track_searches
             "q": "Kiki's Delivery Service",
             "type": "album",
             "market": "JP",
+            "offset": "0",
             "limit": "3",
         }
         albums = [_track_payload(f"track-{position}")["album"] for position in range(4)]

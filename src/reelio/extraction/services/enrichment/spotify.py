@@ -2,7 +2,6 @@
 
 import asyncio
 from collections.abc import Sequence
-from difflib import SequenceMatcher
 from typing import Protocol
 
 from reelio.extraction.market import SpotifyMarket
@@ -21,7 +20,6 @@ from reelio.extraction.types import (
     normalize_music_identity,
 )
 
-_FUZZY_MATCH_THRESHOLD = 0.90
 _CANDIDATE_LIMIT = 3
 
 
@@ -112,26 +110,12 @@ class SpotifyMusicResolver:
 
 def _build_track_query(track_mention: TrackMention) -> str:
     """Build one unescaped Spotify field-filter query for a Track Mention."""
-    query_terms = [
-        f"track:{track_mention.track_title}",
-        *(f"artist:{artist}" for artist in track_mention.artists),
-    ]
-    if track_mention.release_title is not None:
-        query_terms.append(f"album:{track_mention.release_title}")
-    if track_mention.release_year is not None:
-        query_terms.append(f"year:{track_mention.release_year}")
-    return " ".join(query_terms)
+    return f"track:{track_mention.track_title} artist:{track_mention.artists[0]}"
 
 
 def _build_album_query(music_release_mention: MusicReleaseMention) -> str:
     """Build one unescaped Spotify field-filter query for a Music Release Mention."""
-    query_terms = [
-        f"album:{music_release_mention.release_title}",
-        *(f"artist:{artist}" for artist in music_release_mention.artists),
-    ]
-    if music_release_mention.release_year is not None:
-        query_terms.append(f"year:{music_release_mention.release_year}")
-    return " ".join(query_terms)
+    return f"album:{music_release_mention.release_title} artist:{music_release_mention.artists[0]}"
 
 
 def _to_enriched_music_release(
@@ -156,23 +140,22 @@ def _resolve_track_mention(
 ) -> TrackResult:
     """Resolve one Track Mention from its provider-ordered bounded candidates."""
     bounded_candidates = candidates[:_CANDIDATE_LIMIT]
+    mention_artist_identities = {
+        normalize_music_identity(artist) for artist in track_mention.artists
+    }
+    artist_eligible_candidates = tuple(
+        candidate
+        for candidate in bounded_candidates
+        if _has_shared_artist_credit(mention_artist_identities, candidate.artists)
+    )
     candidate = next(
         (
             candidate
-            for candidate in bounded_candidates
-            if _is_exact_track_match(track_mention, candidate)
+            for candidate in artist_eligible_candidates
+            if _has_exact_track_titles(track_mention, candidate)
         ),
         None,
     )
-    if candidate is None:
-        candidate = next(
-            (
-                candidate
-                for candidate in bounded_candidates
-                if _is_fuzzy_track_match(track_mention, candidate)
-            ),
-            None,
-        )
     if candidate is None:
         return TrackResult(
             status=ResultStatus.UNRESOLVED,
@@ -201,23 +184,22 @@ def _resolve_music_release_mention(
 ) -> MusicReleaseResult:
     """Resolve one Music Release Mention from its bounded Album candidates."""
     bounded_candidates = candidates[:_CANDIDATE_LIMIT]
+    mention_artist_identities = {
+        normalize_music_identity(artist) for artist in music_release_mention.artists
+    }
+    artist_eligible_candidates = tuple(
+        candidate
+        for candidate in bounded_candidates
+        if _has_shared_artist_credit(mention_artist_identities, candidate.artists)
+    )
     candidate = next(
         (
             candidate
-            for candidate in bounded_candidates
-            if _is_exact_music_release_match(music_release_mention, candidate)
+            for candidate in artist_eligible_candidates
+            if _has_exact_music_release_title(music_release_mention, candidate)
         ),
         None,
     )
-    if candidate is None:
-        candidate = next(
-            (
-                candidate
-                for candidate in bounded_candidates
-                if _is_fuzzy_music_release_match(music_release_mention, candidate)
-            ),
-            None,
-        )
     if candidate is None:
         return MusicReleaseResult(
             status=ResultStatus.UNRESOLVED,
@@ -231,114 +213,36 @@ def _resolve_music_release_mention(
     )
 
 
-def _is_exact_track_match(track_mention: TrackMention, candidate: TrackCandidate) -> bool:
-    """Return whether every supplied Track identity field matches exactly."""
+def _has_exact_track_titles(track_mention: TrackMention, candidate: TrackCandidate) -> bool:
+    """Return whether required Track and attached Music Release titles match exactly."""
     if normalize_music_identity(track_mention.track_title) != normalize_music_identity(
         candidate.title
     ):
         return False
-    if not _has_matching_artist_sequence(track_mention.artists, candidate.artists):
-        return False
-    if track_mention.release_title is not None and (
+    return track_mention.release_title is None or (
         normalize_music_identity(track_mention.release_title)
-        != normalize_music_identity(candidate.album.title)
-    ):
-        return False
-    return track_mention.release_year is None or track_mention.release_year == int(
-        candidate.album.release_date[:4]
+        == normalize_music_identity(candidate.album.title)
     )
 
 
-def _is_fuzzy_track_match(track_mention: TrackMention, candidate: TrackCandidate) -> bool:
-    """Return whether every applicable textual Track field clears the fuzzy threshold."""
-    if not _has_fuzzy_artist_sequence(track_mention.artists, candidate.artists):
-        return False
-    if not _has_fuzzy_text_match(track_mention.track_title, candidate.title):
-        return False
-    return track_mention.release_title is None or _has_fuzzy_text_match(
-        track_mention.release_title,
-        candidate.album.title,
-    )
-
-
-def _is_exact_music_release_match(
+def _has_exact_music_release_title(
     music_release_mention: MusicReleaseMention,
     candidate: AlbumCandidate,
 ) -> bool:
-    """Return whether every supplied Music Release identity field matches exactly."""
-    if normalize_music_identity(music_release_mention.release_title) != normalize_music_identity(
-        candidate.title
-    ):
-        return False
-    if not _has_matching_artist_sequence(
-        music_release_mention.artists,
-        candidate.artists,
-    ):
-        return False
-    return music_release_mention.release_year is None or (
-        music_release_mention.release_year == int(candidate.release_date[:4])
-    )
+    """Return whether a Music Release title matches exactly."""
+    return normalize_music_identity(
+        music_release_mention.release_title
+    ) == normalize_music_identity(candidate.title)
 
 
-def _is_fuzzy_music_release_match(
-    music_release_mention: MusicReleaseMention,
-    candidate: AlbumCandidate,
-) -> bool:
-    """Return whether every supplied Music Release text clears the fuzzy threshold."""
-    if not _has_fuzzy_artist_sequence(
-        music_release_mention.artists,
-        candidate.artists,
-    ):
-        return False
-    return _has_fuzzy_text_match(
-        music_release_mention.release_title,
-        candidate.title,
-    )
-
-
-def _has_matching_artist_sequence(
-    mention_artists: Sequence[str],
+def _has_shared_artist_credit(
+    mention_artist_identities: set[str],
     candidate_artists: Sequence[ArtistCredit],
 ) -> bool:
-    """Return whether artist credits have equal length and positional identities."""
-    if len(mention_artists) != len(candidate_artists):
-        return False
-    return all(
-        normalize_music_identity(mention_artist) == normalize_music_identity(candidate_artist.name)
-        for mention_artist, candidate_artist in zip(
-            mention_artists,
-            candidate_artists,
-            strict=True,
-        )
-    )
-
-
-def _has_fuzzy_artist_sequence(
-    mention_artists: Sequence[str],
-    candidate_artists: Sequence[ArtistCredit],
-) -> bool:
-    """Return whether positional artist credits all clear the fuzzy threshold."""
-    if len(mention_artists) != len(candidate_artists):
-        return False
-    return all(
-        _has_fuzzy_text_match(mention_artist, candidate_artist.name)
-        for mention_artist, candidate_artist in zip(
-            mention_artists,
-            candidate_artists,
-            strict=True,
-        )
-    )
-
-
-def _has_fuzzy_text_match(left: str, right: str) -> bool:
-    """Return whether case-insensitive normalized text meets the inclusive threshold."""
-    return (
-        SequenceMatcher(
-            a=normalize_music_identity(left),
-            b=normalize_music_identity(right),
-            autojunk=False,
-        ).ratio()
-        >= _FUZZY_MATCH_THRESHOLD
+    """Return whether a Candidate shares a normalized Artist Credit with a Mention."""
+    return any(
+        normalize_music_identity(candidate_artist.name) in mention_artist_identities
+        for candidate_artist in candidate_artists
     )
 
 

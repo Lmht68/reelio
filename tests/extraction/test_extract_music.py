@@ -2,7 +2,8 @@
 
 import json
 from collections.abc import Callable, Iterator, Sequence
-from typing import cast
+from dataclasses import dataclass
+from typing import Literal, cast
 
 import httpx
 import pytest
@@ -22,7 +23,13 @@ from reelio.extraction.services.interpretation.service import MentionInterpretat
 from reelio.extraction.services.interpretation.types import LLMMessage
 from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import InspectedSource
-from reelio.extraction.types import Platform, Source, Transcript, TranscriptMethod
+from reelio.extraction.types import (
+    AlbumType,
+    Platform,
+    Source,
+    Transcript,
+    TranscriptMethod,
+)
 from reelio.main import app
 from tests.extraction.fakes import FakeScreenWorkResolver
 
@@ -76,10 +83,15 @@ class _TranscriptionService:
 
 
 class _InterpretationProvider:
-    """Return one strict Track interpretation response without network I/O."""
+    """Return one configured strict interpretation response without network I/O."""
 
-    def __init__(self) -> None:
-        """Initialize a provider with observable completion calls."""
+    def __init__(self, response: dict[str, object]) -> None:
+        """Initialize a provider with one observable response.
+
+        Args:
+            response: Strict interpretation response returned from every completion.
+        """
+        self._response = response
         self.calls: list[tuple[LLMMessage, ...]] = []
         self.closed = False
 
@@ -94,29 +106,9 @@ class _InterpretationProvider:
         return "deterministic-track-provider"
 
     async def complete(self, messages: Sequence[LLMMessage]) -> str:
-        """Return one response with a Track and a Music Release Mention."""
+        """Return the configured strict interpretation response."""
         self.calls.append(tuple(messages))
-        return json.dumps(
-            {
-                "movies": [],
-                "tv_series": [],
-                "tracks": [
-                    {
-                        "track_title": "One More Time",
-                        "artists": ["Daft Punk"],
-                        "release_title": "Discovery",
-                        "release_year": 2001,
-                    }
-                ],
-                "music_releases": [
-                    {
-                        "release_title": "Discovery",
-                        "artists": ["Daft Punk"],
-                        "release_year": 2001,
-                    }
-                ],
-            }
-        )
+        return json.dumps(self._response)
 
     async def aclose(self) -> None:
         """Record pipeline-owned interpretation-provider closure."""
@@ -157,93 +149,91 @@ def _spotify_images(image_set: str) -> list[dict[str, int | str]]:
     ]
 
 
-def _spotify_track_payload(include_images: bool) -> dict[str, object]:
-    """Return one relinked Spotify Track payload matching the interpreted Track."""
+def _spotify_artist_payloads(artist_names: Sequence[str]) -> list[dict[str, str]]:
+    """Return Spotify Artist Credit payloads in the supplied order."""
+    return [
+        {"id": f"artist-{index}", "name": artist_name}
+        for index, artist_name in enumerate(artist_names)
+    ]
+
+
+def _spotify_track_payload(
+    *,
+    spotify_track_id: str = "playable-track",
+    title: str = "One More Time",
+    artist_names: Sequence[str] = ("Daft Punk",),
+    attached_album_id: str = "attached-album",
+    attached_album_title: str = "Discovery",
+    attached_album_artist_names: Sequence[str] = ("Daft Punk",),
+    attached_album_release_date: str = "2001",
+    attached_album_type: AlbumType = "album",
+    include_images: bool = True,
+) -> dict[str, object]:
+    """Return one relinked Spotify Track payload with configurable music metadata."""
     return {
-        "id": "playable-track",
-        "name": "One More Time",
-        "artists": [{"id": "4tZwfgrHOc3mvqYlEYSvVi", "name": "Daft Punk"}],
-        "external_urls": {"spotify": "https://open.spotify.com/track/playable-track"},
+        "id": spotify_track_id,
+        "name": title,
+        "artists": _spotify_artist_payloads(artist_names),
+        "external_urls": {"spotify": f"https://open.spotify.com/track/{spotify_track_id}"},
         "linked_from": {"id": "original-track"},
         "album": {
-            "id": "attached-album",
-            "name": "Discovery",
-            "artists": [{"id": "4tZwfgrHOc3mvqYlEYSvVi", "name": "Daft Punk"}],
-            "external_urls": {"spotify": "https://open.spotify.com/album/attached-album"},
-            "release_date": "2001",
-            "album_type": "album",
+            "id": attached_album_id,
+            "name": attached_album_title,
+            "artists": _spotify_artist_payloads(attached_album_artist_names),
+            "external_urls": {"spotify": f"https://open.spotify.com/album/{attached_album_id}"},
+            "release_date": attached_album_release_date,
+            "album_type": attached_album_type,
             "images": _spotify_images("attached") if include_images else [],
         },
     }
 
 
-def _spotify_album_payload(include_images: bool) -> dict[str, object]:
-    """Return one Spotify Album payload matching the interpreted Music Release."""
+def _spotify_album_payload(
+    *,
+    spotify_album_id: str = "direct-album",
+    title: str = "Discovery",
+    artist_names: Sequence[str] = ("Daft Punk",),
+    release_date: str = "2001-02",
+    album_type: AlbumType = "album",
+    include_images: bool = True,
+) -> dict[str, object]:
+    """Return one Spotify Album payload with configurable music metadata."""
     return {
-        "id": "direct-album",
-        "name": "Discovery",
-        "artists": [{"id": "4tZwfgrHOc3mvqYlEYSvVi", "name": "Daft Punk"}],
-        "external_urls": {"spotify": "https://open.spotify.com/album/direct-album"},
-        "release_date": "2001-02",
-        "album_type": "album",
+        "id": spotify_album_id,
+        "name": title,
+        "artists": _spotify_artist_payloads(artist_names),
+        "external_urls": {"spotify": f"https://open.spotify.com/album/{spotify_album_id}"},
+        "release_date": release_date,
+        "album_type": album_type,
         "images": _spotify_images("direct") if include_images else [],
     }
 
 
-@pytest.mark.parametrize(
-    ("include_images", "attached_cover_url", "direct_cover_url"),
-    [
-        (
-            True,
-            "https://i.scdn.co/image/attached-primary",
-            "https://i.scdn.co/image/direct-primary",
-        ),
-        (False, None, None),
-    ],
-    ids=["provider-images", "no-provider-images"],
-)
-async def test_extract_resolves_music_through_mocked_spotify_catalog(
-    include_images: bool,
-    attached_cover_url: str | None,
-    direct_cover_url: str | None,
-) -> None:
-    """Expose a resolved Track and Music Release through the in-process HTTP endpoint."""
-    requests: list[httpx.Request] = []
+def _interpretation_response(
+    *,
+    tracks: list[dict[str, object]],
+    music_releases: list[dict[str, object]],
+) -> dict[str, object]:
+    """Return a complete strict interpretation response with supplied Music Mentions."""
+    return {
+        "movies": [],
+        "tv_series": [],
+        "tracks": tracks,
+        "music_releases": music_releases,
+    }
 
-    async def handle(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if request.url.host == "accounts.spotify.test":
-            assert request.method == "POST"
-            return httpx.Response(
-                200,
-                json={"access_token": "test-access-token", "expires_in": 3600},
-            )
 
-        assert request.method == "GET"
-        assert request.url.path == "/v1/search"
-        assert request.headers["authorization"] == "Bearer test-access-token"
-        params = dict(request.url.params)
-        assert params["market"] == "JP"
-        assert params["limit"] == "3"
-        if params["type"] == "track":
-            assert params["q"] == ("track:One More Time artist:Daft Punk album:Discovery year:2001")
-            return httpx.Response(
-                200,
-                json={"tracks": {"items": [_spotify_track_payload(include_images)]}},
-            )
-        assert params["type"] == "album"
-        assert params["q"] == "album:Discovery artist:Daft Punk year:2001"
-        return httpx.Response(
-            200,
-            json={"albums": {"items": [_spotify_album_payload(include_images)]}},
-        )
-
+async def _post_extract(
+    interpretation_response: dict[str, object],
+    spotify_transport: httpx.AsyncBaseTransport,
+) -> tuple[httpx.Response, _InterpretationProvider, httpx.AsyncClient]:
+    """Run the real extraction pipeline through the HTTP endpoint and close its owners."""
     http_client = httpx.AsyncClient(
         base_url="https://api.spotify.test/v1/",
-        transport=httpx.MockTransport(handle),
+        transport=spotify_transport,
     )
     catalog = SpotifyCatalog(http_client, _spotify_settings())
-    interpretation_provider = _InterpretationProvider()
+    interpretation_provider = _InterpretationProvider(interpretation_response)
     pipeline = ExtractionPipeline(
         _MetadataService(),
         _TranscriptionService(),
@@ -267,80 +257,593 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog(
         await pipeline.aclose()
         await catalog.aclose()
 
+    return response, interpretation_provider, http_client
+
+
+@dataclass(frozen=True)
+class _ExactResolutionScenario:
+    """Define one endpoint-visible exact Music resolution outcome."""
+
+    interpretation_response: dict[str, object]
+    search_type: Literal["track", "album"]
+    search_query: str
+    candidates: tuple[dict[str, object], ...]
+    result_list_key: Literal["tracks", "music_releases"]
+    mention_key: Literal["track_mention", "music_release_mention"]
+    entity_key: Literal["track", "music_release"]
+    mention: dict[str, object]
+    expected_status: Literal["resolved", "unresolved"]
+    expected_spotify_id: str | None
+
+
+@pytest.mark.parametrize(
+    ("include_images", "attached_cover_url", "direct_cover_url"),
+    [
+        (
+            True,
+            "https://i.scdn.co/image/attached-primary",
+            "https://i.scdn.co/image/direct-primary",
+        ),
+        (False, None, None),
+    ],
+    ids=["provider-images", "no-provider-images"],
+)
+async def test_extract_resolves_music_through_mocked_spotify_catalog(
+    include_images: bool,
+    attached_cover_url: str | None,
+    direct_cover_url: str | None,
+) -> None:
+    """Expose exact shared-credit Music resolution through the in-process endpoint."""
+    requests: list[httpx.Request] = []
+    track_mention = {
+        "track_title": "One More Time",
+        "artists": ["Daft Punk", "Romanthony"],
+        "release_title": "Discovery",
+        "release_year": 2001,
+    }
+    music_release_mention = {
+        "release_title": "Discovery",
+        "artists": ["Daft Punk", "Romanthony"],
+        "release_year": 2001,
+    }
+    interpretation_response = _interpretation_response(
+        tracks=[track_mention],
+        music_releases=[music_release_mention],
+    )
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "accounts.spotify.test":
+            assert request.method == "POST"
+            return httpx.Response(
+                200,
+                json={"access_token": "test-access-token", "expires_in": 3600},
+            )
+
+        assert request.method == "GET"
+        assert request.url.path == "/v1/search"
+        assert request.headers["authorization"] == "Bearer test-access-token"
+        params = dict(request.url.params)
+        if params["type"] == "track":
+            return httpx.Response(
+                200,
+                json={
+                    "tracks": {
+                        "items": [
+                            _spotify_track_payload(
+                                artist_names=("  romanthony  ", "Additional Artist"),
+                                attached_album_artist_names=(
+                                    "DAFT PUNK",
+                                    "Additional Artist",
+                                ),
+                                attached_album_release_date="2025",
+                                include_images=include_images,
+                            )
+                        ]
+                    }
+                },
+            )
+        assert params["type"] == "album"
+        return httpx.Response(
+            200,
+            json={
+                "albums": {
+                    "items": [
+                        _spotify_album_payload(
+                            artist_names=("Additional Artist", "DAFT PUNK"),
+                            release_date="2025-02",
+                            include_images=include_images,
+                        )
+                    ]
+                }
+            },
+        )
+
+    response, interpretation_provider, http_client = await _post_extract(
+        interpretation_response,
+        httpx.MockTransport(handle),
+    )
+
     assert response.status_code == 200
     assert interpretation_provider.closed is True
     assert http_client.is_closed is True
     assert len(interpretation_provider.calls) == 1
     assert len(requests) == 3
     assert sum(request.method == "POST" for request in requests) == 1
-    assert sum(request.method == "GET" for request in requests) == 2
-    assert response.json()["market"] == "JP"
-    assert set(response.json()["results"]) == {
-        "movies",
-        "tv_series",
-        "tracks",
-        "music_releases",
+    search_parameters = {
+        request.url.params["type"]: dict(request.url.params)
+        for request in requests
+        if request.method == "GET"
     }
-    assert response.json()["results"]["movies"] == []
-    assert response.json()["results"]["tv_series"] == []
-    assert response.json()["results"]["tracks"] == [
-        {
-            "status": "resolved",
-            "track_mention": {
-                "track_title": "One More Time",
-                "artists": ["Daft Punk"],
-                "release_title": "Discovery",
-                "release_year": 2001,
-            },
-            "track": {
-                "track_title": "One More Time",
-                "artists": [
+    assert search_parameters == {
+        "track": {
+            "q": "track:One More Time artist:Daft Punk",
+            "type": "track",
+            "market": "JP",
+            "offset": "0",
+            "limit": "3",
+        },
+        "album": {
+            "q": "album:Discovery artist:Daft Punk",
+            "type": "album",
+            "market": "JP",
+            "offset": "0",
+            "limit": "3",
+        },
+    }
+
+    response_body = response.json()
+    assert response_body["market"] == "JP"
+    assert response_body["results"]["movies"] == []
+    assert response_body["results"]["tv_series"] == []
+    track_result = response_body["results"]["tracks"][0]
+    assert track_result["status"] == "resolved"
+    assert track_result["track_mention"] == track_mention
+    assert track_result["track"] == {
+        "track_title": "One More Time",
+        "artists": [
+            {"spotify_artist_id": "artist-0", "name": "romanthony"},
+            {"spotify_artist_id": "artist-1", "name": "Additional Artist"},
+        ],
+        "spotify_track_id": "playable-track",
+        "spotify_url": "https://open.spotify.com/track/playable-track",
+        "preferred_music_release": {
+            "release_title": "Discovery",
+            "artists": [
+                {"spotify_artist_id": "artist-0", "name": "DAFT PUNK"},
+                {"spotify_artist_id": "artist-1", "name": "Additional Artist"},
+            ],
+            "release_date": "2025",
+            "album_type": "album",
+            "spotify_album_id": "attached-album",
+            "spotify_url": "https://open.spotify.com/album/attached-album",
+            "cover_url": attached_cover_url,
+        },
+        "cover_url": attached_cover_url,
+    }
+    music_release_result = response_body["results"]["music_releases"][0]
+    assert music_release_result["status"] == "resolved"
+    assert music_release_result["music_release_mention"] == music_release_mention
+    assert music_release_result["music_release"] == {
+        "release_title": "Discovery",
+        "artists": [
+            {"spotify_artist_id": "artist-0", "name": "Additional Artist"},
+            {"spotify_artist_id": "artist-1", "name": "DAFT PUNK"},
+        ],
+        "release_date": "2025-02",
+        "album_type": "album",
+        "spotify_album_id": "direct-album",
+        "spotify_url": "https://open.spotify.com/album/direct-album",
+        "cover_url": direct_cover_url,
+    }
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        _ExactResolutionScenario(
+            interpretation_response=_interpretation_response(
+                tracks=[
                     {
-                        "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
-                        "name": "Daft Punk",
+                        "track_title": "Standalone",
+                        "artists": ["Artist One"],
+                        "release_title": None,
+                        "release_year": None,
                     }
                 ],
-                "spotify_track_id": "playable-track",
-                "spotify_url": "https://open.spotify.com/track/playable-track",
-                "preferred_music_release": {
-                    "release_title": "Discovery",
-                    "artists": [
-                        {
-                            "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
-                            "name": "Daft Punk",
-                        }
-                    ],
-                    "release_date": "2001",
-                    "album_type": "album",
-                    "spotify_album_id": "attached-album",
-                    "spotify_url": "https://open.spotify.com/album/attached-album",
-                    "cover_url": attached_cover_url,
-                },
-                "cover_url": attached_cover_url,
+                music_releases=[],
+            ),
+            search_type="track",
+            search_query="track:Standalone artist:Artist One",
+            candidates=(
+                _spotify_track_payload(
+                    spotify_track_id="standalone",
+                    title="Standalone",
+                    artist_names=("Artist One",),
+                    attached_album_title="Unrelated Album",
+                ),
+            ),
+            result_list_key="tracks",
+            mention_key="track_mention",
+            entity_key="track",
+            mention={
+                "track_title": "Standalone",
+                "artists": ["Artist One"],
+                "release_title": None,
+                "release_year": None,
             },
-        }
-    ]
-    assert response.json()["results"]["music_releases"] == [
-        {
-            "status": "resolved",
-            "music_release_mention": {
-                "release_title": "Discovery",
-                "artists": ["Daft Punk"],
-                "release_year": 2001,
-            },
-            "music_release": {
-                "release_title": "Discovery",
-                "artists": [
+            expected_status="resolved",
+            expected_spotify_id="standalone",
+        ),
+        _ExactResolutionScenario(
+            interpretation_response=_interpretation_response(
+                tracks=[
                     {
-                        "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
-                        "name": "Daft Punk",
+                        "track_title": "Context Song",
+                        "artists": ["Artist One"],
+                        "release_title": "Context Album",
+                        "release_year": 1999,
                     }
                 ],
-                "release_date": "2001-02",
-                "album_type": "album",
-                "spotify_album_id": "direct-album",
-                "spotify_url": "https://open.spotify.com/album/direct-album",
-                "cover_url": direct_cover_url,
+                music_releases=[],
+            ),
+            search_type="track",
+            search_query="track:Context Song artist:Artist One",
+            candidates=(
+                _spotify_track_payload(
+                    spotify_track_id="wrong-context",
+                    title="Context Song",
+                    artist_names=("Artist One",),
+                    attached_album_title="Other Album",
+                ),
+                _spotify_track_payload(
+                    spotify_track_id="exact-context",
+                    title="Context Song",
+                    artist_names=("Artist One",),
+                    attached_album_title="Context Album",
+                    attached_album_release_date="2025",
+                ),
+            ),
+            result_list_key="tracks",
+            mention_key="track_mention",
+            entity_key="track",
+            mention={
+                "track_title": "Context Song",
+                "artists": ["Artist One"],
+                "release_title": "Context Album",
+                "release_year": 1999,
             },
+            expected_status="resolved",
+            expected_spotify_id="exact-context",
+        ),
+        _ExactResolutionScenario(
+            interpretation_response=_interpretation_response(
+                tracks=[
+                    {
+                        "track_title": "Context Song",
+                        "artists": ["Artist One"],
+                        "release_title": "Context Album",
+                        "release_year": None,
+                    }
+                ],
+                music_releases=[],
+            ),
+            search_type="track",
+            search_query="track:Context Song artist:Artist One",
+            candidates=(
+                _spotify_track_payload(
+                    spotify_track_id="wrong-context",
+                    title="Context Song",
+                    artist_names=("Artist One",),
+                    attached_album_title="Other Album",
+                ),
+            ),
+            result_list_key="tracks",
+            mention_key="track_mention",
+            entity_key="track",
+            mention={
+                "track_title": "Context Song",
+                "artists": ["Artist One"],
+                "release_title": "Context Album",
+                "release_year": None,
+            },
+            expected_status="unresolved",
+            expected_spotify_id=None,
+        ),
+        _ExactResolutionScenario(
+            interpretation_response=_interpretation_response(
+                tracks=[],
+                music_releases=[
+                    {
+                        "release_title": "Compilation",
+                        "artists": ["Artist One"],
+                        "release_year": 2000,
+                    }
+                ],
+            ),
+            search_type="album",
+            search_query="album:Compilation artist:Artist One",
+            candidates=(
+                _spotify_album_payload(
+                    spotify_album_id="compilation",
+                    title="Compilation",
+                    artist_names=("Artist One",),
+                    album_type="compilation",
+                ),
+            ),
+            result_list_key="music_releases",
+            mention_key="music_release_mention",
+            entity_key="music_release",
+            mention={
+                "release_title": "Compilation",
+                "artists": ["Artist One"],
+                "release_year": 2000,
+            },
+            expected_status="resolved",
+            expected_spotify_id="compilation",
+        ),
+        _ExactResolutionScenario(
+            interpretation_response=_interpretation_response(
+                tracks=[
+                    {
+                        "track_title": "No Shared Artist",
+                        "artists": ["Artist One"],
+                        "release_title": None,
+                        "release_year": None,
+                    }
+                ],
+                music_releases=[],
+            ),
+            search_type="track",
+            search_query="track:No Shared Artist artist:Artist One",
+            candidates=(
+                _spotify_track_payload(
+                    title="No Shared Artist",
+                    artist_names=("Other Artist",),
+                ),
+            ),
+            result_list_key="tracks",
+            mention_key="track_mention",
+            entity_key="track",
+            mention={
+                "track_title": "No Shared Artist",
+                "artists": ["Artist One"],
+                "release_title": None,
+                "release_year": None,
+            },
+            expected_status="unresolved",
+            expected_spotify_id=None,
+        ),
+        _ExactResolutionScenario(
+            interpretation_response=_interpretation_response(
+                tracks=[],
+                music_releases=[
+                    {
+                        "release_title": "Exact Album",
+                        "artists": ["Artist One"],
+                        "release_year": None,
+                    }
+                ],
+            ),
+            search_type="album",
+            search_query="album:Exact Album artist:Artist One",
+            candidates=(
+                _spotify_album_payload(
+                    title="Exact Albums",
+                    artist_names=("Artist One",),
+                ),
+            ),
+            result_list_key="music_releases",
+            mention_key="music_release_mention",
+            entity_key="music_release",
+            mention={
+                "release_title": "Exact Album",
+                "artists": ["Artist One"],
+                "release_year": None,
+            },
+            expected_status="unresolved",
+            expected_spotify_id=None,
+        ),
+        _ExactResolutionScenario(
+            interpretation_response=_interpretation_response(
+                tracks=[],
+                music_releases=[
+                    {
+                        "release_title": "Exact Album",
+                        "artists": ["Artist One"],
+                        "release_year": None,
+                    }
+                ],
+            ),
+            search_type="album",
+            search_query="album:Exact Album artist:Artist One",
+            candidates=(
+                _spotify_album_payload(
+                    title="Exact Album (Deluxe Edition)",
+                    artist_names=("Artist One",),
+                ),
+            ),
+            result_list_key="music_releases",
+            mention_key="music_release_mention",
+            entity_key="music_release",
+            mention={
+                "release_title": "Exact Album",
+                "artists": ["Artist One"],
+                "release_year": None,
+            },
+            expected_status="unresolved",
+            expected_spotify_id=None,
+        ),
+        _ExactResolutionScenario(
+            interpretation_response=_interpretation_response(
+                tracks=[
+                    {
+                        "track_title": "First Exact",
+                        "artists": ["Artist One"],
+                        "release_title": None,
+                        "release_year": None,
+                    }
+                ],
+                music_releases=[],
+            ),
+            search_type="track",
+            search_query="track:First Exact artist:Artist One",
+            candidates=(
+                _spotify_track_payload(
+                    spotify_track_id="first-exact",
+                    title="First Exact",
+                    artist_names=("Artist One",),
+                ),
+                _spotify_track_payload(
+                    spotify_track_id="second-exact",
+                    title="First Exact",
+                    artist_names=("Artist One",),
+                ),
+            ),
+            result_list_key="tracks",
+            mention_key="track_mention",
+            entity_key="track",
+            mention={
+                "track_title": "First Exact",
+                "artists": ["Artist One"],
+                "release_title": None,
+                "release_year": None,
+            },
+            expected_status="resolved",
+            expected_spotify_id="first-exact",
+        ),
+        _ExactResolutionScenario(
+            interpretation_response=_interpretation_response(
+                tracks=[],
+                music_releases=[
+                    {
+                        "release_title": "Bounded Album",
+                        "artists": ["Artist One"],
+                        "release_year": None,
+                    }
+                ],
+            ),
+            search_type="album",
+            search_query="album:Bounded Album artist:Artist One",
+            candidates=(
+                _spotify_album_payload(title="Wrong One", artist_names=("Artist One",)),
+                _spotify_album_payload(title="Wrong Two", artist_names=("Artist One",)),
+                _spotify_album_payload(title="Wrong Three", artist_names=("Artist One",)),
+                _spotify_album_payload(
+                    spotify_album_id="fourth-exact",
+                    title="Bounded Album",
+                    artist_names=("Artist One",),
+                ),
+            ),
+            result_list_key="music_releases",
+            mention_key="music_release_mention",
+            entity_key="music_release",
+            mention={
+                "release_title": "Bounded Album",
+                "artists": ["Artist One"],
+                "release_year": None,
+            },
+            expected_status="unresolved",
+            expected_spotify_id=None,
+        ),
+    ],
+    ids=[
+        "track-without-context",
+        "track-context-uses-later-exact-candidate",
+        "track-context-unresolved",
+        "direct-compilation",
+        "no-shared-artist",
+        "near-title",
+        "decorated-title",
+        "first-exact-candidate",
+        "fourth-candidate-is-ignored",
+    ],
+)
+async def test_extract_applies_the_exact_music_resolution_matrix(
+    scenario: _ExactResolutionScenario,
+) -> None:
+    """Expose exact-only Music resolution and the first-three Candidate bound."""
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "test-access-token", "expires_in": 3600},
+            )
+
+        assert request.method == "GET"
+        assert dict(request.url.params) == {
+            "q": scenario.search_query,
+            "type": scenario.search_type,
+            "market": "JP",
+            "offset": "0",
+            "limit": "3",
         }
-    ]
+        result_key = "tracks" if scenario.search_type == "track" else "albums"
+        return httpx.Response(
+            200,
+            json={result_key: {"items": list(scenario.candidates)}},
+        )
+
+    response, interpretation_provider, http_client = await _post_extract(
+        scenario.interpretation_response,
+        httpx.MockTransport(handle),
+    )
+
+    assert response.status_code == 200
+    assert interpretation_provider.closed is True
+    assert http_client.is_closed is True
+    assert len(interpretation_provider.calls) == 1
+    assert sum(request.method == "POST" for request in requests) == 1
+    assert sum(request.method == "GET" for request in requests) == 1
+    result = response.json()["results"][scenario.result_list_key][0]
+    assert result[scenario.mention_key] == scenario.mention
+    assert result["status"] == scenario.expected_status
+    if scenario.expected_spotify_id is None:
+        assert result[scenario.entity_key] is None
+    else:
+        spotify_id_key = (
+            "spotify_track_id" if scenario.search_type == "track" else "spotify_album_id"
+        )
+        assert result[scenario.entity_key][spotify_id_key] == scenario.expected_spotify_id
+
+
+async def test_extract_returns_atomic_catalog_failure_without_music_results() -> None:
+    """Map a Spotify search failure to the existing provider-error response."""
+    interpretation_response = _interpretation_response(
+        tracks=[
+            {
+                "track_title": "One More Time",
+                "artists": ["Daft Punk"],
+                "release_title": None,
+                "release_year": None,
+            }
+        ],
+        music_releases=[],
+    )
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "test-access-token", "expires_in": 3600},
+            )
+        assert request.method == "GET"
+        return httpx.Response(503)
+
+    response, interpretation_provider, http_client = await _post_extract(
+        interpretation_response,
+        httpx.MockTransport(handle),
+    )
+
+    assert interpretation_provider.closed is True
+    assert http_client.is_closed is True
+    assert response.status_code == 502
+    assert response.json() == {
+        "error": {
+            "code": "catalog_provider_failed",
+            "message": "Spotify catalog request failed.",
+        }
+    }
