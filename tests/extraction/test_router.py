@@ -1054,8 +1054,14 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert "offset zero and limit three" in description
     assert "first ordered Artist Credit only" in description
     assert "at least one Artist Credit matches any Mention Artist Credit" in description
-    assert "matches exactly under Music Identity Normalization" in description
     assert "exact title equality across every artist-eligible Candidate" in description
+    assert "before reusing the same bounded artist-eligible Candidate sequence" in description
+    assert "Equivalent Track Versions" in description
+    assert "complete trailing remaster and bonus designations" in description
+    assert "release-only Track variants" in description
+    assert "explicit Music Release context" in description
+    assert "attached Album title that is exact or equivalent" in description
+    assert "without release context, the attached Album does not constrain matching" in description
     assert "same bounded artist-eligible Candidate sequence" in description
     assert "without another Spotify search" in description
     assert "right to left" in description
@@ -1066,6 +1072,8 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert "Release year does not participate in retrieval or Candidate verification" in description
     assert "fuzzy" not in description.lower()
     assert "90 percent" not in description.lower()
+    assert "every ordered Artist Credit" not in description
+    assert "release year must match" not in description.lower()
     assert {"200", "400", "404", "413", "500", "502", "504", "422"} <= set(responses)
     for status_code in ("400", "404", "413", "500", "502", "504"):
         schema = responses[status_code]["content"]["application/json"]["schema"]
@@ -1127,6 +1135,11 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "release_title": "Discovery",
         "release_year": 2001,
     }
+    assert resolved_track_example["track"]["track_title"] == ("One More Time (2011 Remaster)")
+    assert (
+        resolved_track_example["track"]["track_title"]
+        != resolved_track_example["track_mention"]["track_title"]
+    )
     assert set(resolved_track_example["track"]) == {
         "track_title",
         "artists",
@@ -1144,6 +1157,13 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "spotify_url",
         "cover_url",
     }
+    assert resolved_track_example["track"]["preferred_music_release"]["release_title"] == (
+        "Discovery (Deluxe Edition)"
+    )
+    assert (
+        resolved_track_example["track"]["preferred_music_release"]["release_title"]
+        != resolved_track_example["track_mention"]["release_title"]
+    )
     assert (
         resolved_track_example["track"]["cover_url"]
         == resolved_track_example["track"]["preferred_music_release"]["cover_url"]

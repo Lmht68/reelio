@@ -331,6 +331,8 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog(
                     "tracks": {
                         "items": [
                             _spotify_track_payload(
+                                title="One More Time (2011 Remaster)",
+                                attached_album_title="Discovery (Deluxe Edition)",
                                 artist_names=("  romanthony  ", "Additional Artist"),
                                 attached_album_artist_names=(
                                     "DAFT PUNK",
@@ -350,6 +352,7 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog(
                 "albums": {
                     "items": [
                         _spotify_album_payload(
+                            title="Discovery (Bonus Edition)",
                             artist_names=("Additional Artist", "DAFT PUNK"),
                             release_date="2025-02",
                             include_images=include_images,
@@ -400,7 +403,7 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog(
     assert track_result["status"] == "resolved"
     assert track_result["track_mention"] == track_mention
     assert track_result["track"] == {
-        "track_title": "One More Time",
+        "track_title": "One More Time (2011 Remaster)",
         "artists": [
             {"spotify_artist_id": "artist-0", "name": "romanthony"},
             {"spotify_artist_id": "artist-1", "name": "Additional Artist"},
@@ -408,7 +411,7 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog(
         "spotify_track_id": "playable-track",
         "spotify_url": "https://open.spotify.com/track/playable-track",
         "preferred_music_release": {
-            "release_title": "Discovery",
+            "release_title": "Discovery (Deluxe Edition)",
             "artists": [
                 {"spotify_artist_id": "artist-0", "name": "DAFT PUNK"},
                 {"spotify_artist_id": "artist-1", "name": "Additional Artist"},
@@ -425,7 +428,7 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog(
     assert music_release_result["status"] == "resolved"
     assert music_release_result["music_release_mention"] == music_release_mention
     assert music_release_result["music_release"] == {
-        "release_title": "Discovery",
+        "release_title": "Discovery (Bonus Edition)",
         "artists": [
             {"spotify_artist_id": "artist-0", "name": "Additional Artist"},
             {"spotify_artist_id": "artist-1", "name": "DAFT PUNK"},
@@ -828,32 +831,88 @@ async def _extract_direct_music_release(
     return cast(dict[str, object], result)
 
 
+async def _extract_track_version(
+    track_title: str,
+    candidates: tuple[dict[str, object], ...],
+    *,
+    release_title: str | None = None,
+    release_year: int | None = None,
+) -> dict[str, object]:
+    """Resolve one Track through the in-process extraction endpoint."""
+    track_mention: dict[str, object] = {
+        "track_title": track_title,
+        "artists": ["Daft Punk"],
+        "release_title": release_title,
+        "release_year": release_year,
+    }
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "accounts.spotify.test":
+            assert request.method == "POST"
+            return httpx.Response(
+                200,
+                json={"access_token": "test-access-token", "expires_in": 3600},
+            )
+
+        assert request.method == "GET"
+        assert request.url.path == "/v1/search"
+        assert request.headers["authorization"] == "Bearer test-access-token"
+        assert dict(request.url.params) == {
+            "q": f"track:{track_title} artist:Daft Punk",
+            "type": "track",
+            "market": "JP",
+            "offset": "0",
+            "limit": "3",
+        }
+        return httpx.Response(200, json={"tracks": {"items": list(candidates)}})
+
+    response, interpretation_provider, http_client = await _post_extract(
+        _interpretation_response(tracks=[track_mention], music_releases=[]),
+        httpx.MockTransport(handle),
+    )
+
+    assert response.status_code == 200
+    assert interpretation_provider.closed is True
+    assert http_client.is_closed is True
+    assert len(interpretation_provider.calls) == 1
+    assert sum(request.method == "POST" for request in requests) == 1
+    assert sum(request.method == "GET" for request in requests) == 1
+    result = response.json()["results"]["tracks"][0]
+    assert result["track_mention"] == track_mention
+    return cast(dict[str, object], result)
+
+
+_MUSIC_RELEASE_EDITION_CASES: tuple[tuple[str, str], ...] = (
+    ("Discovery (Remaster)", "remaster"),
+    ("Discovery [Remastered]", "remastered"),
+    ("Discovery - Remastered Version", "remastered-version"),
+    ("Discovery: 2011 Remaster", "year-remaster"),
+    ("Discovery (Remastered 2011)", "remastered-year"),
+    ("Discovery [2011 Remastered Version]", "year-remastered-version"),
+    ("Discovery - Deluxe", "deluxe"),
+    ("Discovery: Deluxe Edition", "deluxe-edition"),
+    ("Discovery (sUPER   dELUXE   Edition)", "super-deluxe"),
+    ("Discovery [Expanded Edition]", "expanded"),
+    ("Discovery - Special Edition", "special"),
+    ("Discovery: Anniversary Edition", "anniversary"),
+    ("Discovery (1st Anniversary)", "first-anniversary"),
+    ("Discovery [2nd Anniversary Edition]", "second-anniversary"),
+    ("Discovery - 3rd Anniversary", "third-anniversary"),
+    ("Discovery: 20th Anniversary Edition", "twentieth-anniversary"),
+    ("Discovery (Reissue)", "reissue"),
+    ("Discovery [Reissued]", "reissued"),
+    ("Discovery - Bonus Edition", "bonus-edition"),
+    ("Discovery: Bonus Version", "bonus-version"),
+    ("Discovery (Bonus Track)", "bonus-track"),
+    ("Discovery [Bonus Track Version]", "bonus-track-version"),
+)
+
+
 @pytest.mark.parametrize(
     ("candidate_title", "spotify_album_id"),
-    [
-        ("Discovery (Remaster)", "remaster"),
-        ("Discovery [Remastered]", "remastered"),
-        ("Discovery - Remastered Version", "remastered-version"),
-        ("Discovery: 2011 Remaster", "year-remaster"),
-        ("Discovery (Remastered 2011)", "remastered-year"),
-        ("Discovery [2011 Remastered Version]", "year-remastered-version"),
-        ("Discovery - Deluxe", "deluxe"),
-        ("Discovery: Deluxe Edition", "deluxe-edition"),
-        ("Discovery (sUPER   dELUXE   Edition)", "super-deluxe"),
-        ("Discovery [Expanded Edition]", "expanded"),
-        ("Discovery - Special Edition", "special"),
-        ("Discovery: Anniversary Edition", "anniversary"),
-        ("Discovery (1st Anniversary)", "first-anniversary"),
-        ("Discovery [2nd Anniversary Edition]", "second-anniversary"),
-        ("Discovery - 3rd Anniversary", "third-anniversary"),
-        ("Discovery: 20th Anniversary Edition", "twentieth-anniversary"),
-        ("Discovery (Reissue)", "reissue"),
-        ("Discovery [Reissued]", "reissued"),
-        ("Discovery - Bonus Edition", "bonus-edition"),
-        ("Discovery: Bonus Version", "bonus-version"),
-        ("Discovery (Bonus Track)", "bonus-track"),
-        ("Discovery [Bonus Track Version]", "bonus-track-version"),
-    ],
+    _MUSIC_RELEASE_EDITION_CASES,
 )
 async def test_extract_resolves_every_supported_music_release_edition_designation(
     candidate_title: str,
@@ -873,6 +932,359 @@ async def test_extract_resolves_every_supported_music_release_edition_designatio
     assert result["status"] == "resolved"
     music_release = cast(dict[str, object], result["music_release"])
     assert music_release["spotify_album_id"] == spotify_album_id
+
+
+@pytest.mark.parametrize(
+    ("candidate_title", "spotify_track_id"),
+    (
+        ("One More Time (Remaster)", "track-remaster"),
+        ("One More Time [Remastered]", "track-remastered"),
+        ("One More Time - Remastered Version", "track-remastered-version"),
+        ("One More Time: 2011 Remaster", "track-year-remaster"),
+        ("One More Time (Remastered 2011)", "track-remastered-year"),
+        (
+            "One More Time [2011 Remastered Version]",
+            "track-year-remastered-version",
+        ),
+        ("One More Time - Bonus Edition", "track-bonus-edition"),
+        ("One More Time: Bonus Version", "track-bonus-version"),
+        ("One More Time (Bonus Track)", "track-bonus-track"),
+        ("One More Time [Bonus Track Version]", "track-bonus-track-version"),
+    ),
+)
+async def test_extract_resolves_every_supported_track_version(
+    candidate_title: str,
+    spotify_track_id: str,
+) -> None:
+    """Resolve every controlled Track version without release context."""
+    result = await _extract_track_version(
+        "One More Time",
+        (
+            _spotify_track_payload(
+                spotify_track_id=spotify_track_id,
+                title=candidate_title,
+                attached_album_title="Unrelated Release",
+            ),
+        ),
+    )
+
+    assert result["status"] == "resolved"
+    track = cast(dict[str, object], result["track"])
+    assert track["spotify_track_id"] == spotify_track_id
+
+
+@pytest.mark.parametrize(
+    ("mention_title", "candidate_title"),
+    (
+        ("One More Time", "One More Time (Remaster)"),
+        ("One More Time (Remaster)", "One More Time"),
+        ("One More Time (Remaster)", "One More Time (Bonus Track Version)"),
+    ),
+)
+async def test_extract_resolves_equivalent_track_versions_symmetrically(
+    mention_title: str,
+    candidate_title: str,
+) -> None:
+    """Resolve bare and equivalent Track versions in either direction."""
+    result = await _extract_track_version(
+        mention_title,
+        (_spotify_track_payload(title=candidate_title),),
+    )
+
+    assert result["status"] == "resolved"
+    assert result["track"] is not None
+
+
+async def test_extract_strips_stacked_track_versions_from_the_right() -> None:
+    """Resolve stacked Track version segments across supported boundaries."""
+    result = await _extract_track_version(
+        "One More Time",
+        (
+            _spotify_track_payload(
+                title="One More Time: Bonus Track [2011 Remaster]",
+            ),
+        ),
+    )
+
+    assert result["status"] == "resolved"
+    assert result["track"] is not None
+
+
+@pytest.mark.parametrize(
+    ("candidate_title", "spotify_album_id"),
+    _MUSIC_RELEASE_EDITION_CASES,
+)
+async def test_extract_resolves_track_with_equivalent_music_release_context(
+    candidate_title: str,
+    spotify_album_id: str,
+) -> None:
+    """Resolve exact Track titles with every controlled attached release edition."""
+    result = await _extract_track_version(
+        "One More Time",
+        (
+            _spotify_track_payload(
+                spotify_track_id=f"track-{spotify_album_id}",
+                title="One More Time",
+                attached_album_id=f"release-{spotify_album_id}",
+                attached_album_title=candidate_title,
+                attached_album_release_date="2025",
+            ),
+        ),
+        release_title="Discovery",
+        release_year=1999,
+    )
+
+    assert result["status"] == "resolved"
+    track = cast(dict[str, object], result["track"])
+    assert track["spotify_track_id"] == f"track-{spotify_album_id}"
+
+
+@pytest.mark.parametrize(
+    (
+        "candidate_title",
+        "attached_album_title",
+        "attached_album_type",
+        "expected_status",
+    ),
+    (
+        (
+            "One More Time (Remaster)",
+            "Discovery",
+            "album",
+            "resolved",
+        ),
+        (
+            "One More Time (Remaster)",
+            "Discovery (Deluxe Edition)",
+            "album",
+            "resolved",
+        ),
+        (
+            "One More Times",
+            "Discovery",
+            "album",
+            "unresolved",
+        ),
+        (
+            "One More Time (Remaster)",
+            "Homework (Deluxe Edition)",
+            "album",
+            "unresolved",
+        ),
+        (
+            "One More Time (Remaster)",
+            "Discovery (Live) (Deluxe Edition)",
+            "album",
+            "unresolved",
+        ),
+        (
+            "One More Time",
+            "Discovery (Deluxe Edition)",
+            "compilation",
+            "unresolved",
+        ),
+    ),
+)
+async def test_extract_requires_equivalent_track_and_music_release_context(
+    candidate_title: str,
+    attached_album_title: str,
+    attached_album_type: AlbumType,
+    expected_status: Literal["resolved", "unresolved"],
+) -> None:
+    """Require controlled Track and attached Music Release equivalence."""
+    result = await _extract_track_version(
+        "One More Time",
+        (
+            _spotify_track_payload(
+                title=candidate_title,
+                attached_album_title=attached_album_title,
+                attached_album_type=attached_album_type,
+            ),
+        ),
+        release_title="Discovery",
+        release_year=1999,
+    )
+
+    assert result["status"] == expected_status
+    assert (result["track"] is not None) is (expected_status == "resolved")
+
+
+async def test_extract_ignores_attached_release_without_release_context() -> None:
+    """Resolve a Track version without querying or matching its attached Album."""
+    result = await _extract_track_version(
+        "One More Time",
+        (
+            _spotify_track_payload(
+                title="One More Time (Remaster)",
+                attached_album_title="Unrelated Release",
+            ),
+        ),
+    )
+
+    assert result["status"] == "resolved"
+    track = cast(dict[str, object], result["track"])
+    preferred_music_release = cast(dict[str, object], track["preferred_music_release"])
+    assert preferred_music_release["release_title"] == "Unrelated Release"
+
+
+async def test_extract_checks_exact_track_titles_before_versions() -> None:
+    """Choose an exact Track after an earlier equivalent Track version."""
+    result = await _extract_track_version(
+        "One More Time",
+        (
+            _spotify_track_payload(
+                spotify_track_id="earlier-equivalent",
+                title="One More Time (Remaster)",
+            ),
+            _spotify_track_payload(
+                spotify_track_id="later-exact",
+                title="One More Time",
+            ),
+        ),
+    )
+
+    track = cast(dict[str, object], result["track"])
+    assert result["status"] == "resolved"
+    assert track["spotify_track_id"] == "later-exact"
+
+
+async def test_extract_keeps_artist_filter_and_provider_order_for_track_versions() -> None:
+    """Choose the first artist-eligible equivalent Track version."""
+    result = await _extract_track_version(
+        "One More Time",
+        (
+            _spotify_track_payload(
+                spotify_track_id="ineligible",
+                title="One More Time (Remaster)",
+                artist_names=("Other Artist",),
+            ),
+            _spotify_track_payload(
+                spotify_track_id="first-equivalent",
+                title="One More Time (Bonus Track)",
+            ),
+            _spotify_track_payload(
+                spotify_track_id="second-equivalent",
+                title="One More Time (Remastered)",
+            ),
+        ),
+    )
+
+    track = cast(dict[str, object], result["track"])
+    assert result["status"] == "resolved"
+    assert track["spotify_track_id"] == "first-equivalent"
+
+
+async def test_extract_limits_equivalent_track_versions_to_three_candidates() -> None:
+    """Ignore an equivalent Track version after the existing candidate bound."""
+    result = await _extract_track_version(
+        "Bounded Track",
+        (
+            _spotify_track_payload(title="Wrong One"),
+            _spotify_track_payload(title="Wrong Two"),
+            _spotify_track_payload(title="Wrong Three"),
+            _spotify_track_payload(
+                spotify_track_id="fourth-equivalent",
+                title="Bounded Track (Remaster)",
+            ),
+        ),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["track"] is None
+
+
+@pytest.mark.parametrize(
+    "candidate_title",
+    (
+        "One More Time (Deluxe)",
+        "One More Time (Deluxe Edition)",
+        "One More Time (Super Deluxe Edition)",
+        "One More Time (Expanded Edition)",
+        "One More Time (Special Edition)",
+        "One More Time (Anniversary Edition)",
+        "One More Time (1st Anniversary)",
+        "One More Time (1st Anniversary Edition)",
+        "One More Time (Reissue)",
+        "One More Time (Reissued)",
+    ),
+)
+async def test_extract_rejects_release_only_track_version_designations(
+    candidate_title: str,
+) -> None:
+    """Reject release-only editions as independently qualifying Track versions."""
+    result = await _extract_track_version(
+        "One More Time",
+        (_spotify_track_payload(title=candidate_title),),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["track"] is None
+
+
+@pytest.mark.parametrize(
+    "blocked_segment",
+    (
+        "Live at Wembley",
+        "2024 Remix",
+        "Acoustic",
+        "Instrumental",
+        "Radio-Edit",
+        "Karaoke",
+        "A Tribute Performance",
+    ),
+)
+async def test_extract_rejects_blocked_track_version_material(
+    blocked_segment: str,
+) -> None:
+    """Reject blocked Track material before a recognized version suffix."""
+    result = await _extract_track_version(
+        "One More Time",
+        (
+            _spotify_track_payload(
+                title=f"One More Time ({blocked_segment}) (Remaster)",
+            ),
+        ),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["track"] is None
+
+
+@pytest.mark.parametrize(
+    "candidate_title",
+    (
+        "One More Times (Remaster)",
+        "One More Time (Archive Notes) (Remaster)",
+        "One More Time (Remaster Version)",
+        "One More Time (11 Remaster)",
+        "One More Time (12345 Remaster)",
+        "One More Time (Remaster Extra)",
+        "One More Time Remaster",
+        "Remastered One More Time",
+    ),
+)
+async def test_extract_rejects_uncontrolled_track_title_differences(
+    candidate_title: str,
+) -> None:
+    """Leave non-equivalent Track titles unresolved without fuzzy matching."""
+    result = await _extract_track_version(
+        "One More Time",
+        (_spotify_track_payload(title=candidate_title),),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["track"] is None
+
+
+async def test_extract_preserves_arbitrary_track_subtitles_during_version_matching() -> None:
+    """Retain equal unrecognized Track subtitles while removing a later version."""
+    result = await _extract_track_version(
+        "One More Time (Archive Notes)",
+        (_spotify_track_payload(title="One More Time (Archive Notes) (Remaster)"),),
+    )
+
+    assert result["status"] == "resolved"
+    assert result["track"] is not None
 
 
 @pytest.mark.parametrize(

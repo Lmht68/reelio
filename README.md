@@ -13,7 +13,7 @@ The extraction pipeline:
 5. Sends bounded source metadata and transcript material to the selected LLM provider.
 6. Validates the structured LLM response, deduplicates Mentions independently per kind, and preserves first-reference order within each kind.
 7. Searches TMDB's Movie and TV endpoints and resolves a Screen Work Mention only when its canonical title or a provider alternative title matches together with its release or first air year.
-8. Makes one bounded Spotify Track search for each Track Mention in the effective market, then resolves only the first artist-eligible Candidate with required exact titles.
+8. Makes one bounded Spotify Track search for each Track Mention in the effective market, checks exact artist-eligible titles first, then reuses those Candidates in Spotify order for controlled Equivalent Track Version resolution.
 9. Makes one bounded Spotify Album search for each direct Music Release Mention in the effective market, checks exact artist-eligible titles first, then reuses those Candidates in Spotify order for controlled equivalent-edition resolution.
 10. Returns grouped `movies`, `tv_series`, `tracks`, and `music_releases` result lists, resolving each Mention to enriched metadata or `null` independently within its kind.
 
@@ -135,10 +135,19 @@ The response contains:
   Each Track Mention causes one Spotify search in the effective market with offset zero and limit three.
   The Track query uses the Mention title and first ordered Artist Credit only.
   A Candidate is artist-eligible when at least one Candidate Artist Credit matches any Mention Artist Credit under Music Identity Normalization, regardless of credit order, count, or unmatched additions.
-  Reelio selects the first provider-ordered artist-eligible Candidate whose Track title matches exactly under Music Identity Normalization.
-  An explicit Mention release title must also exactly match the accepted Candidate's attached Album title; without release context, that attached Album title does not constrain matching.
+  Reelio first checks exact Track title equality and, when supplied, exact attached Music Release title equality across every artist-eligible Candidate in Spotify order.
+  Only when no exact Candidate exists does it reuse the same bounded, artist-eligible Candidate sequence for a controlled Equivalent Track Version pass without another Spotify search.
+  Equivalent Track Versions accept Remaster, Remastered, Remastered Version, four-digit year Remaster forms, Bonus Edition, Bonus Version, Bonus Track, and Bonus Track Version.
+  Each designation must occupy a complete trailing segment bounded by parentheses, brackets, a spaced hyphen, or a colon.
+  Stacked recognized trailing segments are removed right to left, and the remaining normalized base Track titles must match exactly.
+  This comparison is symmetric between a base Track title and an eligible version title, or between two eligible version titles.
+  Deluxe, expanded, special, anniversary, and reissue designations remain literal Track identity and do not independently qualify a Track version.
+  Track version comparison rejects trailing segments containing live, remix, remixed, remixes, acoustic, instrumental, radio edit, karaoke, or tribute material.
+  With explicit release context, the attached Music Release must match exactly or under the complete Music Release Edition grammar; equivalent attached-release matching accepts only `album` and `single` Candidates.
+  Without release context, the attached Album does not constrain matching and no Album search occurs.
+  An Equivalent Track Version returns the ordinary `resolved` Result with the accepted playable Spotify Track identity and attached Preferred Music Release metadata unchanged, without match-kind, confidence, or version-relationship fields.
   Release year remains nullable Mention context and does not participate in Spotify retrieval or Candidate verification.
-  An unresolved Track preserves its original Track Mention when no exact eligible Candidate appears.
+  An unresolved Track preserves its original Track Mention when neither an exact nor an eligible equivalent Candidate appears.
 - `results.music_releases[].music_release_mention`: The interpreted direct Music Release title, ordered release artists, and explicit nullable release year.
 - `results.music_releases[].music_release`: Spotify-backed enrichment for a resolved Mention, or `null` for an unresolved Mention.
   A resolved Music Release is one independently matched market-available Spotify Album with Spotify's canonical Album title, ordered artist credits, provider-reported `release_date`, `album_type`, a Spotify Album ID and URL, and `cover_url`.
@@ -149,13 +158,14 @@ The response contains:
   The same shared normalized Artist Credit eligibility applies.
   Reelio first checks exact title equality under Music Identity Normalization across every artist-eligible Candidate in Spotify order, including Compilations.
   Only when no exact Candidate exists does it reuse that same bounded, artist-eligible Candidate sequence for a controlled Equivalent Music Release Edition pass without another Spotify search.
+  The same complete Music Release Edition grammar constrains explicit Track release context through the accepted Track Candidate's attached Album without a separate Album search.
   Equivalent title analysis accepts Remaster, Remastered, Remastered Version, four-digit year Remaster forms, Deluxe, Deluxe Edition, Super Deluxe Edition, Expanded Edition, Special Edition, Anniversary Edition, numeric ordinal Anniversary forms, Reissue, Reissued, Bonus Edition, Bonus Version, Bonus Track, and Bonus Track Version.
   Each designation must occupy a complete trailing segment bounded by parentheses, brackets, a spaced hyphen, or a colon.
   Stacked recognized trailing segments are removed right to left, and the remaining normalized base titles must match exactly.
   This comparison is symmetric between a base title and an eligible edition title, or between two eligible edition titles.
   The equivalent-edition fallback accepts only `album` and `single` Candidates, while a `compilation` remains eligible only for exact-title verification.
   It rejects trailing segments containing live, remix, remixed, remixes, acoustic, instrumental, radio edit, karaoke, tribute, or greatest hits material.
-  An equivalent match returns the ordinary `resolved` Result with the accepted Spotify Album identity and metadata unchanged, without match-kind, confidence, or edition-relationship fields.
+  An Equivalent Track Version or Equivalent Music Release Edition returns the ordinary `resolved` Result with accepted Spotify identity and metadata unchanged, without match-kind, confidence, or edition-relationship fields.
   Release year does not participate in Spotify retrieval or Candidate verification.
   The contract makes no worldwide-edition, sibling-release, release-family, inferred-subtype, or earliest-worldwide-date claims.
   An unresolved Music Release preserves its original Mention when neither an exact nor an eligible equivalent Candidate appears.
@@ -235,7 +245,7 @@ Compact success example:
           "release_year": 2001
         },
         "track": {
-          "track_title": "One More Time",
+          "track_title": "One More Time (2011 Remaster)",
           "artists": [
             {
               "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
@@ -245,7 +255,7 @@ Compact success example:
           "spotify_track_id": "0DiWol3AO6WpXZgp0goxAV",
           "spotify_url": "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV",
           "preferred_music_release": {
-            "release_title": "Discovery",
+            "release_title": "Discovery (Deluxe Edition)",
             "artists": [
               {
                 "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",

@@ -99,7 +99,7 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                     "release_year": 2001,
                 },
                 "track": {
-                    "track_title": "One More Time",
+                    "track_title": "One More Time (2011 Remaster)",
                     "artists": [
                         {
                             "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
@@ -109,7 +109,7 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                     "spotify_track_id": "0DiWol3AO6WpXZgp0goxAV",
                     "spotify_url": "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV",
                     "preferred_music_release": {
-                        "release_title": "Discovery",
+                        "release_title": "Discovery (Deluxe Edition)",
                         "artists": [
                             {
                                 "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
@@ -407,27 +407,33 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         "and limit three, using the Mention title and first ordered Artist Credit "
         "only. Candidates remain eligible when at least one Artist Credit matches "
         "any Mention Artist Credit under Music Identity Normalization, regardless "
-        "of credit order, count, or unmatched additions. Reelio selects the first "
-        "provider-ordered eligible Track Candidate whose Track title, or Track title "
-        "plus explicit attached Music Release title when supplied, matches exactly "
-        "under Music Identity Normalization. For a direct Music Release, Reelio "
-        "first checks exact title equality across every artist-eligible Candidate, "
-        "including compilation Candidates. Only when no exact Candidate appears "
-        "does it reuse the same bounded artist-eligible Candidate sequence in "
-        "provider order for controlled Equivalent Music Release Editions without "
-        "another Spotify search. Equivalent editions remove recognized trailing "
-        "remaster, deluxe, expanded, special, anniversary, reissue, and bonus "
-        "designations, including four-digit remaster years and numeric ordinal "
-        "anniversaries, right to left from parentheses, brackets, a spaced hyphen, "
-        "or colon boundaries before requiring equal normalized base titles. The "
-        "fallback accepts only album or single Candidates, excludes compilation "
-        "Candidates, and rejects blocked trailing segments containing live, remix, "
-        "acoustic, instrumental, radio edit, karaoke, tribute, or greatest hits "
-        "material. An equivalent match returns the ordinary Resolved Result with "
-        "Spotify identity and metadata unchanged. Release year does not participate "
-        "in retrieval or Candidate verification, and a completed search without an "
-        "exact or eligible equivalent Candidate returns an Unresolved Result. Any "
-        "TMDB or Spotify provider failure fails the complete request."
+        "of credit order, count, or unmatched additions. Reelio checks exact title "
+        "equality across every artist-eligible Candidate in provider order before "
+        "reusing the same bounded artist-eligible Candidate sequence without "
+        "another Spotify search for controlled Equivalent Track Versions or "
+        "Equivalent Music Release Editions. Equivalent Track Versions accept only "
+        "complete trailing remaster and bonus designations, including four-digit "
+        "remaster years. Deluxe, expanded, special, anniversary, and reissue "
+        "designations are release-only Track variants and do not independently "
+        "qualify a Track title. With explicit Music Release context, an accepted "
+        "Track Candidate must have an attached Album title that is exact or "
+        "equivalent under the complete Music Release Edition grammar; without "
+        "release context, the attached Album does not constrain matching. Both "
+        "fallbacks remove recognized trailing segments right to left from "
+        "parentheses, brackets, a spaced hyphen, or colon boundaries before "
+        "requiring equal normalized base titles. Track equivalence is symmetric. "
+        "The Music Release grammar additionally accepts deluxe, expanded, special, "
+        "anniversary, and reissue designations. Equivalent Music Release fallback "
+        "accepts only album or single Candidates, excluding compilation Candidates. "
+        "Both fallbacks reject blocked trailing segments containing live, remix, "
+        "acoustic, instrumental, radio edit, karaoke, or tribute material; Music "
+        "Release comparison also rejects greatest hits material. An Equivalent "
+        "Track Version or Equivalent Music Release Edition returns the ordinary "
+        "Resolved Result with Spotify identity and metadata unchanged. Release year "
+        "does not participate in retrieval or Candidate verification, and a "
+        "completed search without an exact or eligible equivalent Candidate returns "
+        "an Unresolved Result. Any TMDB or Spotify provider failure fails the "
+        "complete request."
     ),
     response_description=(
         "Effective market, Source, transcript, and grouped Movie, TV Series, "

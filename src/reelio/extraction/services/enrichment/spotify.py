@@ -2,7 +2,7 @@
 
 import asyncio
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -56,10 +56,12 @@ _YEAR_REMASTER_DESIGNATION_PATTERN = re.compile(
 _ORDINAL_ANNIVERSARY_DESIGNATION_PATTERN = re.compile(
     r"[0-9]+(?:st|nd|rd|th) anniversary(?: edition)?"
 )
-_BLOCKED_EDITION_MATERIAL_PATTERN = re.compile(
+_BLOCKED_TRACK_VERSION_MATERIAL_PATTERN = re.compile(
     r"\b(?:live|remix|remixed|remixes|acoustic|instrumental|karaoke|tribute)\b"
     r"|\bradio(?: |-)edit\b"
-    r"|\bgreatest(?: |-)hits?\b"
+)
+_BLOCKED_MUSIC_RELEASE_EDITION_MATERIAL_PATTERN = re.compile(
+    _BLOCKED_TRACK_VERSION_MATERIAL_PATTERN.pattern + r"|\bgreatest(?: |-)hits?\b"
 )
 _TRAILING_TITLE_SEGMENT_PATTERNS = (
     re.compile(r"^(?P<base>.+)\((?P<segment>[^()]+)\)$"),
@@ -211,6 +213,30 @@ def _resolve_track_mention(
         None,
     )
     if candidate is None:
+        mention_track_edition_identity = _track_edition_identity(
+            normalize_music_identity(track_mention.track_title)
+        )
+        mention_release_title_identity: str | None = None
+        mention_release_edition_identity: _EditionTitleIdentity | None = None
+        if track_mention.release_title is not None:
+            mention_release_title_identity = normalize_music_identity(track_mention.release_title)
+            mention_release_edition_identity = _music_release_edition_identity(
+                mention_release_title_identity
+            )
+        candidate = next(
+            (
+                candidate
+                for candidate in artist_eligible_candidates
+                if _has_equivalent_track_titles(
+                    mention_track_edition_identity,
+                    mention_release_title_identity,
+                    mention_release_edition_identity,
+                    candidate,
+                )
+            ),
+            None,
+        )
+    if candidate is None:
         return TrackResult(
             status=ResultStatus.UNRESOLVED,
             track_mention=track_mention,
@@ -294,6 +320,43 @@ def _has_exact_track_titles(track_mention: TrackMention, candidate: TrackCandida
     )
 
 
+def _has_equivalent_track_titles(
+    mention_track_edition_identity: _EditionTitleIdentity | None,
+    mention_release_title_identity: str | None,
+    mention_release_edition_identity: _EditionTitleIdentity | None,
+    candidate: TrackCandidate,
+) -> bool:
+    """Return whether titles differ by controlled Track or release editions."""
+    if mention_track_edition_identity is None:
+        return False
+    candidate_track_edition_identity = _track_edition_identity(
+        normalize_music_identity(candidate.title)
+    )
+    if (
+        candidate_track_edition_identity is None
+        or mention_track_edition_identity.base_title != candidate_track_edition_identity.base_title
+    ):
+        return False
+    if mention_release_title_identity is None:
+        return (
+            mention_track_edition_identity.designation_removed
+            or candidate_track_edition_identity.designation_removed
+        )
+    candidate_release_title_identity = normalize_music_identity(candidate.album.title)
+    if mention_release_title_identity == candidate_release_title_identity:
+        return (
+            mention_track_edition_identity.designation_removed
+            or candidate_track_edition_identity.designation_removed
+        )
+    return candidate.album.album_type in (
+        "album",
+        "single",
+    ) and _has_equivalent_music_release_title(
+        mention_release_edition_identity,
+        candidate_release_title_identity,
+    )
+
+
 def _split_trailing_title_segment(normalized_title: str) -> tuple[str, str] | None:
     """Return the rightmost supported trailing title segment."""
     longest_match: tuple[str, str] | None = None
@@ -312,6 +375,14 @@ def _split_trailing_title_segment(normalized_title: str) -> tuple[str, str] | No
     return longest_match
 
 
+def _is_track_edition_designation(segment_title: str) -> bool:
+    """Return whether a normalized title segment names a supported Track version."""
+    return (
+        segment_title in _TRACK_AND_RELEASE_EDITION_DESIGNATIONS
+        or _YEAR_REMASTER_DESIGNATION_PATTERN.fullmatch(segment_title) is not None
+    )
+
+
 def _is_music_release_edition_designation(segment_title: str) -> bool:
     """Return whether a normalized title segment names a supported release edition."""
     return (
@@ -321,8 +392,10 @@ def _is_music_release_edition_designation(segment_title: str) -> bool:
     )
 
 
-def _music_release_edition_identity(
+def _edition_title_identity(
     normalized_title: str,
+    is_edition_designation: Callable[[str], bool],
+    blocked_material_pattern: re.Pattern[str],
 ) -> _EditionTitleIdentity | None:
     """Return a comparison identity or None when trailing material is excluded."""
     comparison_base = normalized_title
@@ -331,9 +404,9 @@ def _music_release_edition_identity(
     stripping_designations = True
     while (trailing_segment := _split_trailing_title_segment(scan_title)) is not None:
         base_title, segment_title = trailing_segment
-        if _BLOCKED_EDITION_MATERIAL_PATTERN.search(segment_title) is not None:
+        if blocked_material_pattern.search(segment_title) is not None:
             return None
-        if stripping_designations and _is_music_release_edition_designation(segment_title):
+        if stripping_designations and is_edition_designation(segment_title):
             comparison_base = base_title
             designation_removed = True
         else:
@@ -342,6 +415,26 @@ def _music_release_edition_identity(
     return _EditionTitleIdentity(
         base_title=comparison_base,
         designation_removed=designation_removed,
+    )
+
+
+def _track_edition_identity(normalized_title: str) -> _EditionTitleIdentity | None:
+    """Return a comparison identity for a Track title."""
+    return _edition_title_identity(
+        normalized_title,
+        _is_track_edition_designation,
+        _BLOCKED_TRACK_VERSION_MATERIAL_PATTERN,
+    )
+
+
+def _music_release_edition_identity(
+    normalized_title: str,
+) -> _EditionTitleIdentity | None:
+    """Return a comparison identity for a Music Release title."""
+    return _edition_title_identity(
+        normalized_title,
+        _is_music_release_edition_designation,
+        _BLOCKED_MUSIC_RELEASE_EDITION_MATERIAL_PATTERN,
     )
 
 
