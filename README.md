@@ -14,7 +14,7 @@ The extraction pipeline:
 6. Validates the structured LLM response, deduplicates Mentions independently per kind, and preserves first-reference order within each kind.
 7. Searches TMDB's Movie and TV endpoints and resolves a Screen Work Mention only when its canonical title or a provider alternative title matches together with its release or first air year.
 8. Makes one bounded Spotify Track search for each Track Mention in the effective market, then resolves only the first artist-eligible Candidate with required exact titles.
-9. Makes one bounded Spotify Album search for each direct Music Release Mention in the effective market, then resolves only the first artist-eligible Candidate with an exact title.
+9. Makes one bounded Spotify Album search for each direct Music Release Mention in the effective market, checks exact artist-eligible titles first, then reuses those Candidates in Spotify order for controlled equivalent-edition resolution.
 10. Returns grouped `movies`, `tv_series`, `tracks`, and `music_releases` result lists, resolving each Mention to enriched metadata or `null` independently within its kind.
 
 Movie results can include the title, release year, cast, directors, description, poster URL, TMDB and IMDb identifiers and links, and the TMDB score.
@@ -146,10 +146,19 @@ The response contains:
   A direct Music Release is never synthesized from a Track's Preferred Music Release.
   Each Music Release Mention causes one Spotify Album search in the effective market with offset zero and limit three.
   The Album query uses the Mention title and first ordered Artist Credit only.
-  The same shared normalized Artist Credit eligibility applies, and the first provider-ordered artist-eligible Candidate whose Music Release title matches exactly under Music Identity Normalization resolves.
+  The same shared normalized Artist Credit eligibility applies.
+  Reelio first checks exact title equality under Music Identity Normalization across every artist-eligible Candidate in Spotify order, including Compilations.
+  Only when no exact Candidate exists does it reuse that same bounded, artist-eligible Candidate sequence for a controlled Equivalent Music Release Edition pass without another Spotify search.
+  Equivalent title analysis accepts Remaster, Remastered, Remastered Version, four-digit year Remaster forms, Deluxe, Deluxe Edition, Super Deluxe Edition, Expanded Edition, Special Edition, Anniversary Edition, numeric ordinal Anniversary forms, Reissue, Reissued, Bonus Edition, Bonus Version, Bonus Track, and Bonus Track Version.
+  Each designation must occupy a complete trailing segment bounded by parentheses, brackets, a spaced hyphen, or a colon.
+  Stacked recognized trailing segments are removed right to left, and the remaining normalized base titles must match exactly.
+  This comparison is symmetric between a base title and an eligible edition title, or between two eligible edition titles.
+  The equivalent-edition fallback accepts only `album` and `single` Candidates, while a `compilation` remains eligible only for exact-title verification.
+  It rejects trailing segments containing live, remix, remixed, remixes, acoustic, instrumental, radio edit, karaoke, tribute, or greatest hits material.
+  An equivalent match returns the ordinary `resolved` Result with the accepted Spotify Album identity and metadata unchanged, without match-kind, confidence, or edition-relationship fields.
   Release year does not participate in Spotify retrieval or Candidate verification.
   The contract makes no worldwide-edition, sibling-release, release-family, inferred-subtype, or earliest-worldwide-date claims.
-  An unresolved Music Release preserves its original Mention when no exact eligible Candidate appears.
+  An unresolved Music Release preserves its original Mention when neither an exact nor an eligible equivalent Candidate appears.
 - Any TMDB or Spotify provider HTTP, timeout, or required-response validation failure fails the complete request rather than returning partial category results.
 
 Compact success example:
@@ -272,7 +281,7 @@ Compact success example:
           "release_year": 2001
         },
         "music_release": {
-          "release_title": "Discovery",
+          "release_title": "Discovery (Deluxe Edition)",
           "artists": [
             {
               "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",

@@ -646,36 +646,6 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog(
         ),
         _ExactResolutionScenario(
             interpretation_response=_interpretation_response(
-                tracks=[],
-                music_releases=[
-                    {
-                        "release_title": "Exact Album",
-                        "artists": ["Artist One"],
-                        "release_year": None,
-                    }
-                ],
-            ),
-            search_type="album",
-            search_query="album:Exact Album artist:Artist One",
-            candidates=(
-                _spotify_album_payload(
-                    title="Exact Album (Deluxe Edition)",
-                    artist_names=("Artist One",),
-                ),
-            ),
-            result_list_key="music_releases",
-            mention_key="music_release_mention",
-            entity_key="music_release",
-            mention={
-                "release_title": "Exact Album",
-                "artists": ["Artist One"],
-                "release_year": None,
-            },
-            expected_status="unresolved",
-            expected_spotify_id=None,
-        ),
-        _ExactResolutionScenario(
-            interpretation_response=_interpretation_response(
                 tracks=[
                     {
                         "track_title": "First Exact",
@@ -754,7 +724,6 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog(
         "direct-compilation",
         "no-shared-artist",
         "near-title",
-        "decorated-title",
         "first-exact-candidate",
         "fourth-candidate-is-ignored",
     ],
@@ -808,6 +777,325 @@ async def test_extract_applies_the_exact_music_resolution_matrix(
             "spotify_track_id" if scenario.search_type == "track" else "spotify_album_id"
         )
         assert result[scenario.entity_key][spotify_id_key] == scenario.expected_spotify_id
+
+
+async def _extract_direct_music_release(
+    release_title: str,
+    candidates: tuple[dict[str, object], ...],
+) -> dict[str, object]:
+    """Resolve one direct Music Release through the in-process extraction endpoint."""
+    music_release_mention = {
+        "release_title": release_title,
+        "artists": ["Daft Punk"],
+        "release_year": 2001,
+    }
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "accounts.spotify.test":
+            assert request.method == "POST"
+            return httpx.Response(
+                200,
+                json={"access_token": "test-access-token", "expires_in": 3600},
+            )
+
+        assert request.method == "GET"
+        assert request.url.path == "/v1/search"
+        assert request.headers["authorization"] == "Bearer test-access-token"
+        assert dict(request.url.params) == {
+            "q": f"album:{release_title} artist:Daft Punk",
+            "type": "album",
+            "market": "JP",
+            "offset": "0",
+            "limit": "3",
+        }
+        return httpx.Response(200, json={"albums": {"items": list(candidates)}})
+
+    response, interpretation_provider, http_client = await _post_extract(
+        _interpretation_response(tracks=[], music_releases=[music_release_mention]),
+        httpx.MockTransport(handle),
+    )
+
+    assert response.status_code == 200
+    assert interpretation_provider.closed is True
+    assert http_client.is_closed is True
+    assert len(interpretation_provider.calls) == 1
+    assert sum(request.method == "POST" for request in requests) == 1
+    assert sum(request.method == "GET" for request in requests) == 1
+    result = response.json()["results"]["music_releases"][0]
+    assert result["music_release_mention"] == music_release_mention
+    return cast(dict[str, object], result)
+
+
+@pytest.mark.parametrize(
+    ("candidate_title", "spotify_album_id"),
+    [
+        ("Discovery (Remaster)", "remaster"),
+        ("Discovery [Remastered]", "remastered"),
+        ("Discovery - Remastered Version", "remastered-version"),
+        ("Discovery: 2011 Remaster", "year-remaster"),
+        ("Discovery (Remastered 2011)", "remastered-year"),
+        ("Discovery [2011 Remastered Version]", "year-remastered-version"),
+        ("Discovery - Deluxe", "deluxe"),
+        ("Discovery: Deluxe Edition", "deluxe-edition"),
+        ("Discovery (sUPER   dELUXE   Edition)", "super-deluxe"),
+        ("Discovery [Expanded Edition]", "expanded"),
+        ("Discovery - Special Edition", "special"),
+        ("Discovery: Anniversary Edition", "anniversary"),
+        ("Discovery (1st Anniversary)", "first-anniversary"),
+        ("Discovery [2nd Anniversary Edition]", "second-anniversary"),
+        ("Discovery - 3rd Anniversary", "third-anniversary"),
+        ("Discovery: 20th Anniversary Edition", "twentieth-anniversary"),
+        ("Discovery (Reissue)", "reissue"),
+        ("Discovery [Reissued]", "reissued"),
+        ("Discovery - Bonus Edition", "bonus-edition"),
+        ("Discovery: Bonus Version", "bonus-version"),
+        ("Discovery (Bonus Track)", "bonus-track"),
+        ("Discovery [Bonus Track Version]", "bonus-track-version"),
+    ],
+)
+async def test_extract_resolves_every_supported_music_release_edition_designation(
+    candidate_title: str,
+    spotify_album_id: str,
+) -> None:
+    """Resolve every controlled Music Release edition across supported boundaries."""
+    result = await _extract_direct_music_release(
+        "Discovery",
+        (
+            _spotify_album_payload(
+                spotify_album_id=spotify_album_id,
+                title=candidate_title,
+            ),
+        ),
+    )
+
+    assert result["status"] == "resolved"
+    music_release = cast(dict[str, object], result["music_release"])
+    assert music_release["spotify_album_id"] == spotify_album_id
+
+
+@pytest.mark.parametrize(
+    ("mention_title", "candidate_title"),
+    [
+        ("Discovery", "Discovery (Deluxe Edition)"),
+        ("Discovery (Deluxe Edition)", "Discovery"),
+        ("Discovery [Expanded Edition]", "Discovery - 2011 Remaster"),
+    ],
+)
+async def test_extract_resolves_equivalent_music_release_editions_symmetrically(
+    mention_title: str,
+    candidate_title: str,
+) -> None:
+    """Resolve bare and equivalent-edition Music Release titles in either direction."""
+    result = await _extract_direct_music_release(
+        mention_title,
+        (_spotify_album_payload(title=candidate_title),),
+    )
+
+    assert result["status"] == "resolved"
+    assert result["music_release"] is not None
+
+
+@pytest.mark.parametrize(
+    "candidate_title",
+    [
+        "Discovery: Deluxe Edition [2011 Remaster]",
+        "Discovery - Deluxe Edition: 2011 Remaster",
+    ],
+)
+async def test_extract_strips_stacked_music_release_editions_from_the_right(
+    candidate_title: str,
+) -> None:
+    """Resolve stacked Edition segments regardless of mixed supported boundaries."""
+    result = await _extract_direct_music_release(
+        "Discovery",
+        (_spotify_album_payload(title=candidate_title),),
+    )
+
+    assert result["status"] == "resolved"
+    assert result["music_release"] is not None
+
+
+async def test_extract_checks_exact_music_release_titles_before_editions() -> None:
+    """Choose an exact Music Release after an earlier equivalent-edition Candidate."""
+    result = await _extract_direct_music_release(
+        "Discovery",
+        (
+            _spotify_album_payload(
+                spotify_album_id="earlier-equivalent",
+                title="Discovery (Deluxe Edition)",
+            ),
+            _spotify_album_payload(
+                spotify_album_id="later-exact",
+                title="Discovery",
+            ),
+        ),
+    )
+
+    music_release = cast(dict[str, object], result["music_release"])
+    assert result["status"] == "resolved"
+    assert music_release["spotify_album_id"] == "later-exact"
+
+
+async def test_extract_keeps_provider_order_for_equivalent_music_release_editions() -> None:
+    """Choose the first eligible equivalent edition after an ineligible Candidate."""
+    result = await _extract_direct_music_release(
+        "Discovery",
+        (
+            _spotify_album_payload(
+                spotify_album_id="ineligible",
+                title="Other Album",
+            ),
+            _spotify_album_payload(
+                spotify_album_id="first-edition",
+                title="Discovery (Deluxe Edition)",
+            ),
+            _spotify_album_payload(
+                spotify_album_id="second-edition",
+                title="Discovery (Expanded Edition)",
+            ),
+        ),
+    )
+
+    music_release = cast(dict[str, object], result["music_release"])
+    assert result["status"] == "resolved"
+    assert music_release["spotify_album_id"] == "first-edition"
+
+
+@pytest.mark.parametrize(
+    ("album_type", "expected_status"),
+    [
+        ("album", "resolved"),
+        ("single", "resolved"),
+        ("compilation", "unresolved"),
+    ],
+)
+async def test_extract_limits_equivalent_music_release_editions_to_albums_and_singles(
+    album_type: AlbumType,
+    expected_status: Literal["resolved", "unresolved"],
+) -> None:
+    """Accept only Album and Single Candidates during equivalent-edition fallback."""
+    result = await _extract_direct_music_release(
+        "Discovery",
+        (
+            _spotify_album_payload(
+                title="Discovery (Deluxe Edition)",
+                album_type=album_type,
+            ),
+        ),
+    )
+
+    assert result["status"] == expected_status
+    assert (result["music_release"] is not None) is (expected_status == "resolved")
+
+
+@pytest.mark.parametrize(
+    "candidate_title",
+    [
+        "Discoveries (Deluxe Edition)",
+        "Discovery (Deluxe Edition Extra)",
+        "Discovery (11 Remaster)",
+        "Discovery (12345 Remaster)",
+        "Discovery (20 Anniversary)",
+        "Discovery (Twentieth Anniversary Edition)",
+        "Discovery (Original Motion Picture Soundtrack)",
+        "Discovery Deluxe Edition",
+    ],
+)
+async def test_extract_rejects_uncontrolled_music_release_title_differences(
+    candidate_title: str,
+) -> None:
+    """Leave non-equivalent Music Release titles unresolved without fuzzy matching."""
+    result = await _extract_direct_music_release(
+        "Discovery",
+        (_spotify_album_payload(title=candidate_title),),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["music_release"] is None
+
+
+@pytest.mark.parametrize(
+    "blocked_segment",
+    [
+        "Live at Wembley",
+        "2024 Remix",
+        "Acoustic",
+        "Instrumental",
+        "Radio-Edit",
+        "Karaoke",
+        "A Tribute to Discovery",
+        "Greatest Hits",
+    ],
+)
+async def test_extract_rejects_blocked_music_release_edition_material(
+    blocked_segment: str,
+) -> None:
+    """Reject blocked trailing material even when an edition suffix is recognized."""
+    result = await _extract_direct_music_release(
+        "Discovery",
+        (
+            _spotify_album_payload(
+                title=f"Discovery ({blocked_segment}) (Deluxe Edition)",
+            ),
+        ),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["music_release"] is None
+
+
+async def test_extract_scans_past_unrecognized_segments_for_blocked_edition_material() -> None:
+    """Reject blocked material left of an unrecognized trailing title segment."""
+    result = await _extract_direct_music_release(
+        "Discovery",
+        (
+            _spotify_album_payload(
+                title="Discovery (Live) (Archive Notes) (Deluxe Edition)",
+            ),
+        ),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["music_release"] is None
+
+
+async def test_extract_preserves_the_public_result_shape_for_equivalent_editions() -> None:
+    """Return provider-backed Music Release metadata without edition-match fields."""
+    result = await _extract_direct_music_release(
+        "Discovery",
+        (
+            _spotify_album_payload(
+                spotify_album_id="provider-edition",
+                title="Discovery (Deluxe Edition)",
+                artist_names=("Daft Punk", "Provider Guest"),
+                release_date="2025-02-26",
+                album_type="album",
+            ),
+        ),
+    )
+
+    assert result == {
+        "status": "resolved",
+        "music_release_mention": {
+            "release_title": "Discovery",
+            "artists": ["Daft Punk"],
+            "release_year": 2001,
+        },
+        "music_release": {
+            "release_title": "Discovery (Deluxe Edition)",
+            "artists": [
+                {"spotify_artist_id": "artist-0", "name": "Daft Punk"},
+                {"spotify_artist_id": "artist-1", "name": "Provider Guest"},
+            ],
+            "release_date": "2025-02-26",
+            "album_type": "album",
+            "spotify_album_id": "provider-edition",
+            "spotify_url": "https://open.spotify.com/album/provider-edition",
+            "cover_url": "https://i.scdn.co/image/direct-primary",
+        },
+    }
 
 
 async def test_extract_returns_atomic_catalog_failure_without_music_results() -> None:

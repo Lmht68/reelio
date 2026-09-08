@@ -243,11 +243,7 @@ async def test_resolver_rejects_exact_title_without_shared_artist_credit() -> No
     assert results[0].music_release is None
 
 
-@pytest.mark.parametrize(
-    "candidate_title",
-    ["Discoveries", "Discovery (Deluxe Edition)"],
-    ids=["near", "decorated"],
-)
+@pytest.mark.parametrize("candidate_title", ["Discoveries"], ids=["near"])
 async def test_resolver_rejects_nonexact_music_release_titles(
     candidate_title: str,
 ) -> None:

@@ -1055,6 +1055,14 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert "first ordered Artist Credit only" in description
     assert "at least one Artist Credit matches any Mention Artist Credit" in description
     assert "matches exactly under Music Identity Normalization" in description
+    assert "exact title equality across every artist-eligible Candidate" in description
+    assert "same bounded artist-eligible Candidate sequence" in description
+    assert "without another Spotify search" in description
+    assert "right to left" in description
+    assert "parentheses, brackets, a spaced hyphen, or colon" in description
+    assert "album or single Candidates" in description
+    assert "blocked trailing segments" in description
+    assert "ordinary Resolved Result" in description
     assert "Release year does not participate in retrieval or Candidate verification" in description
     assert "fuzzy" not in description.lower()
     assert "90 percent" not in description.lower()
@@ -1159,6 +1167,13 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "spotify_url",
         "cover_url",
     }
+    assert resolved_music_release_example["music_release"]["release_title"] == (
+        "Discovery (Deluxe Edition)"
+    )
+    assert (
+        resolved_music_release_example["music_release"]["release_title"]
+        != resolved_music_release_example["music_release_mention"]["release_title"]
+    )
     assert (
         resolved_music_release_example["music_release"]["cover_url"]
         == "https://i.scdn.co/image/discovery-cover"

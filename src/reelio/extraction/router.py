@@ -145,7 +145,7 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                     "release_year": 2001,
                 },
                 "music_release": {
-                    "release_title": "Discovery",
+                    "release_title": "Discovery (Deluxe Edition)",
                     "artists": [
                         {
                             "spotify_artist_id": "4tZwfgrHOc3mvqYlEYSvVi",
@@ -408,12 +408,26 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         "only. Candidates remain eligible when at least one Artist Credit matches "
         "any Mention Artist Credit under Music Identity Normalization, regardless "
         "of credit order, count, or unmatched additions. Reelio selects the first "
-        "provider-ordered eligible Candidate whose Music Release title, or Track "
-        "title plus explicit attached Music Release title when supplied, matches "
-        "exactly under Music Identity Normalization. Release year does not "
-        "participate in retrieval or Candidate verification, and a completed "
-        "search without an exact eligible Candidate returns an Unresolved Result. "
-        "Any TMDB or Spotify provider failure fails the complete request."
+        "provider-ordered eligible Track Candidate whose Track title, or Track title "
+        "plus explicit attached Music Release title when supplied, matches exactly "
+        "under Music Identity Normalization. For a direct Music Release, Reelio "
+        "first checks exact title equality across every artist-eligible Candidate, "
+        "including compilation Candidates. Only when no exact Candidate appears "
+        "does it reuse the same bounded artist-eligible Candidate sequence in "
+        "provider order for controlled Equivalent Music Release Editions without "
+        "another Spotify search. Equivalent editions remove recognized trailing "
+        "remaster, deluxe, expanded, special, anniversary, reissue, and bonus "
+        "designations, including four-digit remaster years and numeric ordinal "
+        "anniversaries, right to left from parentheses, brackets, a spaced hyphen, "
+        "or colon boundaries before requiring equal normalized base titles. The "
+        "fallback accepts only album or single Candidates, excludes compilation "
+        "Candidates, and rejects blocked trailing segments containing live, remix, "
+        "acoustic, instrumental, radio edit, karaoke, tribute, or greatest hits "
+        "material. An equivalent match returns the ordinary Resolved Result with "
+        "Spotify identity and metadata unchanged. Release year does not participate "
+        "in retrieval or Candidate verification, and a completed search without an "
+        "exact or eligible equivalent Candidate returns an Unresolved Result. Any "
+        "TMDB or Spotify provider failure fails the complete request."
     ),
     response_description=(
         "Effective market, Source, transcript, and grouped Movie, TV Series, "

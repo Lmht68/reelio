@@ -1,7 +1,9 @@
 """Resolve interpreted Music Mentions through the Spotify catalog boundary."""
 
 import asyncio
+import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Protocol
 
 from reelio.extraction.market import SpotifyMarket
@@ -21,6 +23,58 @@ from reelio.extraction.types import (
 )
 
 _CANDIDATE_LIMIT = 3
+
+_TRACK_AND_RELEASE_EDITION_DESIGNATIONS = frozenset(
+    {
+        "remaster",
+        "remastered",
+        "remastered version",
+        "bonus edition",
+        "bonus version",
+        "bonus track",
+        "bonus track version",
+    }
+)
+_MUSIC_RELEASE_ONLY_EDITION_DESIGNATIONS = frozenset(
+    {
+        "deluxe",
+        "deluxe edition",
+        "super deluxe edition",
+        "expanded edition",
+        "special edition",
+        "anniversary edition",
+        "reissue",
+        "reissued",
+    }
+)
+_MUSIC_RELEASE_EDITION_DESIGNATIONS = (
+    _TRACK_AND_RELEASE_EDITION_DESIGNATIONS | _MUSIC_RELEASE_ONLY_EDITION_DESIGNATIONS
+)
+_YEAR_REMASTER_DESIGNATION_PATTERN = re.compile(
+    r"(?:[0-9]{4} remaster|remastered [0-9]{4}|[0-9]{4} remastered version)"
+)
+_ORDINAL_ANNIVERSARY_DESIGNATION_PATTERN = re.compile(
+    r"[0-9]+(?:st|nd|rd|th) anniversary(?: edition)?"
+)
+_BLOCKED_EDITION_MATERIAL_PATTERN = re.compile(
+    r"\b(?:live|remix|remixed|remixes|acoustic|instrumental|karaoke|tribute)\b"
+    r"|\bradio(?: |-)edit\b"
+    r"|\bgreatest(?: |-)hits?\b"
+)
+_TRAILING_TITLE_SEGMENT_PATTERNS = (
+    re.compile(r"^(?P<base>.+)\((?P<segment>[^()]+)\)$"),
+    re.compile(r"^(?P<base>.+)\[(?P<segment>[^\[\]]+)\]$"),
+    re.compile(r"^(?P<base>.+) - (?P<segment>.+)$"),
+    re.compile(r"^(?P<base>.+):\s*(?P<segment>.+)$"),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _EditionTitleIdentity:
+    """Hold a normalized edition-comparison title and its designation state."""
+
+    base_title: str
+    designation_removed: bool
 
 
 class _MusicCatalog(Protocol):
@@ -183,23 +237,38 @@ def _resolve_music_release_mention(
     candidates: tuple[AlbumCandidate, ...],
 ) -> MusicReleaseResult:
     """Resolve one Music Release Mention from its bounded Album candidates."""
+    mention_title_identity = normalize_music_identity(music_release_mention.release_title)
     bounded_candidates = candidates[:_CANDIDATE_LIMIT]
     mention_artist_identities = {
         normalize_music_identity(artist) for artist in music_release_mention.artists
     }
     artist_eligible_candidates = tuple(
-        candidate
+        (candidate, normalize_music_identity(candidate.title))
         for candidate in bounded_candidates
         if _has_shared_artist_credit(mention_artist_identities, candidate.artists)
     )
     candidate = next(
         (
             candidate
-            for candidate in artist_eligible_candidates
-            if _has_exact_music_release_title(music_release_mention, candidate)
+            for candidate, candidate_title_identity in artist_eligible_candidates
+            if candidate_title_identity == mention_title_identity
         ),
         None,
     )
+    if candidate is None:
+        mention_edition_identity = _music_release_edition_identity(mention_title_identity)
+        candidate = next(
+            (
+                candidate
+                for candidate, candidate_title_identity in artist_eligible_candidates
+                if candidate.album_type in ("album", "single")
+                and _has_equivalent_music_release_title(
+                    mention_edition_identity,
+                    candidate_title_identity,
+                )
+            ),
+            None,
+        )
     if candidate is None:
         return MusicReleaseResult(
             status=ResultStatus.UNRESOLVED,
@@ -225,14 +294,73 @@ def _has_exact_track_titles(track_mention: TrackMention, candidate: TrackCandida
     )
 
 
-def _has_exact_music_release_title(
-    music_release_mention: MusicReleaseMention,
-    candidate: AlbumCandidate,
+def _split_trailing_title_segment(normalized_title: str) -> tuple[str, str] | None:
+    """Return the rightmost supported trailing title segment."""
+    longest_match: tuple[str, str] | None = None
+    for pattern in _TRAILING_TITLE_SEGMENT_PATTERNS:
+        match = pattern.fullmatch(normalized_title)
+        if match is None:
+            continue
+        base_title = match.group("base").strip()
+        segment_title = match.group("segment").strip()
+        if (
+            base_title
+            and segment_title
+            and (longest_match is None or len(base_title) > len(longest_match[0]))
+        ):
+            longest_match = (base_title, segment_title)
+    return longest_match
+
+
+def _is_music_release_edition_designation(segment_title: str) -> bool:
+    """Return whether a normalized title segment names a supported release edition."""
+    return (
+        segment_title in _MUSIC_RELEASE_EDITION_DESIGNATIONS
+        or _YEAR_REMASTER_DESIGNATION_PATTERN.fullmatch(segment_title) is not None
+        or _ORDINAL_ANNIVERSARY_DESIGNATION_PATTERN.fullmatch(segment_title) is not None
+    )
+
+
+def _music_release_edition_identity(
+    normalized_title: str,
+) -> _EditionTitleIdentity | None:
+    """Return a comparison identity or None when trailing material is excluded."""
+    comparison_base = normalized_title
+    scan_title = normalized_title
+    designation_removed = False
+    stripping_designations = True
+    while (trailing_segment := _split_trailing_title_segment(scan_title)) is not None:
+        base_title, segment_title = trailing_segment
+        if _BLOCKED_EDITION_MATERIAL_PATTERN.search(segment_title) is not None:
+            return None
+        if stripping_designations and _is_music_release_edition_designation(segment_title):
+            comparison_base = base_title
+            designation_removed = True
+        else:
+            stripping_designations = False
+        scan_title = base_title
+    return _EditionTitleIdentity(
+        base_title=comparison_base,
+        designation_removed=designation_removed,
+    )
+
+
+def _has_equivalent_music_release_title(
+    mention_edition_identity: _EditionTitleIdentity | None,
+    candidate_title_identity: str,
 ) -> bool:
-    """Return whether a Music Release title matches exactly."""
-    return normalize_music_identity(
-        music_release_mention.release_title
-    ) == normalize_music_identity(candidate.title)
+    """Return whether titles differ only by controlled Music Release editions."""
+    if mention_edition_identity is None:
+        return False
+    candidate_edition_identity = _music_release_edition_identity(candidate_title_identity)
+    return (
+        candidate_edition_identity is not None
+        and mention_edition_identity.base_title == candidate_edition_identity.base_title
+        and (
+            mention_edition_identity.designation_removed
+            or candidate_edition_identity.designation_removed
+        )
+    )
 
 
 def _has_shared_artist_credit(
