@@ -12,7 +12,7 @@ The extraction pipeline:
 4. Uses Faster-Whisper directly for non-YouTube sources.
 5. Sends bounded source metadata and transcript material to the selected LLM provider.
 6. Validates the structured LLM response, deduplicates Mentions independently per kind, and preserves first-reference order within each kind.
-7. Searches TMDB's Movie and TV endpoints and resolves a Screen Work Mention only when its canonical title or a provider alternative title matches together with its release or first air year.
+7. Searches TMDB's Movie and TV endpoints and resolves a Screen Work Mention by matching its canonical or provider alternative title against the exact interpreted year first, then the immediately following and preceding provider years only if no exact-year Candidate matches.
 8. Makes one bounded Spotify Track search for each Track Mention in the effective market, checks exact artist-eligible titles first, then reuses those Candidates in Spotify order for controlled Equivalent Track Version resolution.
 9. Makes one bounded Spotify Album search for each direct Music Release Mention in the effective market, checks exact artist-eligible titles first, then reuses those Candidates in Spotify order for controlled equivalent-edition resolution.
 10. Returns grouped `movies`, `tv_series`, `tracks`, and `music_releases` result lists, resolving each Mention to enriched metadata or `null` independently within its kind.
@@ -125,7 +125,7 @@ The response contains:
 - `results.movies[].movie`: TMDB-backed enrichment for a resolved Mention, or `null` for an unresolved Mention.
 - `results.tv_series[].tv_series_mention`: The canonical TV Series title and first air year interpreted by the LLM.
 - `results.tv_series[].tv_series`: TMDB-backed enrichment for a resolved Mention, or `null` for an unresolved Mention.
-  `first_air_year` is the verified TV First Air Year.
+  `first_air_year` is the matched TMDB provider year and can differ from the preserved TV Series Mention year by at most one.
   A `null` `last_air_year` means the final air year is unavailable, not that the TV Series continues.
   `creators` comes only from TMDB's `created_by` list and retains first-provider order after duplicate names are removed.
   `cast` is the first five TMDB aggregate-cast names in provider order, with no role filtering or person deduplication.

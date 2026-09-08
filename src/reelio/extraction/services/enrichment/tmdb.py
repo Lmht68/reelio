@@ -264,13 +264,47 @@ class TMDBScreenWorkResolver:
         tv_series_mention: TVSeriesMention,
     ) -> TVSeriesResult:
         normalized_mention_title = normalize_screen_work_title(tv_series_mention.title)
+        for search_year in (
+            tv_series_mention.year,
+            tv_series_mention.year + 1,
+            tv_series_mention.year - 1,
+        ):
+            resolution = await self._find_tv_series_in_year(
+                tv_series_mention,
+                normalized_mention_title,
+                search_year,
+            )
+            if resolution is not None:
+                tv_series, first_air_year = resolution
+                return TVSeriesResult(
+                    status=ResultStatus.RESOLVED,
+                    tv_series_mention=tv_series_mention,
+                    tv_series=self._enrich_tv_series(
+                        tv_series_mention,
+                        tv_series,
+                        first_air_year,
+                    ),
+                )
+
+        return TVSeriesResult(
+            status=ResultStatus.UNRESOLVED,
+            tv_series_mention=tv_series_mention,
+            tv_series=None,
+        )
+
+    async def _find_tv_series_in_year(
+        self,
+        tv_series_mention: TVSeriesMention,
+        normalized_mention_title: str,
+        search_year: int,
+    ) -> tuple[_TVSeriesDetails, int] | None:
         search_response = await self._get_model(
             "search/tv",
             {
                 "query": tv_series_mention.title,
                 "include_adult": True,
                 "language": "en-US",
-                "first_air_date_year": tv_series_mention.year,
+                "first_air_date_year": search_year,
                 "page": 1,
             },
             _TVSearchResponse,
@@ -278,7 +312,7 @@ class TMDBScreenWorkResolver:
 
         for candidate in search_response.results[:_CANDIDATE_LIMIT]:
             candidate_year = _year_from_date(candidate.first_air_date)
-            if candidate_year is None or candidate_year != tv_series_mention.year:
+            if candidate_year is None or candidate_year != search_year:
                 continue
 
             primary_titles_matched = any(
@@ -307,17 +341,9 @@ class TMDBScreenWorkResolver:
                 ):
                     continue
 
-            return TVSeriesResult(
-                status=ResultStatus.RESOLVED,
-                tv_series_mention=tv_series_mention,
-                tv_series=self._enrich_tv_series(tv_series_mention, tv_series),
-            )
+            return tv_series, candidate_year
 
-        return TVSeriesResult(
-            status=ResultStatus.UNRESOLVED,
-            tv_series_mention=tv_series_mention,
-            tv_series=None,
-        )
+        return None
 
     async def _get_model[ModelType: BaseModel](
         self,
@@ -378,6 +404,7 @@ class TMDBScreenWorkResolver:
         self,
         tv_series_mention: TVSeriesMention,
         tv_series: _TVSeriesDetails,
+        first_air_year: int,
     ) -> EnrichedTVSeries:
         cast_members = [member.name for member in tv_series.aggregate_credits.cast[:5]]
         creators = list(dict.fromkeys(creator.name for creator in tv_series.created_by))
@@ -396,7 +423,7 @@ class TMDBScreenWorkResolver:
         )
         return EnrichedTVSeries(
             title=tv_series_mention.title,
-            first_air_year=tv_series_mention.year,
+            first_air_year=first_air_year,
             last_air_year=last_air_year,
             cast=cast_members,
             creators=creators,

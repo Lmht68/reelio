@@ -431,29 +431,94 @@ async def test_resolver_resolves_tv_primary_original_and_alternative_titles() ->
     await resolver.aclose()
 
 
-async def test_resolver_limits_tv_resolution_to_first_page_and_three_candidates() -> None:
-    """Request no TV search page beyond one and inspect at most three candidates."""
-    requested_paths: list[str] = []
+@pytest.mark.parametrize(
+    ("provider_year", "expected_search_years"),
+    [
+        (2000 - 1, ["2000", "2001", "1999"]),
+        (2000 + 1, ["2000", "2001"]),
+    ],
+)
+async def test_resolver_searches_tv_adjacent_years_after_exact_year_has_no_match(
+    provider_year: int,
+    expected_search_years: list[str],
+) -> None:
+    """Resolve a TV Series whose provider first air year differs by one."""
+    requested_search_years: list[str] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
-        requested_paths.append(request.url.path)
         if request.url.path == "/3/search/tv":
-            assert request.url.params["page"] == "1"
+            search_year = request.url.params["first_air_date_year"]
+            requested_search_years.append(search_year)
+            if int(search_year) != provider_year:
+                return httpx.Response(200, json={"results": []})
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 1,
+                            "name": "Target",
+                            "first_air_date": f"{provider_year}-01-01",
+                        }
+                    ]
+                },
+            )
+
+        assert request.url.path == "/3/tv/1"
+        assert request.url.params["append_to_response"] == "aggregate_credits,external_ids"
+        return httpx.Response(
+            200,
+            json={
+                "id": 1,
+                "name": "Target",
+                "aggregate_credits": {"cast": []},
+                "external_ids": {},
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    tv_series_mention = TVSeriesMention(title="Target", year=2000)
+
+    results = await resolver.resolve(_mentions(tv_series=[tv_series_mention]))
+
+    assert requested_search_years == expected_search_years
+    result = results.tv_series[0]
+    assert result.status is ResultStatus.RESOLVED
+    assert result.tv_series_mention is tv_series_mention
+    assert result.tv_series_mention.year == 2000
+    assert result.tv_series is not None
+    assert result.tv_series.first_air_year == provider_year
+    await resolver.aclose()
+
+
+async def test_resolver_limits_tv_resolution_to_first_page_and_three_candidates() -> None:
+    """Inspect only page one and the first three candidates for each tolerated TV year."""
+    requested_searches: list[tuple[str, str]] = []
+    requested_detail_paths: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/tv":
+            search_year = int(request.url.params["first_air_date_year"])
+            page = request.url.params["page"]
+            requested_searches.append((str(search_year), page))
+            assert page == "1"
             return httpx.Response(
                 200,
                 json={
                     "total_pages": 2,
                     "results": [
                         {
-                            "id": identifier,
+                            "id": search_year * 10 + identifier,
                             "name": "No Match",
-                            "first_air_date": "2020-01-01",
+                            "first_air_date": f"{search_year}-01-01",
                         }
                         for identifier in range(1, 5)
                     ],
                 },
             )
-        assert request.url.path in {"/3/tv/1", "/3/tv/2", "/3/tv/3"}
+
+        requested_detail_paths.append(request.url.path)
         assert request.url.params["append_to_response"] == (
             "aggregate_credits,alternative_titles,external_ids"
         )
@@ -476,7 +541,12 @@ async def test_resolver_limits_tv_resolution_to_first_page_and_three_candidates(
         _mentions(tv_series=[TVSeriesMention(title="Target", year=2020)])
     )
 
-    assert requested_paths == ["/3/search/tv", "/3/tv/1", "/3/tv/2", "/3/tv/3"]
+    assert requested_searches == [("2020", "1"), ("2021", "1"), ("2019", "1")]
+    assert requested_detail_paths == [
+        f"/3/tv/{search_year * 10 + identifier}"
+        for search_year in (2020, 2021, 2019)
+        for identifier in range(1, 4)
+    ]
     assert results.tv_series[0].status is ResultStatus.UNRESOLVED
     assert results.tv_series[0].tv_series is None
     await resolver.aclose()
@@ -484,10 +554,12 @@ async def test_resolver_limits_tv_resolution_to_first_page_and_three_candidates(
 
 async def test_resolver_returns_first_matching_tv_candidate() -> None:
     """Select the first TV candidate that matches the canonical title and year."""
+    requested_search_years: list[str] = []
     detail_paths: list[str] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/3/search/tv":
+            requested_search_years.append(request.url.params["first_air_date_year"])
             return httpx.Response(
                 200,
                 json={
@@ -523,6 +595,7 @@ async def test_resolver_returns_first_matching_tv_candidate() -> None:
         _mentions(tv_series=[TVSeriesMention(title="Target", year=2015)])
     )
 
+    assert requested_search_years == ["2015"]
     assert detail_paths == ["/3/tv/1"]
     assert results.tv_series[0].tv_series is not None
     assert results.tv_series[0].tv_series.tmdb_id == 1
@@ -543,7 +616,7 @@ async def test_resolver_retains_unresolved_tv_mentions_after_mismatches_or_absen
                             {
                                 "id": 1,
                                 "name": "Wrong Year",
-                                "first_air_date": "1999-01-01",
+                                "first_air_date": "1998-01-01",
                             }
                         ],
                         "Wrong Title": [
