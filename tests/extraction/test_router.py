@@ -374,7 +374,7 @@ def _install_pipeline(application: FastAPI, pipeline: ExtractionPipelineProtocol
 async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_results(
     client: AsyncClient,
 ) -> None:
-    """Return a complete mixed Screen Work and Music contract with resolved and null entities."""
+    """Return grouped results and their complete resolution statistics."""
     metadata_extractor = _MetadataExtractor()
     resolved_movie_mention = MovieMention(title="Dune: Part One", year=2021)
     unresolved_movie_mention = MovieMention(title="Unknown Movie", year=2024)
@@ -499,8 +499,16 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
     assert payload.transcript.method == "youtube_captions"
     assert payload.transcript.text == "Router caption text."
 
-    raw_results = response.json()["results"]
-    assert set(raw_results) == {"movies", "tv_series", "tracks", "music_releases"}
+    raw_response = response.json()
+    assert list(raw_response) == ["market", "source", "transcript", "statistics", "results"]
+    raw_statistics = raw_response["statistics"]
+    assert raw_statistics == {
+        "movies": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+        "tv_series": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+        "tracks": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+        "music_releases": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+    }
+    raw_results = raw_response["results"]
     assert [item["status"] for item in raw_results["movies"]] == ["resolved", "unresolved"]
     assert [item["status"] for item in raw_results["tv_series"]] == ["resolved", "unresolved"]
     assert [item["status"] for item in raw_results["tracks"]] == ["resolved", "unresolved"]
@@ -1043,7 +1051,7 @@ async def test_unhandled_failures_do_not_leak_internals() -> None:
 
 
 async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
-    """Document grouped Music resolution, complete TV metadata, and atomic failures."""
+    """Document result statistics, grouped Music resolution, TV metadata, and failures."""
     response = await client.get("/openapi.json")
 
     assert response.status_code == 200
@@ -1102,6 +1110,12 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
 
     example = responses["200"]["content"]["application/json"]["example"]
     assert example["market"] == "US"
+    assert example["statistics"] == {
+        "movies": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+        "tv_series": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+        "tracks": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+        "music_releases": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+    }
     assert set(example["results"]) == {
         "movies",
         "tv_series",
@@ -1211,9 +1225,19 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
 
     assert "ResultModel" not in schemas
     assert all("cover" not in schema_name.casefold() for schema_name in schemas)
-    extract_response_properties = schemas["ExtractResponse"]["properties"]
-    assert "market" in schemas["ExtractResponse"]["required"]
+    extract_response_schema = schemas["ExtractResponse"]
+    extract_response_properties = extract_response_schema["properties"]
+    assert extract_response_schema["required"] == [
+        "market",
+        "source",
+        "transcript",
+        "statistics",
+        "results",
+    ]
     assert extract_response_properties["market"]["pattern"] == "^[A-Z]{2}$"
+    assert extract_response_properties["statistics"] == {
+        "$ref": "#/components/schemas/ExtractionStatisticsModel"
+    }
     assert extract_response_properties["results"] == {
         "$ref": "#/components/schemas/ExtractionResultsModel"
     }
@@ -1244,6 +1268,23 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "type": "array",
         "title": "Music Releases",
     }
+    extraction_statistics = schemas["ExtractionStatisticsModel"]
+    assert extraction_statistics["required"] == [
+        "movies",
+        "tv_series",
+        "tracks",
+        "music_releases",
+    ]
+    assert extraction_statistics["properties"] == {
+        "movies": {"$ref": "#/components/schemas/ResultCountsModel"},
+        "tv_series": {"$ref": "#/components/schemas/ResultCountsModel"},
+        "tracks": {"$ref": "#/components/schemas/ResultCountsModel"},
+        "music_releases": {"$ref": "#/components/schemas/ResultCountsModel"},
+    }
+    result_counts = schemas["ResultCountsModel"]
+    assert result_counts["required"] == ["n_mentions", "n_resolved", "n_unresolved"]
+    for count_name in result_counts["required"]:
+        assert result_counts["properties"][count_name]["minimum"] == 0
 
     movie_result_schema = schemas["MovieResultModel"]
     assert {"status", "movie_mention", "movie"} <= set(movie_result_schema["required"])
@@ -1388,6 +1429,7 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     }
     assert "YouTube, Instagram, Facebook, TikTok, or X" in operation["description"]
     assert "first-reference order" in operation["description"]
+    assert "Each statistics category counts returned results" in operation["description"]
     assert "Track Results retain their interpreted Track Mention" in operation["description"]
     assert (
         "Music Release Results retain their interpreted Music Release Mention"
@@ -1470,6 +1512,12 @@ async def test_extract_validates_forwards_and_exposes_the_effective_market(
 
     assert explicit_response.status_code == 200
     assert explicit_response.json()["market"] == "JP"
+    assert explicit_response.json()["statistics"] == {
+        "movies": {"n_mentions": 0, "n_resolved": 0, "n_unresolved": 0},
+        "tv_series": {"n_mentions": 0, "n_resolved": 0, "n_unresolved": 0},
+        "tracks": {"n_mentions": 0, "n_resolved": 0, "n_unresolved": 0},
+        "music_releases": {"n_mentions": 0, "n_resolved": 0, "n_unresolved": 0},
+    }
     assert default_response.status_code == 200
     assert default_response.json()["market"] == "US"
     assert invalid_response.status_code == 422

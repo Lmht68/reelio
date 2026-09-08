@@ -1,5 +1,6 @@
 """HTTP routing and domain-to-schema conversion for extraction."""
 
+from collections.abc import Sequence
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, Request, status
@@ -17,11 +18,14 @@ from reelio.extraction.types import (
     MusicReleaseMention,
     MusicReleaseResult,
     PipelineResult,
+    ResultStatus,
     TrackMention,
     TrackResult,
     TVSeriesMention,
     TVSeriesResult,
 )
+
+_ExtractionResult = MovieResult | TVSeriesResult | TrackResult | MusicReleaseResult
 
 _EXTRACT_RESPONSE_EXAMPLE = {
     "market": "US",
@@ -38,6 +42,12 @@ _EXTRACT_RESPONSE_EXAMPLE = {
         "text": "Dune: Part One, The Last of Us, One More Time, and Discovery are excellent.",
         "language": "en",
         "method": "youtube_captions",
+    },
+    "statistics": {
+        "movies": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+        "tv_series": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+        "tracks": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+        "music_releases": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
     },
     "results": {
         "movies": [
@@ -340,6 +350,26 @@ def _to_music_release_result_schema(
     )
 
 
+def _to_result_counts_schema(
+    results: Sequence[_ExtractionResult],
+) -> extraction_schemas.ResultCountsModel:
+    """Count returned results by resolution outcome.
+
+    Args:
+        results: Returned results from one category.
+
+    Returns:
+        ResultCountsModel: Total, resolved, and unresolved result counts.
+    """
+    n_mentions = len(results)
+    n_resolved = sum(item.status is ResultStatus.RESOLVED for item in results)
+    return extraction_schemas.ResultCountsModel(
+        n_mentions=n_mentions,
+        n_resolved=n_resolved,
+        n_unresolved=n_mentions - n_resolved,
+    )
+
+
 def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
     return extraction_schemas.ExtractResponse(
         market=result.market,
@@ -356,6 +386,12 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
             text=result.transcript.text,
             language=result.transcript.language,
             method=result.transcript.method,
+        ),
+        statistics=extraction_schemas.ExtractionStatisticsModel(
+            movies=_to_result_counts_schema(result.results.screen_works.movies),
+            tv_series=_to_result_counts_schema(result.results.screen_works.tv_series),
+            tracks=_to_result_counts_schema(result.results.music.tracks),
+            music_releases=_to_result_counts_schema(result.results.music.music_releases),
         ),
         results=extraction_schemas.ExtractionResultsModel(
             movies=[_to_movie_result_schema(item) for item in result.results.screen_works.movies],
@@ -379,9 +415,11 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
     description=(
         "Accept a public YouTube, Instagram, Facebook, TikTok, or X video URL and "
         "return the normalized Source, the Transcript with its acquisition method, "
-        "the effective Spotify market, and grouped Movie, TV Series, Track, and "
-        "Music Release results. Each list preserves first-reference order within "
-        "its kind, with no cross-kind ordering. The optional market must use "
+        "the effective Spotify market, category-specific result statistics, and "
+        "grouped Movie, TV Series, Track, and Music Release results. Each statistics "
+        "category counts returned results, Resolved Results, and Unresolved Results. "
+        "Each list preserves first-reference order within its kind, with no cross-kind "
+        "ordering. The optional market must use "
         "uppercase ISO 3166-1 alpha-2 syntax; an omitted market uses configured "
         "US. Resolved TV Series report their TV First Air Year, an optional final "
         "air year where null means unavailable rather than proof of continuation, "
@@ -436,12 +474,12 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         "complete request."
     ),
     response_description=(
-        "Effective market, Source, transcript, and grouped Movie, TV Series, "
-        "Track, and Music Release results."
+        "Effective market, Source, transcript, category-specific result statistics, "
+        "and grouped Movie, TV Series, Track, and Music Release results."
     ),
     responses={
         200: {
-            "description": ("Grouped Movie, TV Series, Track, and Music Release results."),
+            "description": "Result statistics and grouped Movie, TV Series, Track, and Music Release results.",
             "content": {
                 "application/json": {"example": _EXTRACT_RESPONSE_EXAMPLE},
             },

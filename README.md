@@ -115,6 +115,9 @@ The response contains:
   Omit it to use configured `REELIO_SPOTIFY_DEFAULT_MARKET`, which defaults to `US`.
 - `source`: The canonical platform, external video ID, URL, title, description, channel, and duration.
 - `transcript`: The normalized transcript text, detected language, and acquisition method.
+- `statistics`: A grouped object before `results` with always-present `movies`, `tv_series`, `tracks`, and `music_releases` category objects.
+  Each category contains non-negative integer `n_mentions`, `n_resolved`, and `n_unresolved` fields.
+  `n_mentions` counts returned items and equals `n_resolved + n_unresolved`.
 - `results`: A grouped object with four always-present lists, `movies`, `tv_series`, `tracks`, and `music_releases`.
   Each list is deduplicated independently and preserves first-reference order within its kind.
   There is no cross-kind ordering.
@@ -189,6 +192,12 @@ Compact success example:
     "text": "Dune: Part One, The Last of Us, One More Time, and Discovery are excellent.",
     "language": "en",
     "method": "youtube_captions"
+  },
+  "statistics": {
+    "movies": {"n_mentions": 1, "n_resolved": 1, "n_unresolved": 0},
+    "tv_series": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+    "tracks": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+    "music_releases": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1}
   },
   "results": {
     "movies": [

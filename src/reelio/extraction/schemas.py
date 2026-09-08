@@ -205,6 +205,32 @@ class MusicReleaseResultModel(BaseModel):
     music_release: MusicReleaseModel | None
 
 
+class ResultCountsModel(BaseModel):
+    """Counts returned results in one category by resolution outcome."""
+
+    n_mentions: int = Field(
+        ge=0,
+        description="Number of results returned in this category.",
+    )
+    n_resolved: int = Field(
+        ge=0,
+        description="Number of returned results with resolved status.",
+    )
+    n_unresolved: int = Field(
+        ge=0,
+        description="Number of returned results with unresolved status.",
+    )
+
+
+class ExtractionStatisticsModel(BaseModel):
+    """Returned result counts grouped by category."""
+
+    movies: ResultCountsModel
+    tv_series: ResultCountsModel
+    tracks: ResultCountsModel
+    music_releases: ResultCountsModel
+
+
 class ExtractionResultsModel(BaseModel):
     """Resolved results grouped in independent first-reference order."""
 
@@ -222,6 +248,7 @@ class ExtractResponse(BaseModel):
     )
     source: SourceModel
     transcript: TranscriptModel
+    statistics: ExtractionStatisticsModel
     results: ExtractionResultsModel
 
 
