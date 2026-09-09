@@ -311,6 +311,9 @@ async def test_resolver_searches_only_first_page_per_year_before_returning_unres
 
     async def handle(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/3/search/movie"
+        if "year" not in request.url.params:
+            return httpx.Response(200, json={"results": []})
+
         search_year = request.url.params["year"]
         page = request.url.params["page"]
         requested_searches.append((search_year, page))
@@ -608,6 +611,9 @@ async def test_resolver_retains_unresolved_tv_mentions_after_mismatches_or_absen
 
     async def handle(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/3/search/tv":
+            query = request.url.params["query"]
+            if query in {"Year", "Wrong", "Title"}:
+                return httpx.Response(200, json={"results": []})
             return httpx.Response(
                 200,
                 json={
@@ -627,7 +633,7 @@ async def test_resolver_retains_unresolved_tv_mentions_after_mismatches_or_absen
                             }
                         ],
                         "Missing": [],
-                    }[request.url.params["query"]]
+                    }[query]
                 },
             )
         detail_paths.append(request.url.path)
@@ -1957,6 +1963,755 @@ async def test_resolver_aborts_grouped_fallback_resolution_without_partial_resul
         assert request.url.path == "/3/tv/2"
         await successful_movie_detail_loaded.wait()
         return httpx.Response(503, request=request)
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+
+    with pytest.raises(EnrichmentError, match="TMDB candidate resolution"):
+        await resolver.resolve(
+            _mentions(
+                movies=[MovieMention(title="Movie Success", year=2020)],
+                tv_series=[TVSeriesMention(title="TV Failure", year=2020)],
+            )
+        )
+
+    await resolver.aclose()
+
+
+async def test_resolver_fragment_searches_movie_and_tv_without_years() -> None:
+    """Resolve both kinds through bounded, yearless suffix fragment searches."""
+    movie_direct_years: list[str] = []
+    tv_direct_years: list[str] = []
+    movie_fragment_params: list[dict[str, str]] = []
+    tv_fragment_params: list[dict[str, str]] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            if "year" in request.url.params:
+                movie_direct_years.append(request.url.params["year"])
+                return httpx.Response(200, json={"results": []})
+            movie_fragment_params.append(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={"results": [{"id": 1, "title": "Target Movi"}]},
+            )
+        if request.url.path == "/3/search/tv":
+            if "first_air_date_year" in request.url.params:
+                tv_direct_years.append(request.url.params["first_air_date_year"])
+                return httpx.Response(200, json={"results": []})
+            tv_fragment_params.append(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={"results": [{"id": 2, "name": "Target Serie"}]},
+            )
+        if request.url.path == "/3/movie/1":
+            return httpx.Response(
+                200,
+                json={"id": 1, "title": "Target Movie", "release_date": "2020-01-01"},
+            )
+
+        assert request.url.path == "/3/tv/2"
+        return httpx.Response(
+            200,
+            json={
+                "id": 2,
+                "name": "Target Series",
+                "first_air_date": "2020-01-01",
+                "aggregate_credits": {},
+                "external_ids": {},
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    movie_mention = MovieMention(title="Target Movie", year=2020)
+    tv_series_mention = TVSeriesMention(title="Target Series", year=2020)
+
+    results = await resolver.resolve(_mentions([movie_mention], [tv_series_mention]))
+
+    assert movie_direct_years == ["2020", "2021", "2019"]
+    assert tv_direct_years == ["2020", "2021", "2019"]
+    assert movie_fragment_params == [
+        {
+            "query": "Movie",
+            "include_adult": "true",
+            "language": "en-US",
+            "page": "1",
+        }
+    ]
+    assert tv_fragment_params == [
+        {
+            "query": "Series",
+            "include_adult": "true",
+            "language": "en-US",
+            "page": "1",
+        }
+    ]
+    assert results.movies[0].status is ResultStatus.RESOLVED
+    assert results.movies[0].movie_mention is movie_mention
+    assert results.movies[0].movie is not None
+    assert results.movies[0].movie.tmdb_id == 1
+    assert results.tv_series[0].status is ResultStatus.RESOLVED
+    assert results.tv_series[0].tv_series_mention is tv_series_mention
+    assert results.tv_series[0].tv_series is not None
+    assert results.tv_series[0].tv_series.tmdb_id == 2
+    await resolver.aclose()
+
+
+async def test_resolver_waits_for_direct_fuzzy_resolution_before_fragment_search() -> None:
+    """Delay Fragment Search until every direct fuzzy resolution has completed."""
+    direct_fuzzy_detail_started = asyncio.Event()
+    release_direct_fuzzy_detail = asyncio.Event()
+    fragment_search_started = asyncio.Event()
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            if "year" in request.url.params:
+                if request.url.params["query"] == "Target Movie":
+                    return httpx.Response(
+                        200,
+                        json={"results": [{"id": 1, "title": "Target Movi"}]},
+                    )
+                return httpx.Response(200, json={"results": []})
+            assert request.url.params["query"] == "Film"
+            fragment_search_started.set()
+            return httpx.Response(
+                200,
+                json={"results": [{"id": 2, "title": "Fragment Fil"}]},
+            )
+        if request.url.path == "/3/movie/1":
+            direct_fuzzy_detail_started.set()
+            await release_direct_fuzzy_detail.wait()
+            return httpx.Response(
+                200,
+                json={"id": 1, "title": "Target Movie", "release_date": "2020-01-01"},
+            )
+
+        assert request.url.path == "/3/movie/2"
+        return httpx.Response(
+            200,
+            json={"id": 2, "title": "Fragment Film", "release_date": "2020-01-01"},
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolve_task = asyncio.create_task(
+        resolver.resolve(
+            _mentions(
+                movies=[
+                    MovieMention(title="Target Movie", year=2020),
+                    MovieMention(title="Fragment Film", year=2020),
+                ]
+            )
+        )
+    )
+
+    await direct_fuzzy_detail_started.wait()
+    await asyncio.sleep(0)
+    assert fragment_search_started.is_set() is False
+
+    release_direct_fuzzy_detail.set()
+    results = await resolve_task
+
+    assert fragment_search_started.is_set() is True
+    assert [result.status for result in results.movies] == [
+        ResultStatus.RESOLVED,
+        ResultStatus.RESOLVED,
+    ]
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize("resolution_stage", ["strict", "direct_fuzzy"])
+async def test_resolver_skips_fragment_search_after_earlier_resolution(
+    resolution_stage: str,
+) -> None:
+    """Keep strict and direct fuzzy matches ahead of Fragment Search."""
+    fragment_queries: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            if "year" not in request.url.params:
+                fragment_queries.append(request.url.params["query"])
+                return httpx.Response(200, json={"results": []})
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 1,
+                            "title": (
+                                "Target Movie" if resolution_stage == "strict" else "Target Movi"
+                            ),
+                            "release_date": ("2020-01-01" if resolution_stage == "strict" else ""),
+                        }
+                    ]
+                },
+            )
+
+        assert request.url.path == "/3/movie/1"
+        return httpx.Response(
+            200,
+            json={"id": 1, "title": "Target Movie", "release_date": "2020-01-01"},
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+
+    results = await resolver.resolve(
+        _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
+    )
+
+    assert fragment_queries == []
+    assert results.movies[0].status is ResultStatus.RESOLVED
+    assert results.movies[0].movie is not None
+    assert results.movies[0].movie.tmdb_id == 1
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    ("title", "expected_fragment_queries"),
+    [
+        ("Title", []),
+        ("First Second", ["Second", "First"]),
+        ("Echo Echo", ["Echo"]),
+    ],
+)
+async def test_resolver_derives_bounded_fragment_queries(
+    title: str,
+    expected_fragment_queries: list[str],
+) -> None:
+    """Search suffix then prefix, skipping absent and duplicate fragments."""
+    fragment_queries: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/3/search/movie"
+        if "year" not in request.url.params:
+            fragment_queries.append(request.url.params["query"])
+        return httpx.Response(200, json={"results": []})
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    movie_mention = MovieMention(title=title, year=2020)
+
+    results = await resolver.resolve(_mentions(movies=[movie_mention]))
+
+    result = results.movies[0]
+    assert fragment_queries == expected_fragment_queries
+    assert result.status is ResultStatus.UNRESOLVED
+    assert result.movie_mention is movie_mention
+    assert result.movie is None
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize("suffix_resolves", [True, False])
+async def test_resolver_preserves_normalized_title_tokens_in_fragment_queries(
+    suffix_resolves: bool,
+) -> None:
+    """Preserve title punctuation and use the prefix only after suffix exhaustion."""
+    title = "  L'Été: Spider-Man's   Re-entry  "
+    suffix = "Spider-Man's Re-entry"
+    prefix = "L'Été: Spider-Man's"
+    fragment_queries: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            if "year" in request.url.params:
+                return httpx.Response(200, json={"results": []})
+            query = request.url.params["query"]
+            fragment_queries.append(query)
+            if (query == suffix and suffix_resolves) or (query == prefix and not suffix_resolves):
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "id": 1 if suffix_resolves else 2,
+                                "title": "L'Été: Spider-Man's Re-entry",
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(200, json={"results": []})
+
+        identifier = int(request.url.path.rsplit("/", maxsplit=1)[-1])
+        return httpx.Response(
+            200,
+            json={
+                "id": identifier,
+                "title": "L'Été: Spider-Man's Re-entry",
+                "release_date": "2020-01-01",
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+
+    results = await resolver.resolve(_mentions(movies=[MovieMention(title=title, year=2020)]))
+
+    assert fragment_queries == ([suffix] if suffix_resolves else [suffix, prefix])
+    assert results.movies[0].status is ResultStatus.RESOLVED
+    assert results.movies[0].movie is not None
+    assert results.movies[0].movie.tmdb_id == (1 if suffix_resolves else 2)
+    await resolver.aclose()
+
+
+async def test_resolver_limits_fragment_search_to_five_candidates() -> None:
+    """Ignore a sixth fragment Candidate even when it would otherwise qualify."""
+    fragment_queries: list[str] = []
+    detail_paths: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            if "year" in request.url.params:
+                return httpx.Response(200, json={"results": []})
+            query = request.url.params["query"]
+            fragment_queries.append(query)
+            if query == "Movie":
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            *[
+                                {"id": identifier, "title": "No Match"}
+                                for identifier in range(1, 6)
+                            ],
+                            {"id": 6, "title": "Target Movie"},
+                        ]
+                    },
+                )
+            return httpx.Response(200, json={"results": []})
+
+        detail_paths.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={"id": 6, "title": "Target Movie", "release_date": "2020-01-01"},
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+
+    results = await resolver.resolve(
+        _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
+    )
+
+    assert fragment_queries == ["Movie", "Target"]
+    assert detail_paths == []
+    assert results.movies[0].status is ResultStatus.UNRESOLVED
+    assert results.movies[0].movie is None
+    await resolver.aclose()
+
+
+async def test_resolver_uses_provider_order_for_fragment_candidates() -> None:
+    """Resolve the first qualifying fragment Candidate without score comparison."""
+    detail_paths: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            if "year" in request.url.params:
+                return httpx.Response(200, json={"results": []})
+            if request.url.params["query"] == "Movie":
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {"id": 1, "title": "Target Movi"},
+                            {"id": 2, "title": "Target Movie"},
+                        ]
+                    },
+                )
+            return httpx.Response(200, json={"results": []})
+
+        detail_paths.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={"id": 1, "title": "Target Movie", "release_date": "2020-01-01"},
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+
+    results = await resolver.resolve(
+        _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
+    )
+
+    assert detail_paths == ["/3/movie/1"]
+    assert results.movies[0].movie is not None
+    assert results.movies[0].movie.tmdb_id == 1
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize("match_source", ["primary", "original", "alternative"])
+async def test_resolver_uses_complete_titles_for_fragment_fuzzy_matching(
+    match_source: str,
+) -> None:
+    """Reject a matching fragment unless the complete Candidate title is similar."""
+    title = "Margot's Got Money Troubles"
+    suffix = "Got Money Troubles"
+    prefix = "Margot's Got Money"
+    fragment_queries: list[str] = []
+    detail_paths: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            if "year" in request.url.params:
+                return httpx.Response(200, json={"results": []})
+            query = request.url.params["query"]
+            fragment_queries.append(query)
+            if query != suffix:
+                return httpx.Response(200, json={"results": []})
+
+            full_title = "Margo's Got Money Troubles"
+            candidate = (
+                {"id": 2, "title": full_title}
+                if match_source == "primary"
+                else (
+                    {"id": 2, "title": "Provider Title", "original_title": full_title}
+                    if match_source == "original"
+                    else {"id": 2, "title": "Provider Title", "original_title": "Provider"}
+                )
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"id": 1, "title": suffix},
+                        candidate,
+                    ]
+                },
+            )
+
+        detail_paths.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "id": 2,
+                "title": "Margo's Got Money Troubles",
+                "release_date": "2020-01-01",
+                "alternative_titles": {"titles": [{"title": "Margo's Got Money Troubles"}]},
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+
+    results = await resolver.resolve(_mentions(movies=[MovieMention(title=title, year=2020)]))
+
+    expected_resolved = match_source != "alternative"
+    assert fragment_queries == ([suffix] if expected_resolved else [suffix, prefix])
+    assert detail_paths == (["/3/movie/2"] if expected_resolved else [])
+    assert (results.movies[0].status is ResultStatus.RESOLVED) is expected_resolved
+    assert (results.movies[0].movie is not None) is expected_resolved
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize("kind", ["movie", "tv"])
+@pytest.mark.parametrize("first_detail_date", [None, "", "not-a-date", "2018-01-01"])
+async def test_resolver_skips_fragment_candidates_without_acceptable_detail_year(
+    kind: str,
+    first_detail_date: object,
+) -> None:
+    """Continue fragment verification after an invalid detailed provider year."""
+    detail_paths: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        is_movie = request.url.path == "/3/search/movie"
+        if request.url.path in {"/3/search/movie", "/3/search/tv"}:
+            direct_year_parameter = "year" if is_movie else "first_air_date_year"
+            if direct_year_parameter in request.url.params:
+                return httpx.Response(200, json={"results": []})
+            if is_movie:
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {"id": 1, "title": "Target Movi"},
+                            {"id": 2, "title": "Target Movix"},
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"id": 1, "name": "Target Serie"},
+                        {"id": 2, "name": "Target Seriesx"},
+                    ]
+                },
+            )
+
+        detail_paths.append(request.url.path)
+        identifier = int(request.url.path.rsplit("/", maxsplit=1)[-1])
+        if kind == "movie":
+            return httpx.Response(
+                200,
+                json={
+                    "id": identifier,
+                    "title": "Target Movie",
+                    "release_date": (first_detail_date if identifier == 1 else "2021-01-01"),
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": identifier,
+                "name": "Target Series",
+                "first_air_date": (first_detail_date if identifier == 1 else "2021-01-01"),
+                "aggregate_credits": {},
+                "external_ids": {},
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+
+    results = await resolver.resolve(
+        _mentions(
+            movies=[MovieMention(title="Target Movie", year=2020)] if kind == "movie" else [],
+            tv_series=([TVSeriesMention(title="Target Series", year=2020)] if kind == "tv" else []),
+        )
+    )
+
+    if kind == "movie":
+        assert detail_paths == ["/3/movie/1", "/3/movie/2"]
+        assert results.movies[0].movie is not None
+        assert results.movies[0].movie.year == 2021
+    else:
+        assert detail_paths == ["/3/tv/1", "/3/tv/2"]
+        assert results.tv_series[0].tv_series is not None
+        assert results.tv_series[0].tv_series.first_air_year == 2021
+    await resolver.aclose()
+
+
+async def test_resolver_preserves_fragment_result_order_after_reverse_completion() -> None:
+    """Retain original per-kind order while fragment details complete in reverse."""
+    detail_completion_order: list[str] = []
+    detail_delays = {
+        "/3/movie/1": 0.04,
+        "/3/movie/2": 0.03,
+        "/3/tv/3": 0.02,
+        "/3/tv/4": 0.01,
+    }
+    movie_candidates = {
+        "Film": (1, "One Fil"),
+        "Movie": (2, "Two Movi"),
+    }
+    tv_candidates = {
+        "Series": (3, "Three Serie"),
+        "Show": (4, "Four Sho"),
+    }
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            if "year" in request.url.params:
+                return httpx.Response(200, json={"results": []})
+            identifier, title = movie_candidates[request.url.params["query"]]
+            return httpx.Response(200, json={"results": [{"id": identifier, "title": title}]})
+        if request.url.path == "/3/search/tv":
+            if "first_air_date_year" in request.url.params:
+                return httpx.Response(200, json={"results": []})
+            identifier, name = tv_candidates[request.url.params["query"]]
+            return httpx.Response(200, json={"results": [{"id": identifier, "name": name}]})
+
+        await asyncio.sleep(detail_delays[request.url.path])
+        detail_completion_order.append(request.url.path)
+        identifier = int(request.url.path.rsplit("/", maxsplit=1)[-1])
+        if request.url.path.startswith("/3/movie/"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": identifier,
+                    "title": f"{identifier} Movie",
+                    "release_date": "2020-01-01",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": identifier,
+                "name": f"{identifier} TV",
+                "first_air_date": "2020-01-01",
+                "aggregate_credits": {},
+                "external_ids": {},
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    movie_mentions = [
+        MovieMention(title="One Film", year=2020),
+        MovieMention(title="Two Movie", year=2020),
+    ]
+    tv_series_mentions = [
+        TVSeriesMention(title="Three Series", year=2020),
+        TVSeriesMention(title="Four Show", year=2020),
+    ]
+
+    results = await resolver.resolve(_mentions(movie_mentions, tv_series_mentions))
+
+    assert detail_completion_order == ["/3/tv/4", "/3/tv/3", "/3/movie/2", "/3/movie/1"]
+    assert [result.movie_mention for result in results.movies] == movie_mentions
+    assert [result.tv_series_mention for result in results.tv_series] == tv_series_mentions
+    assert [result.movie.tmdb_id for result in results.movies if result.movie] == [1, 2]
+    assert [result.tv_series.tmdb_id for result in results.tv_series if result.tv_series] == [3, 4]
+    await resolver.aclose()
+
+
+async def test_resolver_reuses_rejected_direct_fuzzy_details_for_fragment_search() -> None:
+    """Avoid reloading a Candidate detail already rejected during direct fuzzy resolution."""
+    fragment_queries: list[str] = []
+    detail_paths: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            if "year" in request.url.params:
+                return httpx.Response(
+                    200,
+                    json={"results": [{"id": 1, "title": "Target Movi"}]},
+                )
+            fragment_queries.append(request.url.params["query"])
+            if request.url.params["query"] == "Movie":
+                return httpx.Response(
+                    200,
+                    json={"results": [{"id": 1, "title": "Target Movi"}]},
+                )
+            return httpx.Response(200, json={"results": []})
+
+        detail_paths.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={"id": 1, "title": "Target Movie", "release_date": "2018-01-01"},
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+
+    results = await resolver.resolve(
+        _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
+    )
+
+    assert fragment_queries == ["Movie", "Target"]
+    assert detail_paths == ["/3/movie/1"]
+    assert results.movies[0].status is ResultStatus.UNRESOLVED
+    assert results.movies[0].movie is None
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    ("kind", "failure", "expected_exception"),
+    [
+        ("movie", "search_http", EnrichmentError),
+        ("movie", "search_timeout", PipelineTimeoutError),
+        ("movie", "search_invalid_json", EnrichmentError),
+        ("movie", "search_missing_candidate_id", EnrichmentError),
+        ("movie", "detail_http", EnrichmentError),
+        ("movie", "detail_timeout", PipelineTimeoutError),
+        ("movie", "detail_invalid_json", EnrichmentError),
+        ("movie", "detail_missing_title", EnrichmentError),
+        ("tv", "detail_missing_aggregate_credits", EnrichmentError),
+        ("tv", "detail_missing_external_ids", EnrichmentError),
+    ],
+)
+async def test_resolver_maps_fragment_search_and_detail_failures(
+    kind: str,
+    failure: str,
+    expected_exception: type[Exception],
+) -> None:
+    """Raise the shared extraction error policy for every fragment failure."""
+    search_path = f"/3/search/{kind}"
+    detail_path = f"/3/{kind}/1"
+    direct_year_parameter = "year" if kind == "movie" else "first_air_date_year"
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == search_path:
+            if direct_year_parameter in request.url.params:
+                return httpx.Response(200, json={"results": []})
+            if failure == "search_http":
+                return httpx.Response(503, request=request)
+            if failure == "search_timeout":
+                raise httpx.ReadTimeout("timed out", request=request)
+            if failure == "search_invalid_json":
+                return httpx.Response(200, content=b"{")
+            if failure == "search_missing_candidate_id":
+                return httpx.Response(200, json={"results": [{"title": "Target Movie"}]})
+            if kind == "movie":
+                return httpx.Response(
+                    200,
+                    json={"results": [{"id": 1, "title": "Target Movi"}]},
+                )
+            return httpx.Response(
+                200,
+                json={"results": [{"id": 1, "name": "Target Serie"}]},
+            )
+
+        assert request.url.path == detail_path
+        if failure == "detail_http":
+            return httpx.Response(503, request=request)
+        if failure == "detail_timeout":
+            raise httpx.ReadTimeout("timed out", request=request)
+        if failure == "detail_invalid_json":
+            return httpx.Response(200, content=b"{")
+        if kind == "movie":
+            payload: dict[str, object] = {
+                "id": 1,
+                "title": "Target Movie",
+                "release_date": "2020-01-01",
+            }
+            if failure == "detail_missing_title":
+                payload.pop("title")
+            return httpx.Response(200, json=payload)
+
+        payload = {
+            "id": 1,
+            "name": "Target Series",
+            "first_air_date": "2020-01-01",
+            "aggregate_credits": {},
+            "external_ids": {},
+        }
+        if failure == "detail_missing_aggregate_credits":
+            payload.pop("aggregate_credits")
+        if failure == "detail_missing_external_ids":
+            payload.pop("external_ids")
+        return httpx.Response(200, json=payload)
+
+    client = _client(httpx.MockTransport(handle))
+    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    mentions = (
+        _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
+        if kind == "movie"
+        else _mentions(tv_series=[TVSeriesMention(title="Target Series", year=2020)])
+    )
+
+    with pytest.raises(expected_exception, match="TMDB candidate resolution"):
+        await resolver.resolve(mentions)
+
+    await resolver.aclose()
+
+
+async def test_resolver_aborts_fragment_resolution_after_sibling_success() -> None:
+    """Raise instead of returning a partial result when a fragment request fails."""
+    successful_movie_detail_loaded = asyncio.Event()
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            if "year" in request.url.params:
+                return httpx.Response(200, json={"results": []})
+            return httpx.Response(
+                200,
+                json={"results": [{"id": 1, "title": "Movie Succes"}]},
+            )
+        if request.url.path == "/3/search/tv":
+            if "first_air_date_year" in request.url.params:
+                return httpx.Response(200, json={"results": []})
+            await successful_movie_detail_loaded.wait()
+            return httpx.Response(503, request=request)
+        if request.url.path == "/3/movie/1":
+            successful_movie_detail_loaded.set()
+            return httpx.Response(
+                200,
+                json={"id": 1, "title": "Movie Success", "release_date": "2020-01-01"},
+            )
+
+        raise AssertionError(f"Unexpected TMDB request: {request.url.path}")
 
     client = _client(httpx.MockTransport(handle))
     resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")

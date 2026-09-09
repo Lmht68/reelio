@@ -30,12 +30,23 @@ logger = logging.getLogger(__name__)
 _ENRICHMENT_ERROR_MESSAGE = "TMDB candidate resolution and enrichment failed."
 _ENRICHMENT_TIMEOUT_MESSAGE = "TMDB candidate resolution timed out."
 _STAGE = "candidate_resolution"
-_CANDIDATE_LIMIT = 3
+_DIRECT_SEARCH_CANDIDATE_LIMIT = 3
+_FRAGMENT_SEARCH_CANDIDATE_LIMIT = 5
 _FUZZY_TITLE_SCORE_THRESHOLD = 80.0
 
 
 def _normalize_fuzzy_screen_work_title(title: str) -> str:
     return normalize_screen_work_title(title).casefold()
+
+
+def _screen_work_search_fragments(title: str) -> tuple[str, ...]:
+    tokens = normalize_screen_work_title(title).split()
+    if len(tokens) <= 1:
+        return ()
+
+    suffix = " ".join(tokens[1:])
+    prefix = " ".join(tokens[:-1])
+    return (suffix,) if suffix == prefix else (suffix, prefix)
 
 
 def _has_fuzzy_title_match(
@@ -265,6 +276,18 @@ class TMDBScreenWorkResolver:
                 if context.match is None
             ),
         )
+        await asyncio.gather(
+            *(
+                self._resolve_movie_fragment_search(context)
+                for context in movie_contexts
+                if context.match is None
+            ),
+            *(
+                self._resolve_tv_series_fragment_search(context)
+                for context in tv_series_contexts
+                if context.match is None
+            ),
+        )
         return ScreenWorkResults(
             movies=[self._to_movie_result(context) for context in movie_contexts],
             tv_series=[self._to_tv_series_result(context) for context in tv_series_contexts],
@@ -301,7 +324,7 @@ class TMDBScreenWorkResolver:
             },
             _MovieSearchResponse,
         )
-        candidates = search_response.results[:_CANDIDATE_LIMIT]
+        candidates = search_response.results[:_DIRECT_SEARCH_CANDIDATE_LIMIT]
         context.candidates.extend(candidates)
 
         for candidate in candidates:
@@ -366,7 +389,7 @@ class TMDBScreenWorkResolver:
             },
             _TVSearchResponse,
         )
-        candidates = search_response.results[:_CANDIDATE_LIMIT]
+        candidates = search_response.results[:_DIRECT_SEARCH_CANDIDATE_LIMIT]
         context.candidates.extend(candidates)
 
         for candidate in candidates:
@@ -410,8 +433,18 @@ class TMDBScreenWorkResolver:
         self,
         context: _MovieResolutionContext,
     ) -> None:
+        context.match = await self._find_movie_fuzzy_match(
+            context,
+            context.candidates,
+        )
+
+    async def _find_movie_fuzzy_match(
+        self,
+        context: _MovieResolutionContext,
+        candidates: list[_MovieSearchCandidate],
+    ) -> _MovieMatch | None:
         normalized_mention_title = _normalize_fuzzy_screen_work_title(context.mention.title)
-        for candidate in context.candidates:
+        for candidate in candidates:
             if not _has_fuzzy_title_match(
                 normalized_mention_title,
                 candidate.title,
@@ -438,18 +471,29 @@ class TMDBScreenWorkResolver:
             if release_date is None or abs(release_date.year - context.mention.year) > 1:
                 continue
 
-            context.match = _MovieMatch(
+            return _MovieMatch(
                 details=movie,
                 release_year=release_date.year,
             )
-            return
+
+        return None
 
     async def _resolve_tv_series_direct_fuzzy(
         self,
         context: _TVResolutionContext,
     ) -> None:
+        context.match = await self._find_tv_series_fuzzy_match(
+            context,
+            context.candidates,
+        )
+
+    async def _find_tv_series_fuzzy_match(
+        self,
+        context: _TVResolutionContext,
+        candidates: list[_TVSearchCandidate],
+    ) -> _TVSeriesMatch | None:
         normalized_mention_title = _normalize_fuzzy_screen_work_title(context.mention.title)
-        for candidate in context.candidates:
+        for candidate in candidates:
             if not _has_fuzzy_title_match(
                 normalized_mention_title,
                 candidate.name,
@@ -475,11 +519,58 @@ class TMDBScreenWorkResolver:
             ):
                 continue
 
-            context.match = _TVSeriesMatch(
+            return _TVSeriesMatch(
                 details=tv_series,
                 first_air_year=tv_series.first_air_date.year,
             )
-            return
+
+        return None
+
+    async def _resolve_movie_fragment_search(
+        self,
+        context: _MovieResolutionContext,
+    ) -> None:
+        for fragment in _screen_work_search_fragments(context.mention.title):
+            search_response = await self._get_model(
+                "search/movie",
+                {
+                    "query": fragment,
+                    "include_adult": True,
+                    "language": "en-US",
+                    "page": 1,
+                },
+                _MovieSearchResponse,
+            )
+            match = await self._find_movie_fuzzy_match(
+                context,
+                search_response.results[:_FRAGMENT_SEARCH_CANDIDATE_LIMIT],
+            )
+            if match is not None:
+                context.match = match
+                return
+
+    async def _resolve_tv_series_fragment_search(
+        self,
+        context: _TVResolutionContext,
+    ) -> None:
+        for fragment in _screen_work_search_fragments(context.mention.title):
+            search_response = await self._get_model(
+                "search/tv",
+                {
+                    "query": fragment,
+                    "include_adult": True,
+                    "language": "en-US",
+                    "page": 1,
+                },
+                _TVSearchResponse,
+            )
+            match = await self._find_tv_series_fuzzy_match(
+                context,
+                search_response.results[:_FRAGMENT_SEARCH_CANDIDATE_LIMIT],
+            )
+            if match is not None:
+                context.match = match
+                return
 
     def _to_movie_result(self, context: _MovieResolutionContext) -> MovieResult:
         if context.match is None:
