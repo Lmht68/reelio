@@ -31,7 +31,6 @@ _ENRICHMENT_ERROR_MESSAGE = "TMDB candidate resolution and enrichment failed."
 _ENRICHMENT_TIMEOUT_MESSAGE = "TMDB candidate resolution timed out."
 _STAGE = "candidate_resolution"
 _DIRECT_SEARCH_CANDIDATE_LIMIT = 3
-_FRAGMENT_SEARCH_CANDIDATE_LIMIT = 5
 _FUZZY_TITLE_SCORE_THRESHOLD = 80.0
 
 
@@ -543,7 +542,7 @@ class TMDBScreenWorkResolver:
             )
             match = await self._find_movie_fuzzy_match(
                 context,
-                search_response.results[:_FRAGMENT_SEARCH_CANDIDATE_LIMIT],
+                search_response.results[:_DIRECT_SEARCH_CANDIDATE_LIMIT],
             )
             if match is not None:
                 context.match = match
@@ -566,7 +565,7 @@ class TMDBScreenWorkResolver:
             )
             match = await self._find_tv_series_fuzzy_match(
                 context,
-                search_response.results[:_FRAGMENT_SEARCH_CANDIDATE_LIMIT],
+                search_response.results[:_DIRECT_SEARCH_CANDIDATE_LIMIT],
             )
             if match is not None:
                 context.match = match
