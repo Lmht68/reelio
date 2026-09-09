@@ -132,7 +132,7 @@ The response contains:
   TMDB and IMDb identifiers and links are included when available, along with the TMDB score.
 - `Screen Work resolution`: Reelio first verifies same-kind direct TMDB Candidates with exact Screen Work Title Normalization and retains its existing alternative-title checks.
   When strict verification leaves a Movie Mention or TV Series Mention unresolved, Reelio first evaluates fuzzy primary and original titles from the first three existing direct-search Candidates for each interpreted, following, and preceding year, then evaluates the first three TMDB multi-search results only when that stage finds no match.
-  Fuzzy comparison uses Unicode NFC normalization, whitespace trimming and collapse, Unicode case folding, preserved punctuation and accents, and a score strictly above 90.
+  Fuzzy comparison uses Unicode NFC normalization, whitespace trimming and collapse, Unicode case folding, preserved punctuation and accents, and a score strictly above 80.
   A fallback Candidate must have the same kind and a detailed TMDB release or first-air year within one year of the Mention.
   The first qualifying Candidate in the defined provider order becomes the ordinary resolved result, while people, opposite-kind results, missing detailed years, and larger year variance remain ineligible.
 - `results.tracks[].track_mention`: The interpreted Track title, ordered Track artists, and explicit nullable release title and year context.

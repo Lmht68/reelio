@@ -31,7 +31,7 @@ _ENRICHMENT_ERROR_MESSAGE = "TMDB candidate resolution and enrichment failed."
 _ENRICHMENT_TIMEOUT_MESSAGE = "TMDB candidate resolution timed out."
 _STAGE = "candidate_resolution"
 _CANDIDATE_LIMIT = 3
-_FUZZY_TITLE_SCORE_THRESHOLD = 90.0
+_FUZZY_TITLE_SCORE_THRESHOLD = 80.0
 
 
 def _normalize_fuzzy_screen_work_title(title: str) -> str:
@@ -508,7 +508,6 @@ class TMDBScreenWorkResolver:
             status=ResultStatus.RESOLVED,
             tv_series_mention=context.mention,
             tv_series=self._enrich_tv_series(
-                context.mention,
                 context.match.details,
                 context.match.first_air_year,
             ),
@@ -575,7 +574,6 @@ class TMDBScreenWorkResolver:
 
     def _enrich_tv_series(
         self,
-        tv_series_mention: TVSeriesMention,
         tv_series: _TVSeriesDetails,
         first_air_year: int,
     ) -> EnrichedTVSeries:
@@ -595,7 +593,7 @@ class TMDBScreenWorkResolver:
             else None
         )
         return EnrichedTVSeries(
-            title=tv_series_mention.title,
+            title=tv_series.name,
             first_air_year=first_air_year,
             last_air_year=last_air_year,
             cast=cast_members,

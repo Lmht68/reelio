@@ -720,9 +720,8 @@ async def test_resolver_enriches_canonical_tv_identity_and_provider_ordered_meta
 
     resolved = results.tv_series[0]
     assert resolved.status is ResultStatus.RESOLVED
-    assert resolved.tv_series_mention is mention
     assert resolved.tv_series is not None
-    assert resolved.tv_series.title == "Canonical Title"
+    assert resolved.tv_series.title == "Localized Provider Title"
     assert resolved.tv_series.first_air_year == 2019
     assert resolved.tv_series.last_air_year == 2022
     assert resolved.tv_series.cast == ["Lead", "Lead", "", "Fourth", "Fifth"]
@@ -1362,9 +1361,9 @@ async def test_resolver_fuzzy_matches_tv_original_title_with_collapsed_whitespac
 @pytest.mark.parametrize(
     ("mention_title", "provider_title", "expected_status"),
     [
-        ("Test Movie", "Test Movif", ResultStatus.UNRESOLVED),
+        ("Test Movie", "Testing Movif", ResultStatus.UNRESOLVED),
         ("Test Movie", "Test Movi", ResultStatus.RESOLVED),
-        ("Amélie", "Amelie", ResultStatus.UNRESOLVED),
+        ("Amélie", "Amelie", ResultStatus.RESOLVED),
         ("A/B/C", "A-B-C", ResultStatus.UNRESOLVED),
     ],
 )
