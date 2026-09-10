@@ -428,6 +428,75 @@ async def test_music_deduplication_preserves_first_mentions_and_context() -> Non
     ]
 
 
+async def test_music_deduplication_normalizes_titles_but_preserves_artist_identity() -> None:
+    """Deduplicate equivalent Music titles without broadening Artist Credit identity."""
+    mentions, _ = await _interpret(
+        "Equivalent Music titles and distinct Artist Credits are referenced.",
+        _response(
+            tracks=(
+                (
+                    "‘Til I Can’t / Stop",
+                    ("Daft Punk",),
+                    "Artist’s Choice / Volume 1",
+                    1999,
+                ),
+                (
+                    "'Til I Can't/Stop",
+                    ("Daft Punk",),
+                    "Ignored Context",
+                    2025,
+                ),
+                ("'Til I Can't/Stop", ("D’Angelo",), None, None),
+                ("'Til I Can't/Stop", ("D'Angelo",), None, None),
+            ),
+            music_releases=(
+                ("Artist’s Choice / Volume 1", ("Daft Punk",), 1999),
+                ("Artist's Choice/Volume 1", ("Daft Punk",), 2025),
+                ("Artist's Choice/Volume 1", ("Artist / One",), 2025),
+                ("Artist's Choice/Volume 1", ("Artist/One",), 2025),
+            ),
+        ),
+    )
+
+    assert mentions.music.tracks == [
+        TrackMention(
+            track_title="‘Til I Can’t / Stop",
+            artists=["Daft Punk"],
+            release_title="Artist’s Choice / Volume 1",
+            release_year=1999,
+        ),
+        TrackMention(
+            track_title="'Til I Can't/Stop",
+            artists=["D’Angelo"],
+            release_title=None,
+            release_year=None,
+        ),
+        TrackMention(
+            track_title="'Til I Can't/Stop",
+            artists=["D'Angelo"],
+            release_title=None,
+            release_year=None,
+        ),
+    ]
+    assert mentions.music.music_releases == [
+        MusicReleaseMention(
+            release_title="Artist’s Choice / Volume 1",
+            artists=["Daft Punk"],
+            release_year=1999,
+        ),
+        MusicReleaseMention(
+            release_title="Artist's Choice/Volume 1",
+            artists=["Artist / One"],
+            release_year=2025,
+        ),
+        MusicReleaseMention(
+            release_title="Artist's Choice/Volume 1",
+            artists=["Artist/One"],
+            release_year=2025,
+        ),
+    ]
+
+
 async def test_track_release_context_does_not_create_music_release_mention() -> None:
     """Keep a Track's contextual release out of independent release results."""
     transcript = "One More Time from Discovery is still incredible."

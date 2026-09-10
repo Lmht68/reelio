@@ -785,12 +785,15 @@ async def test_extract_applies_the_bounded_music_resolution_matrix(
 async def _extract_direct_music_release(
     release_title: str,
     candidates: tuple[dict[str, object], ...],
+    *,
+    artists: Sequence[str] = ("Daft Punk",),
+    release_year: int | None = 2001,
 ) -> dict[str, object]:
     """Resolve one direct Music Release through the in-process extraction endpoint."""
-    music_release_mention = {
+    music_release_mention: dict[str, object] = {
         "release_title": release_title,
-        "artists": ["Daft Punk"],
-        "release_year": 2001,
+        "artists": list(artists),
+        "release_year": release_year,
     }
     requests: list[httpx.Request] = []
 
@@ -807,7 +810,7 @@ async def _extract_direct_music_release(
         assert request.url.path == "/v1/search"
         assert request.headers["authorization"] == "Bearer test-access-token"
         assert dict(request.url.params) == {
-            "q": f"album:{release_title} artist:Daft Punk",
+            "q": f"album:{release_title} artist:{artists[0]}",
             "type": "album",
             "market": "JP",
             "offset": "0",
@@ -894,6 +897,9 @@ _MUSIC_RELEASE_EDITION_CASES: tuple[tuple[str, str], ...] = (
     ("Discovery - Deluxe", "deluxe"),
     ("Discovery: Deluxe Edition", "deluxe-edition"),
     ("Discovery (sUPER   dELUXE   Edition)", "super-deluxe"),
+    ("Discovery (Extended)", "extended"),
+    ("Discovery [Extended Version]", "extended-version"),
+    ("Discovery - Extended Edition", "extended-edition"),
     ("Discovery [Expanded Edition]", "expanded"),
     ("Discovery - Special Edition", "special"),
     ("Discovery: Anniversary Edition", "anniversary"),
@@ -1054,6 +1060,12 @@ async def test_extract_resolves_track_with_equivalent_music_release_context(
             "resolved",
         ),
         (
+            "One More Time",
+            "Discovery (Extended Version)",
+            "single",
+            "resolved",
+        ),
+        (
             "One More Time (Remaster)",
             "Discovery (Deluxe Edition)",
             "album",
@@ -1206,6 +1218,9 @@ async def test_extract_limits_equivalent_track_versions_to_three_candidates() ->
         "One More Time (1st Anniversary Edition)",
         "One More Time (Reissue)",
         "One More Time (Reissued)",
+        "One More Time (Extended)",
+        "One More Time (Extended Version)",
+        "One More Time (Extended Edition)",
     ),
 )
 async def test_extract_rejects_release_only_track_version_designations(
@@ -1293,6 +1308,7 @@ async def test_extract_preserves_arbitrary_track_subtitles_during_version_matchi
         ("Discovery", "Discovery (Deluxe Edition)"),
         ("Discovery (Deluxe Edition)", "Discovery"),
         ("Discovery [Expanded Edition]", "Discovery - 2011 Remaster"),
+        ("Discovery (Extended Edition)", "Discovery"),
     ],
 )
 async def test_extract_resolves_equivalent_music_release_editions_symmetrically(
@@ -1376,14 +1392,21 @@ async def test_extract_keeps_provider_order_for_equivalent_music_release_edition
 
 
 @pytest.mark.parametrize(
-    ("album_type", "expected_status"),
+    ("candidate_title", "album_type", "expected_status"),
     [
-        ("album", "resolved"),
-        ("single", "resolved"),
-        ("compilation", "unresolved"),
+        ("Discovery (Deluxe Edition)", "album", "resolved"),
+        ("Discovery (Deluxe Edition)", "single", "resolved"),
+        ("Discovery (Deluxe Edition)", "compilation", "unresolved"),
+        ("Discovery (Extended)", "single", "resolved"),
+        ("Discovery (Extended)", "compilation", "unresolved"),
+        ("Discovery [Extended Version]", "single", "resolved"),
+        ("Discovery [Extended Version]", "compilation", "unresolved"),
+        ("Discovery - Extended Edition", "single", "resolved"),
+        ("Discovery - Extended Edition", "compilation", "unresolved"),
     ],
 )
 async def test_extract_limits_equivalent_music_release_editions_to_albums_and_singles(
+    candidate_title: str,
     album_type: AlbumType,
     expected_status: Literal["resolved", "unresolved"],
 ) -> None:
@@ -1392,7 +1415,7 @@ async def test_extract_limits_equivalent_music_release_editions_to_albums_and_si
         "Discovery",
         (
             _spotify_album_payload(
-                title="Discovery (Deluxe Edition)",
+                title=candidate_title,
                 album_type=album_type,
             ),
         ),
@@ -1510,6 +1533,52 @@ async def test_extract_preserves_the_public_result_shape_for_equivalent_editions
     }
 
 
+async def test_extract_resolves_the_forever_story_to_first_extended_release() -> None:
+    """Choose the first matching Extended Music Release after Artist Credit filtering."""
+    result = await _extract_direct_music_release(
+        "The Forever Story",
+        (
+            _spotify_album_payload(
+                spotify_album_id="wrong-artist",
+                title="The Forever Story (Extended Version)",
+                artist_names=("Other Artist",),
+            ),
+            _spotify_album_payload(
+                spotify_album_id="first-extended",
+                title="The Forever Story (Extended Version)",
+                artist_names=("JID",),
+                release_date="2022-10-31",
+                album_type="album",
+            ),
+            _spotify_album_payload(
+                spotify_album_id="later-extended",
+                title="The Forever Story (Extended Version)",
+                artist_names=("JID",),
+            ),
+        ),
+        artists=("JID",),
+        release_year=2022,
+    )
+
+    assert result == {
+        "status": "resolved",
+        "music_release_mention": {
+            "release_title": "The Forever Story",
+            "artists": ["JID"],
+            "release_year": 2022,
+        },
+        "music_release": {
+            "release_title": "The Forever Story (Extended Version)",
+            "artists": [{"spotify_artist_id": "artist-0", "name": "JID"}],
+            "release_date": "2022-10-31",
+            "album_type": "album",
+            "spotify_album_id": "first-extended",
+            "spotify_url": "https://open.spotify.com/album/first-extended",
+            "cover_url": "https://i.scdn.co/image/direct-primary",
+        },
+    }
+
+
 async def test_extract_resolves_fuzzy_track_with_music_identity_normalization() -> None:
     """Resolve a normalized above-threshold Track title without release context."""
     result = await _extract_track_version(
@@ -1556,6 +1625,58 @@ async def test_extract_resolves_fuzzy_track_with_music_identity_normalization() 
     }
 
 
+async def test_extract_prefers_title_normalized_extended_track_context_to_earlier_fuzzy_candidate() -> (
+    None
+):
+    """Choose edition-aware title identity over an earlier fuzzy Track Candidate."""
+    result = await _extract_track_version(
+        "‘Til I Can’t / Part I",
+        (
+            _spotify_track_payload(
+                spotify_track_id="earlier-fuzzy",
+                title="Til I Can / Part I",
+                attached_album_id="earlier-fuzzy-release",
+                attached_album_title="Artists Choice/Volume 1",
+            ),
+            _spotify_track_payload(
+                spotify_track_id="normalized-extended",
+                title="'Til I Can't/Part I",
+                attached_album_id="normalized-extended-release",
+                attached_album_title="Artist's Choice/Volume 1 (Extended Version)",
+                attached_album_release_date="2025-02-26",
+            ),
+        ),
+        release_title="Artist’s Choice / Volume 1",
+        release_year=1999,
+    )
+
+    assert result == {
+        "status": "resolved",
+        "track_mention": {
+            "track_title": "‘Til I Can’t / Part I",
+            "artists": ["Daft Punk"],
+            "release_title": "Artist’s Choice / Volume 1",
+            "release_year": 1999,
+        },
+        "track": {
+            "track_title": "'Til I Can't/Part I",
+            "artists": [{"spotify_artist_id": "artist-0", "name": "Daft Punk"}],
+            "spotify_track_id": "normalized-extended",
+            "spotify_url": "https://open.spotify.com/track/normalized-extended",
+            "preferred_music_release": {
+                "release_title": "Artist's Choice/Volume 1 (Extended Version)",
+                "artists": [{"spotify_artist_id": "artist-0", "name": "Daft Punk"}],
+                "release_date": "2025-02-26",
+                "album_type": "album",
+                "spotify_album_id": "normalized-extended-release",
+                "spotify_url": ("https://open.spotify.com/album/normalized-extended-release"),
+                "cover_url": "https://i.scdn.co/image/attached-primary",
+            },
+            "cover_url": "https://i.scdn.co/image/attached-primary",
+        },
+    }
+
+
 async def test_extract_resolves_fuzzy_music_release_with_provider_metadata() -> None:
     """Resolve an above-threshold Music Release with provider-owned values."""
     result = await _extract_direct_music_release(
@@ -1587,6 +1708,35 @@ async def test_extract_resolves_fuzzy_music_release_with_provider_metadata() -> 
             "cover_url": "https://i.scdn.co/image/direct-primary",
         },
     }
+
+
+async def test_extract_prefers_title_normalized_extended_release_to_earlier_fuzzy_candidate() -> (
+    None
+):
+    """Choose edition-aware title identity over an earlier fuzzy Music Release."""
+    result = await _extract_direct_music_release(
+        "Artist’s Choice / Volume 1",
+        (
+            _spotify_album_payload(
+                spotify_album_id="earlier-fuzzy",
+                title="Artists Choice/Volume 1",
+            ),
+            _spotify_album_payload(
+                spotify_album_id="normalized-extended",
+                title="Artist's Choice/Volume 1 (Extended Edition)",
+            ),
+        ),
+    )
+
+    music_release = cast(dict[str, object], result["music_release"])
+    assert result["status"] == "resolved"
+    assert result["music_release_mention"] == {
+        "release_title": "Artist’s Choice / Volume 1",
+        "artists": ["Daft Punk"],
+        "release_year": 2001,
+    }
+    assert music_release["spotify_album_id"] == "normalized-extended"
+    assert music_release["release_title"] == "Artist's Choice/Volume 1 (Extended Edition)"
 
 
 async def test_extract_rejects_fuzzy_title_at_exact_threshold() -> None:
@@ -1622,6 +1772,33 @@ async def test_extract_requires_exact_artist_credit_for_fuzzy_resolution() -> No
 
     assert result["status"] == "unresolved"
     assert result["track"] is None
+
+
+@pytest.mark.parametrize(
+    ("mention_artist", "candidate_artist"),
+    (
+        ("D’Angelo", "D'Angelo"),
+        ("Artist / One", "Artist/One"),
+    ),
+)
+async def test_extract_keeps_title_identity_out_of_artist_credit_matching(
+    mention_artist: str,
+    candidate_artist: str,
+) -> None:
+    """Reject title-equivalent releases with distinct normalized Artist Credits."""
+    result = await _extract_direct_music_release(
+        "Artist’s Choice / Volume 1",
+        (
+            _spotify_album_payload(
+                title="Artist's Choice/Volume 1",
+                artist_names=(candidate_artist,),
+            ),
+        ),
+        artists=(mention_artist,),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["music_release"] is None
 
 
 @pytest.mark.parametrize(

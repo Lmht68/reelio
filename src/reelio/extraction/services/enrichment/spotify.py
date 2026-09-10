@@ -22,6 +22,7 @@ from reelio.extraction.types import (
     TrackMention,
     TrackResult,
     normalize_music_identity,
+    normalize_music_title_identity,
 )
 
 _CANDIDATE_LIMIT = 3
@@ -49,6 +50,9 @@ _MUSIC_RELEASE_ONLY_EDITION_DESIGNATIONS = frozenset(
         "anniversary edition",
         "reissue",
         "reissued",
+        "extended",
+        "extended version",
+        "extended edition",
     }
 )
 _MUSIC_RELEASE_EDITION_DESIGNATIONS = (
@@ -217,12 +221,14 @@ def _resolve_track_mention(
         None,
     )
     if candidate is None:
-        mention_track_title_identity = normalize_music_identity(track_mention.track_title)
+        mention_track_title_identity = normalize_music_title_identity(track_mention.track_title)
         mention_track_edition_identity = _track_edition_identity(mention_track_title_identity)
         mention_release_title_identity: str | None = None
         mention_release_edition_identity: _EditionTitleIdentity | None = None
         if track_mention.release_title is not None:
-            mention_release_title_identity = normalize_music_identity(track_mention.release_title)
+            mention_release_title_identity = normalize_music_title_identity(
+                track_mention.release_title
+            )
             mention_release_edition_identity = _music_release_edition_identity(
                 mention_release_title_identity
             )
@@ -279,13 +285,13 @@ def _resolve_music_release_mention(
     candidates: tuple[AlbumCandidate, ...],
 ) -> MusicReleaseResult:
     """Resolve one Music Release Mention from its bounded Album candidates."""
-    mention_title_identity = normalize_music_identity(music_release_mention.release_title)
+    mention_title_identity = normalize_music_title_identity(music_release_mention.release_title)
     bounded_candidates = candidates[:_CANDIDATE_LIMIT]
     mention_artist_identities = {
         normalize_music_identity(artist) for artist in music_release_mention.artists
     }
     artist_eligible_candidates = tuple(
-        (candidate, normalize_music_identity(candidate.title))
+        (candidate, normalize_music_title_identity(candidate.title))
         for candidate in bounded_candidates
         if _has_shared_artist_credit(mention_artist_identities, candidate.artists)
     )
@@ -338,13 +344,13 @@ def _resolve_music_release_mention(
 
 def _has_exact_track_titles(track_mention: TrackMention, candidate: TrackCandidate) -> bool:
     """Return whether required Track and attached Music Release titles match exactly."""
-    if normalize_music_identity(track_mention.track_title) != normalize_music_identity(
+    if normalize_music_title_identity(track_mention.track_title) != normalize_music_title_identity(
         candidate.title
     ):
         return False
     return track_mention.release_title is None or (
-        normalize_music_identity(track_mention.release_title)
-        == normalize_music_identity(candidate.album.title)
+        normalize_music_title_identity(track_mention.release_title)
+        == normalize_music_title_identity(candidate.album.title)
     )
 
 
@@ -369,12 +375,12 @@ def _has_fuzzy_track_titles(
     """Return whether required normalized Track and release titles are fuzzy matches."""
     if not _has_fuzzy_title_match(
         mention_track_title_identity,
-        normalize_music_identity(candidate.title),
+        normalize_music_title_identity(candidate.title),
     ):
         return False
     return mention_release_title_identity is None or _has_fuzzy_title_match(
         mention_release_title_identity,
-        normalize_music_identity(candidate.album.title),
+        normalize_music_title_identity(candidate.album.title),
     )
 
 
@@ -388,7 +394,7 @@ def _has_equivalent_track_titles(
     if mention_track_edition_identity is None:
         return False
     candidate_track_edition_identity = _track_edition_identity(
-        normalize_music_identity(candidate.title)
+        normalize_music_title_identity(candidate.title)
     )
     if (
         candidate_track_edition_identity is None
@@ -400,7 +406,7 @@ def _has_equivalent_track_titles(
             mention_track_edition_identity.designation_removed
             or candidate_track_edition_identity.designation_removed
         )
-    candidate_release_title_identity = normalize_music_identity(candidate.album.title)
+    candidate_release_title_identity = normalize_music_title_identity(candidate.album.title)
     if mention_release_title_identity == candidate_release_title_identity:
         return (
             mention_track_edition_identity.designation_removed

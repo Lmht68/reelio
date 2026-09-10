@@ -34,6 +34,7 @@ from reelio.extraction.types import (
     maximum_screen_work_mention_year,
     normalize_music_identity,
     normalize_music_text,
+    normalize_music_title_identity,
     normalize_screen_work_title,
 )
 
@@ -50,6 +51,12 @@ def test_normalize_music_text_and_identity_canonicalize_unicode_case_and_whitesp
     """Separate display normalization from case-insensitive music identity."""
     assert normalize_music_text("  AME\u0301LIE:\tSong  ") == "AMÉLIE: Song"
     assert normalize_music_identity("  AME\u0301LIE:\tSong  ") == "amélie: song"
+
+
+def test_normalize_music_title_identity_unifies_apostrophes_and_slash_spacing() -> None:
+    """Normalize Music title apostrophes and whitespace adjacent to slashes."""
+    assert normalize_music_identity("  D’Angelo / The Band  ") == "d’angelo / the band"
+    assert normalize_music_title_identity("  ‘TIL\tI CAN’T  /  STOP  ") == "'til i can't/stop"
 
 
 def test_album_type_alias_matches_spotify_values() -> None:

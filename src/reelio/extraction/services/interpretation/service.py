@@ -34,6 +34,7 @@ from reelio.extraction.types import (
     Transcript,
     TVSeriesMention,
     normalize_music_identity,
+    normalize_music_title_identity,
     normalize_screen_work_title,
 )
 
@@ -232,7 +233,7 @@ def _deduplicate(response: InterpretationResponse) -> ExtractionMentions:
     track_mentions: list[TrackMention] = []
     for track in response.tracks:
         track_identity = (
-            normalize_music_identity(track.track_title),
+            normalize_music_title_identity(track.track_title),
             tuple(normalize_music_identity(artist) for artist in track.artists),
         )
         if track_identity in seen_track_identities:
@@ -251,7 +252,7 @@ def _deduplicate(response: InterpretationResponse) -> ExtractionMentions:
     music_release_mentions: list[MusicReleaseMention] = []
     for music_release in response.music_releases:
         music_release_identity = (
-            normalize_music_identity(music_release.release_title),
+            normalize_music_title_identity(music_release.release_title),
             tuple(normalize_music_identity(artist) for artist in music_release.artists),
         )
         if music_release_identity in seen_music_release_identities:

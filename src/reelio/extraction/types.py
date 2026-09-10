@@ -11,6 +11,8 @@ from reelio.extraction.market import SpotifyMarket
 MINIMUM_SCREEN_WORK_MENTION_YEAR = 1888
 _MAX_FUTURE_SCREEN_WORK_MENTION_YEARS = 2
 
+_MUSIC_TITLE_APOSTROPHE_TRANSLATION = str.maketrans({"‘": "'", "’": "'"})
+
 
 def maximum_screen_work_mention_year() -> int:
     """Return the latest accepted Screen Work Mention year.
@@ -57,6 +59,24 @@ def normalize_music_identity(text: str) -> str:
         str: Display-normalized text with Unicode case folding applied.
     """
     return normalize_music_text(text).casefold()
+
+
+def normalize_music_title_identity(title: str) -> str:
+    """Normalize a Music title for comparison.
+
+    Args:
+        title: Music title to normalize.
+
+    Returns:
+        str: Case-insensitive title form with common apostrophes unified and
+        whitespace adjacent to slashes removed.
+    """
+    return (
+        normalize_music_identity(title)
+        .translate(_MUSIC_TITLE_APOSTROPHE_TRANSLATION)
+        .replace(" /", "/")
+        .replace("/ ", "/")
+    )
 
 
 AlbumType = Literal["album", "single", "compilation"]
