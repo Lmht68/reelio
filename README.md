@@ -370,7 +370,7 @@ All supported settings and their defaults are documented in [`.env.example`](.en
 - `REELIO_LOG_LEVEL` defaults to `INFO`.
 - `REELIO_LLM_PROVIDER` is required and accepts only the exact lowercase values `openai` and `deepseek`.
 - OpenAI uses `gpt-5-nano` by default and supports model, reasoning effort, timeout, output-token, and retry overrides.
-- DeepSeek uses `deepseek-v4-flash` and `https://api.deepseek.com` by default and supports endpoint, generation, timeout, output-token, and retry overrides.
+- DeepSeek uses `deepseek-flash` and `https://api.deepseek.com` by default and supports endpoint, generation, timeout, output-token, and retry overrides.
 - `REELIO_MAX_VIDEO_DURATION_SECONDS` defaults to 1,800 seconds.
 - Faster-Whisper uses the `large-v3-turbo` model, CUDA, `float16`, and one concurrent transcription by default.
 - Interpretation Material limits default to 500 source-title characters, 2,000 description characters, 64 transcript-language characters, and 100,000 transcript characters.

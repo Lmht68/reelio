@@ -954,7 +954,7 @@ async def test_deepseek_adapter_sends_json_options_and_closes_client() -> None:
 
     assert content == _response(("Dune: Part One", 2021))
     assert fake_client.completions.kwargs == {
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
         "messages": [{"role": "system", "content": "Return JSON"}],
         "response_format": {"type": "json_object"},
         "temperature": 0.0,
@@ -962,7 +962,7 @@ async def test_deepseek_adapter_sends_json_options_and_closes_client() -> None:
         "extra_body": {"thinking": {"type": "disabled"}},
     }
     assert provider.provider_name is LLMProvider.DEEPSEEK
-    assert provider.model_name == "deepseek-v4-flash"
+    assert provider.model_name == "deepseek-flash"
     assert fake_client.closed is True
 
 

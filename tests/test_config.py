@@ -137,7 +137,7 @@ def test_deepseek_configuration_ignores_inactive_openai_settings(
 
     settings = _without_dotenv(DeepSeekConfig, api_key="deepseek-key")
 
-    assert settings.model == "deepseek-v4-flash"
+    assert settings.model == "deepseek-flash"
 
 
 def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -200,7 +200,7 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert openai_settings.max_output_tokens == 8_192
     assert openai_settings.max_retries == 2
     assert deepseek_settings.base_url == "https://api.deepseek.com"
-    assert deepseek_settings.model == "deepseek-v4-flash"
+    assert deepseek_settings.model == "deepseek-flash"
     assert deepseek_settings.request_timeout_seconds == 60.0
     assert deepseek_settings.temperature == 0.0
     assert deepseek_settings.max_output_tokens == 8_192

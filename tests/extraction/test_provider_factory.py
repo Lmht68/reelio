@@ -88,7 +88,7 @@ def test_factory_constructs_only_selected_deepseek_provider(
     selected_provider = provider_factory.create_mention_interpretation_provider(_selection())
 
     assert selected_provider is provider
-    assert captured_settings[0].model == "deepseek-v4-flash"
+    assert captured_settings[0].model == "deepseek-flash"
 
 
 def test_factory_does_not_fallback_after_selected_provider_failure(

@@ -71,5 +71,5 @@ class DeepSeekConfig(_ProviderRequestConfig):
 
     api_key: _NonBlankSecret = Field(validation_alias="REELIO_DEEPSEEK_API_KEY")
     base_url: str = Field(default="https://api.deepseek.com", min_length=1)
-    model: str = Field(default="deepseek-v4-flash", min_length=1)
+    model: str = Field(default="deepseek-flash", min_length=1)
     temperature: float = Field(default=0.0, ge=0, le=2)
