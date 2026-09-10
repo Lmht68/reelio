@@ -300,18 +300,24 @@ async def test_resolver_rejects_exact_title_without_shared_artist_credit() -> No
 
 
 @pytest.mark.parametrize(
-    "candidate_title",
-    ["One More Times", "One More Time (Radio Edit)"],
-    ids=["near", "decorated"],
+    ("candidate_title", "expected_status"),
+    [
+        ("One More Times", ResultStatus.RESOLVED),
+        ("One More Time (Radio Edit)", ResultStatus.UNRESOLVED),
+    ],
+    ids=["above-threshold", "below-threshold"],
 )
-async def test_resolver_rejects_nonexact_track_titles(candidate_title: str) -> None:
-    """Leave a shared-credit Candidate unresolved when its Track title differs."""
+async def test_resolver_applies_fuzzy_track_title_threshold(
+    candidate_title: str,
+    expected_status: ResultStatus,
+) -> None:
+    """Resolve only shared-credit Track titles above the strict fuzzy threshold."""
     catalog = _FakeTrackCatalog(((_candidate(title=candidate_title),),))
 
     results = await _resolve_tracks(SpotifyMusicResolver(catalog), [_mention()])
 
-    assert results[0].status is ResultStatus.UNRESOLVED
-    assert results[0].track is None
+    assert results[0].status is expected_status
+    assert (results[0].track is not None) is (expected_status is ResultStatus.RESOLVED)
 
 
 async def test_resolver_requires_explicit_attached_music_release_title() -> None:

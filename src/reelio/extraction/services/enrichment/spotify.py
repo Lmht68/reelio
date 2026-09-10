@@ -6,6 +6,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from rapidfuzz import fuzz
+
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.services.catalog.types import AlbumCandidate, TrackCandidate
 from reelio.extraction.types import (
@@ -23,6 +25,8 @@ from reelio.extraction.types import (
 )
 
 _CANDIDATE_LIMIT = 3
+_FUZZY_TITLE_SCORE_THRESHOLD = 80.0
+
 
 _TRACK_AND_RELEASE_EDITION_DESIGNATIONS = frozenset(
     {
@@ -213,9 +217,8 @@ def _resolve_track_mention(
         None,
     )
     if candidate is None:
-        mention_track_edition_identity = _track_edition_identity(
-            normalize_music_identity(track_mention.track_title)
-        )
+        mention_track_title_identity = normalize_music_identity(track_mention.track_title)
+        mention_track_edition_identity = _track_edition_identity(mention_track_title_identity)
         mention_release_title_identity: str | None = None
         mention_release_edition_identity: _EditionTitleIdentity | None = None
         if track_mention.release_title is not None:
@@ -236,6 +239,19 @@ def _resolve_track_mention(
             ),
             None,
         )
+        if candidate is None:
+            candidate = next(
+                (
+                    candidate
+                    for candidate in artist_eligible_candidates
+                    if _has_fuzzy_track_titles(
+                        mention_track_title_identity,
+                        mention_release_title_identity,
+                        candidate,
+                    )
+                ),
+                None,
+            )
     if candidate is None:
         return TrackResult(
             status=ResultStatus.UNRESOLVED,
@@ -295,6 +311,18 @@ def _resolve_music_release_mention(
             ),
             None,
         )
+        if candidate is None:
+            candidate = next(
+                (
+                    candidate
+                    for candidate, candidate_title_identity in artist_eligible_candidates
+                    if _has_fuzzy_title_match(
+                        mention_title_identity,
+                        candidate_title_identity,
+                    )
+                ),
+                None,
+            )
     if candidate is None:
         return MusicReleaseResult(
             status=ResultStatus.UNRESOLVED,
@@ -317,6 +345,36 @@ def _has_exact_track_titles(track_mention: TrackMention, candidate: TrackCandida
     return track_mention.release_title is None or (
         normalize_music_identity(track_mention.release_title)
         == normalize_music_identity(candidate.album.title)
+    )
+
+
+def _has_fuzzy_title_match(
+    normalized_mention_title: str,
+    normalized_candidate_title: str,
+) -> bool:
+    """Return whether two non-empty normalized titles exceed the fuzzy threshold."""
+    return bool(
+        normalized_mention_title
+        and normalized_candidate_title
+        and fuzz.ratio(normalized_mention_title, normalized_candidate_title)
+        > _FUZZY_TITLE_SCORE_THRESHOLD
+    )
+
+
+def _has_fuzzy_track_titles(
+    mention_track_title_identity: str,
+    mention_release_title_identity: str | None,
+    candidate: TrackCandidate,
+) -> bool:
+    """Return whether required normalized Track and release titles are fuzzy matches."""
+    if not _has_fuzzy_title_match(
+        mention_track_title_identity,
+        normalize_music_identity(candidate.title),
+    ):
+        return False
+    return mention_release_title_identity is None or _has_fuzzy_title_match(
+        mention_release_title_identity,
+        normalize_music_identity(candidate.album.title),
     )
 
 

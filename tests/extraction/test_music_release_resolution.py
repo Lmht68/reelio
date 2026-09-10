@@ -243,11 +243,11 @@ async def test_resolver_rejects_exact_title_without_shared_artist_credit() -> No
     assert results[0].music_release is None
 
 
-@pytest.mark.parametrize("candidate_title", ["Discoveries"], ids=["near"])
-async def test_resolver_rejects_nonexact_music_release_titles(
+@pytest.mark.parametrize("candidate_title", ["Discoveries"], ids=["exact-threshold"])
+async def test_resolver_rejects_music_release_title_at_fuzzy_threshold(
     candidate_title: str,
 ) -> None:
-    """Leave a shared-credit Candidate unresolved when its title differs."""
+    """Leave a shared-credit Music Release unresolved at the strict fuzzy boundary."""
     catalog = _FakeAlbumCatalog(((_candidate(title=candidate_title),),))
 
     results = await _resolve_music_releases(SpotifyMusicResolver(catalog), [_mention()])

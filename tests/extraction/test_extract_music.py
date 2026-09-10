@@ -632,7 +632,7 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog(
             search_query="album:Exact Album artist:Artist One",
             candidates=(
                 _spotify_album_payload(
-                    title="Exact Albums",
+                    title="Different Album",
                     artist_names=("Artist One",),
                 ),
             ),
@@ -726,15 +726,15 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog(
         "track-context-unresolved",
         "direct-compilation",
         "no-shared-artist",
-        "near-title",
+        "below-fuzzy-threshold",
         "first-exact-candidate",
         "fourth-candidate-is-ignored",
     ],
 )
-async def test_extract_applies_the_exact_music_resolution_matrix(
+async def test_extract_applies_the_bounded_music_resolution_matrix(
     scenario: _ExactResolutionScenario,
 ) -> None:
-    """Expose exact-only Music resolution and the first-three Candidate bound."""
+    """Expose bounded Music resolution and the first-three Candidate limit."""
     requests: list[httpx.Request] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
@@ -1060,7 +1060,7 @@ async def test_extract_resolves_track_with_equivalent_music_release_context(
             "resolved",
         ),
         (
-            "One More Times",
+            "One More",
             "Discovery",
             "album",
             "unresolved",
@@ -1263,10 +1263,10 @@ async def test_extract_rejects_blocked_track_version_material(
         "Remastered One More Time",
     ),
 )
-async def test_extract_rejects_uncontrolled_track_title_differences(
+async def test_extract_keeps_track_title_differences_below_fuzzy_threshold_unresolved(
     candidate_title: str,
 ) -> None:
-    """Leave non-equivalent Track titles unresolved without fuzzy matching."""
+    """Leave below-threshold Track titles unresolved."""
     result = await _extract_track_version(
         "One More Time",
         (_spotify_track_payload(title=candidate_title),),
@@ -1415,10 +1415,10 @@ async def test_extract_limits_equivalent_music_release_editions_to_albums_and_si
         "Discovery Deluxe Edition",
     ],
 )
-async def test_extract_rejects_uncontrolled_music_release_title_differences(
+async def test_extract_keeps_music_release_title_differences_below_fuzzy_threshold_unresolved(
     candidate_title: str,
 ) -> None:
-    """Leave non-equivalent Music Release titles unresolved without fuzzy matching."""
+    """Leave below-threshold Music Release titles unresolved."""
     result = await _extract_direct_music_release(
         "Discovery",
         (_spotify_album_payload(title=candidate_title),),
@@ -1508,6 +1508,307 @@ async def test_extract_preserves_the_public_result_shape_for_equivalent_editions
             "cover_url": "https://i.scdn.co/image/direct-primary",
         },
     }
+
+
+async def test_extract_resolves_fuzzy_track_with_music_identity_normalization() -> None:
+    """Resolve a normalized above-threshold Track title without release context."""
+    result = await _extract_track_version(
+        "AMÉLIE DREAM",
+        (
+            _spotify_track_payload(
+                spotify_track_id="normalized-fuzzy-track",
+                title="Amélie Dreams",
+                artist_names=("DAFT PUNK",),
+                attached_album_id="unrelated-release",
+                attached_album_title="Unrelated Release",
+                attached_album_artist_names=("Provider Artist",),
+                attached_album_release_date="2025-02-26",
+            ),
+        ),
+    )
+
+    assert result == {
+        "status": "resolved",
+        "track_mention": {
+            "track_title": "AMÉLIE DREAM",
+            "artists": ["Daft Punk"],
+            "release_title": None,
+            "release_year": None,
+        },
+        "track": {
+            "track_title": "Amélie Dreams",
+            "artists": [{"spotify_artist_id": "artist-0", "name": "DAFT PUNK"}],
+            "spotify_track_id": "normalized-fuzzy-track",
+            "spotify_url": "https://open.spotify.com/track/normalized-fuzzy-track",
+            "preferred_music_release": {
+                "release_title": "Unrelated Release",
+                "artists": [
+                    {"spotify_artist_id": "artist-0", "name": "Provider Artist"},
+                ],
+                "release_date": "2025-02-26",
+                "album_type": "album",
+                "spotify_album_id": "unrelated-release",
+                "spotify_url": "https://open.spotify.com/album/unrelated-release",
+                "cover_url": "https://i.scdn.co/image/attached-primary",
+            },
+            "cover_url": "https://i.scdn.co/image/attached-primary",
+        },
+    }
+
+
+async def test_extract_resolves_fuzzy_music_release_with_provider_metadata() -> None:
+    """Resolve an above-threshold Music Release with provider-owned values."""
+    result = await _extract_direct_music_release(
+        "Discovery",
+        (
+            _spotify_album_payload(
+                spotify_album_id="fuzzy-release",
+                title="Discoverd",
+                artist_names=("DAFT PUNK",),
+                release_date="2025-02-26",
+            ),
+        ),
+    )
+
+    assert result == {
+        "status": "resolved",
+        "music_release_mention": {
+            "release_title": "Discovery",
+            "artists": ["Daft Punk"],
+            "release_year": 2001,
+        },
+        "music_release": {
+            "release_title": "Discoverd",
+            "artists": [{"spotify_artist_id": "artist-0", "name": "DAFT PUNK"}],
+            "release_date": "2025-02-26",
+            "album_type": "album",
+            "spotify_album_id": "fuzzy-release",
+            "spotify_url": "https://open.spotify.com/album/fuzzy-release",
+            "cover_url": "https://i.scdn.co/image/direct-primary",
+        },
+    }
+
+
+async def test_extract_rejects_fuzzy_title_at_exact_threshold() -> None:
+    """Leave a Track unresolved when normalized title similarity is exactly 80."""
+    result = await _extract_track_version(
+        "abcdefghij",
+        (_spotify_track_payload(title="abcdXYghij"),),
+    )
+
+    assert result == {
+        "status": "unresolved",
+        "track_mention": {
+            "track_title": "abcdefghij",
+            "artists": ["Daft Punk"],
+            "release_title": None,
+            "release_year": None,
+        },
+        "track": None,
+    }
+
+
+async def test_extract_requires_exact_artist_credit_for_fuzzy_resolution() -> None:
+    """Reject an above-threshold Track title without a shared Artist Credit."""
+    result = await _extract_track_version(
+        "One More Time",
+        (
+            _spotify_track_payload(
+                title="One More Tiem",
+                artist_names=("Daft Punks",),
+            ),
+        ),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["track"] is None
+
+
+@pytest.mark.parametrize(
+    ("candidate_track_title", "candidate_release_title", "expected_status"),
+    (
+        ("One More Tiem", "Discoverd", "resolved"),
+        ("One More Tiem", "Other Album", "unresolved"),
+        ("One More", "Discoverd", "unresolved"),
+    ),
+)
+async def test_extract_requires_every_explicit_track_context_title_to_pass_fuzzy_threshold(
+    candidate_track_title: str,
+    candidate_release_title: str,
+    expected_status: Literal["resolved", "unresolved"],
+) -> None:
+    """Require above-threshold Track and attached Music Release titles."""
+    result = await _extract_track_version(
+        "One More Time",
+        (
+            _spotify_track_payload(
+                title=candidate_track_title,
+                attached_album_title=candidate_release_title,
+                attached_album_release_date="2025-02-26",
+            ),
+        ),
+        release_title="Discovery",
+        release_year=1999,
+    )
+
+    assert result["status"] == expected_status
+    if expected_status == "unresolved":
+        assert result["track"] is None
+        return
+    track = cast(dict[str, object], result["track"])
+    preferred_music_release = cast(dict[str, object], track["preferred_music_release"])
+    assert preferred_music_release["release_date"] == "2025-02-26"
+
+
+@pytest.mark.parametrize(
+    ("later_title", "expected_spotify_track_id"),
+    (
+        ("One More Time", "later-exact"),
+        ("One More Time (Remaster)", "later-edition"),
+    ),
+)
+async def test_extract_prefers_earlier_track_resolution_stages_to_fuzzy(
+    later_title: str,
+    expected_spotify_track_id: str,
+) -> None:
+    """Choose a later exact or edition Track before an earlier fuzzy Candidate."""
+    result = await _extract_track_version(
+        "One More Time",
+        (
+            _spotify_track_payload(
+                spotify_track_id="earlier-fuzzy",
+                title="One More Tiem",
+            ),
+            _spotify_track_payload(
+                spotify_track_id=expected_spotify_track_id,
+                title=later_title,
+            ),
+        ),
+    )
+
+    track = cast(dict[str, object], result["track"])
+    assert result["status"] == "resolved"
+    assert track["spotify_track_id"] == expected_spotify_track_id
+
+
+@pytest.mark.parametrize(
+    ("later_title", "expected_spotify_album_id"),
+    (
+        ("Discovery", "later-exact"),
+        ("Discovery (Deluxe Edition)", "later-edition"),
+    ),
+)
+async def test_extract_prefers_earlier_music_release_resolution_stages_to_fuzzy(
+    later_title: str,
+    expected_spotify_album_id: str,
+) -> None:
+    """Choose a later exact or edition release before an earlier fuzzy Candidate."""
+    result = await _extract_direct_music_release(
+        "Discovery",
+        (
+            _spotify_album_payload(
+                spotify_album_id="earlier-fuzzy",
+                title="Discoverd",
+            ),
+            _spotify_album_payload(
+                spotify_album_id=expected_spotify_album_id,
+                title=later_title,
+            ),
+        ),
+    )
+
+    music_release = cast(dict[str, object], result["music_release"])
+    assert result["status"] == "resolved"
+    assert music_release["spotify_album_id"] == expected_spotify_album_id
+
+
+async def test_extract_keeps_provider_order_for_fuzzy_track_candidates() -> None:
+    """Choose the first provider-ordered above-threshold fuzzy Track."""
+    result = await _extract_track_version(
+        "One More Time",
+        (
+            _spotify_track_payload(
+                spotify_track_id="first-fuzzy",
+                title="The One More Time",
+            ),
+            _spotify_track_payload(
+                spotify_track_id="second-fuzzy",
+                title="One More Times",
+            ),
+        ),
+    )
+
+    track = cast(dict[str, object], result["track"])
+    assert result["status"] == "resolved"
+    assert track["spotify_track_id"] == "first-fuzzy"
+
+
+async def test_extract_keeps_provider_order_for_fuzzy_music_release_candidates() -> None:
+    """Choose the first provider-ordered above-threshold fuzzy Music Release."""
+    result = await _extract_direct_music_release(
+        "Discovery",
+        (
+            _spotify_album_payload(
+                spotify_album_id="first-fuzzy",
+                title="The Discovery",
+            ),
+            _spotify_album_payload(
+                spotify_album_id="second-fuzzy",
+                title="Discoveryy",
+            ),
+        ),
+    )
+
+    music_release = cast(dict[str, object], result["music_release"])
+    assert result["status"] == "resolved"
+    assert music_release["spotify_album_id"] == "first-fuzzy"
+
+
+async def test_extract_ignores_fourth_fuzzy_track_candidate_without_another_search() -> None:
+    """Leave a fourth above-threshold Track outside the bounded provider result set."""
+    result = await _extract_track_version(
+        "Bounded Track",
+        (
+            _spotify_track_payload(title="Wrong One"),
+            _spotify_track_payload(title="Wrong Two"),
+            _spotify_track_payload(title="Wrong Three"),
+            _spotify_track_payload(
+                spotify_track_id="fourth-fuzzy",
+                title="Bounded Trak",
+            ),
+        ),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["track"] is None
+
+
+async def test_extract_allows_recording_version_material_in_fuzzy_track_resolution() -> None:
+    """Resolve complete above-threshold Track titles containing remix material."""
+    result = await _extract_track_version(
+        "One More Time (Remix)",
+        (_spotify_track_payload(title="One More Tiem (Remix)"),),
+    )
+
+    assert result["status"] == "resolved"
+    assert result["track"] is not None
+
+
+async def test_extract_allows_edition_material_in_fuzzy_music_release_resolution() -> None:
+    """Resolve a fuzzy compilation title containing an edition designation."""
+    result = await _extract_direct_music_release(
+        "Discovery (Deluxe Edition)",
+        (
+            _spotify_album_payload(
+                title="Discoverd (Deluxe Edition)",
+                album_type="compilation",
+            ),
+        ),
+    )
+
+    assert result["status"] == "resolved"
+    music_release = cast(dict[str, object], result["music_release"])
+    assert music_release["album_type"] == "compilation"
 
 
 async def test_extract_returns_atomic_catalog_failure_without_music_results() -> None:
