@@ -26,8 +26,8 @@ from reelio.extraction.types import (
 )
 
 _CANDIDATE_LIMIT = 3
+_CANDIDATE_ARTIST_ALIAS_DELIMITER = " / "
 _FUZZY_TITLE_SCORE_THRESHOLD = 80.0
-
 
 _TRACK_AND_RELEASE_EDITION_DESIGNATIONS = frozenset(
     {
@@ -210,7 +210,7 @@ def _resolve_track_mention(
     artist_eligible_candidates = tuple(
         candidate
         for candidate in bounded_candidates
-        if _has_shared_artist_credit(mention_artist_identities, candidate.artists)
+        if _has_artist_credit_match(mention_artist_identities, candidate.artists)
     )
     candidate = next(
         (
@@ -293,7 +293,7 @@ def _resolve_music_release_mention(
     artist_eligible_candidates = tuple(
         (candidate, normalize_music_title_identity(candidate.title))
         for candidate in bounded_candidates
-        if _has_shared_artist_credit(mention_artist_identities, candidate.artists)
+        if _has_artist_credit_match(mention_artist_identities, candidate.artists)
     )
     candidate = next(
         (
@@ -520,15 +520,23 @@ def _has_equivalent_music_release_title(
     )
 
 
-def _has_shared_artist_credit(
+def _has_artist_credit_match(
     mention_artist_identities: set[str],
     candidate_artists: Sequence[ArtistCredit],
 ) -> bool:
-    """Return whether a Candidate shares a normalized Artist Credit with a Mention."""
-    return any(
-        normalize_music_identity(candidate_artist.name) in mention_artist_identities
-        for candidate_artist in candidate_artists
-    )
+    """Return whether a Candidate credit exactly matches a Mention credit or alias."""
+    for candidate_artist in candidate_artists:
+        candidate_name = candidate_artist.name
+        if normalize_music_identity(candidate_name) in mention_artist_identities:
+            return True
+        if _CANDIDATE_ARTIST_ALIAS_DELIMITER not in candidate_name:
+            continue
+        if any(
+            normalize_music_identity(component) in mention_artist_identities
+            for component in candidate_name.split(_CANDIDATE_ARTIST_ALIAS_DELIMITER)
+        ):
+            return True
+    return False
 
 
 def _drop_duplicate_playable_tracks(results: list[TrackResult]) -> list[TrackResult]:

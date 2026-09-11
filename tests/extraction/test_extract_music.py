@@ -838,13 +838,14 @@ async def _extract_track_version(
     track_title: str,
     candidates: tuple[dict[str, object], ...],
     *,
+    artists: Sequence[str] = ("Daft Punk",),
     release_title: str | None = None,
     release_year: int | None = None,
 ) -> dict[str, object]:
     """Resolve one Track through the in-process extraction endpoint."""
     track_mention: dict[str, object] = {
         "track_title": track_title,
-        "artists": ["Daft Punk"],
+        "artists": list(artists),
         "release_title": release_title,
         "release_year": release_year,
     }
@@ -863,7 +864,7 @@ async def _extract_track_version(
         assert request.url.path == "/v1/search"
         assert request.headers["authorization"] == "Bearer test-access-token"
         assert dict(request.url.params) == {
-            "q": f"track:{track_title} artist:Daft Punk",
+            "q": f"track:{track_title} artist:{artists[0]}",
             "type": "track",
             "market": "JP",
             "offset": "0",
@@ -1758,8 +1759,8 @@ async def test_extract_rejects_fuzzy_title_at_exact_threshold() -> None:
     }
 
 
-async def test_extract_requires_exact_artist_credit_for_fuzzy_resolution() -> None:
-    """Reject an above-threshold Track title without a shared Artist Credit."""
+async def test_extract_requires_artist_credit_match_for_fuzzy_resolution() -> None:
+    """Reject an above-threshold Track title without an Artist Credit Match."""
     result = await _extract_track_version(
         "One More Time",
         (
@@ -1772,6 +1773,172 @@ async def test_extract_requires_exact_artist_credit_for_fuzzy_resolution() -> No
 
     assert result["status"] == "unresolved"
     assert result["track"] is None
+
+
+async def test_extract_resolves_father_and_son_with_candidate_artist_alias() -> None:
+    """Resolve a Track when the Candidate credit contains a spaced-slash alias."""
+    result = await _extract_track_version(
+        "Father and Son",
+        (
+            _spotify_track_payload(
+                spotify_track_id="father-and-son",
+                title="Father and Son",
+                artist_names=("Yusuf / Cat Stevens", "Additional Artist"),
+                attached_album_id="tea-for-the-tillerman",
+                attached_album_title="Tea for the Tillerman",
+                attached_album_artist_names=("Yusuf / Cat Stevens",),
+                attached_album_release_date="1970",
+                attached_album_type="album",
+            ),
+        ),
+        artists=("Cat Stevens",),
+    )
+
+    assert result == {
+        "status": "resolved",
+        "track_mention": {
+            "track_title": "Father and Son",
+            "artists": ["Cat Stevens"],
+            "release_title": None,
+            "release_year": None,
+        },
+        "track": {
+            "track_title": "Father and Son",
+            "artists": [
+                {"spotify_artist_id": "artist-0", "name": "Yusuf / Cat Stevens"},
+                {"spotify_artist_id": "artist-1", "name": "Additional Artist"},
+            ],
+            "spotify_track_id": "father-and-son",
+            "spotify_url": "https://open.spotify.com/track/father-and-son",
+            "preferred_music_release": {
+                "release_title": "Tea for the Tillerman",
+                "artists": [
+                    {"spotify_artist_id": "artist-0", "name": "Yusuf / Cat Stevens"},
+                ],
+                "release_date": "1970",
+                "album_type": "album",
+                "spotify_album_id": "tea-for-the-tillerman",
+                "spotify_url": ("https://open.spotify.com/album/tea-for-the-tillerman"),
+                "cover_url": "https://i.scdn.co/image/attached-primary",
+            },
+            "cover_url": "https://i.scdn.co/image/attached-primary",
+        },
+    }
+
+
+async def test_extract_resolves_music_release_with_candidate_artist_alias() -> None:
+    """Resolve a Music Release with a normalized spaced-slash Candidate alias."""
+    result = await _extract_direct_music_release(
+        "Tea for the Tillerman",
+        (
+            _spotify_album_payload(
+                spotify_album_id="tea-for-the-tillerman",
+                title="Tea for the Tillerman",
+                artist_names=("Yusuf / CAT   STEVENS", "Additional Artist"),
+                release_date="1970",
+                album_type="album",
+            ),
+        ),
+        artists=("Cat Stevens",),
+        release_year=1970,
+    )
+
+    assert result == {
+        "status": "resolved",
+        "music_release_mention": {
+            "release_title": "Tea for the Tillerman",
+            "artists": ["Cat Stevens"],
+            "release_year": 1970,
+        },
+        "music_release": {
+            "release_title": "Tea for the Tillerman",
+            "artists": [
+                {"spotify_artist_id": "artist-0", "name": "Yusuf / CAT   STEVENS"},
+                {"spotify_artist_id": "artist-1", "name": "Additional Artist"},
+            ],
+            "release_date": "1970",
+            "album_type": "album",
+            "spotify_album_id": "tea-for-the-tillerman",
+            "spotify_url": "https://open.spotify.com/album/tea-for-the-tillerman",
+            "cover_url": "https://i.scdn.co/image/direct-primary",
+        },
+    }
+
+
+async def test_extract_preserves_complete_spaced_slash_artist_credit_equality() -> None:
+    """Resolve a normalized-equal complete Candidate credit before alias splitting."""
+    result = await _extract_direct_music_release(
+        "Alias Collection",
+        (
+            _spotify_album_payload(
+                title="Alias Collection",
+                artist_names=("YUSUF / CAT STEVENS",),
+            ),
+        ),
+        artists=("Yusuf / Cat Stevens",),
+    )
+
+    assert result == {
+        "status": "resolved",
+        "music_release_mention": {
+            "release_title": "Alias Collection",
+            "artists": ["Yusuf / Cat Stevens"],
+            "release_year": 2001,
+        },
+        "music_release": {
+            "release_title": "Alias Collection",
+            "artists": [
+                {"spotify_artist_id": "artist-0", "name": "YUSUF / CAT STEVENS"},
+            ],
+            "release_date": "2001-02",
+            "album_type": "album",
+            "spotify_album_id": "direct-album",
+            "spotify_url": "https://open.spotify.com/album/direct-album",
+            "cover_url": "https://i.scdn.co/image/direct-primary",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("mention_artist", "candidate_artist"),
+    (
+        ("Yusuf / Cat Stevens", "Cat Stevens"),
+        ("Cat Stevens", "Yusuf/Cat Stevens"),
+        ("AC", "AC/DC"),
+        ("Cat Stevens", "Yusuf & Cat Stevens"),
+        ("Cat Stevens", "Yusuf and Cat Stevens"),
+        ("Cat Stevens", "Yusuf, Cat Stevens"),
+        ("Stevens", "Yusuf / Cat Stevens"),
+        ("Cat Stevens", "Cat Steven"),
+        ("Cat Stevens", "Stevens Cat"),
+        ("Cat Stevens", "Kat Stevens"),
+    ),
+)
+async def test_extract_rejects_non_alias_artist_credit_forms(
+    mention_artist: str,
+    candidate_artist: str,
+) -> None:
+    """Reject relations outside complete Candidate-credit spaced-slash aliases."""
+    result = await _extract_direct_music_release(
+        "Alias Collection",
+        (
+            _spotify_album_payload(
+                title="Alias Collection",
+                artist_names=(candidate_artist,),
+            ),
+        ),
+        artists=(mention_artist,),
+    )
+
+    assert result == {
+        "status": "unresolved",
+        "music_release_mention": {
+            "release_title": "Alias Collection",
+            "artists": [mention_artist],
+            "release_year": 2001,
+        },
+        "music_release": None,
+    }
 
 
 @pytest.mark.parametrize(
