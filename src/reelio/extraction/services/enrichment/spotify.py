@@ -384,7 +384,16 @@ def _has_fuzzy_track_titles(
     if mention_has_medley_designation or _has_trailing_medley_designation(
         candidate_track_title_identity
     ):
-        return False
+        return _has_fuzzy_medley_track_titles(
+            mention_track_title_identity,
+            candidate_track_title_identity,
+        ) and (
+            mention_release_title_identity is None
+            or _has_fuzzy_title_match(
+                mention_release_title_identity,
+                normalize_music_title_identity(candidate.album.title),
+            )
+        )
     if not _has_fuzzy_title_match(
         mention_track_title_identity,
         candidate_track_title_identity,
@@ -400,6 +409,33 @@ def _is_composite_track_base_title(base_title: str) -> bool:
     """Return whether a normalized Track base title names multiple works."""
     title_components = base_title.split("/")
     return len(title_components) >= 2 and all(title_components)
+
+
+def _has_fuzzy_medley_track_titles(
+    mention_track_title_identity: str,
+    candidate_track_title_identity: str,
+) -> bool:
+    """Return whether composite Medley titles have matching fuzzy components."""
+    mention_edition_identity = _track_edition_identity(mention_track_title_identity)
+    candidate_edition_identity = _track_edition_identity(candidate_track_title_identity)
+    if (
+        mention_edition_identity is None
+        or candidate_edition_identity is None
+        or not candidate_edition_identity.medley_designation_removed
+        or not _is_composite_track_base_title(mention_edition_identity.base_title)
+        or not _is_composite_track_base_title(candidate_edition_identity.base_title)
+    ):
+        return False
+    mention_components = mention_edition_identity.base_title.split("/")
+    candidate_components = candidate_edition_identity.base_title.split("/")
+    return len(mention_components) == len(candidate_components) and all(
+        _has_fuzzy_title_match(mention_component, candidate_component)
+        for mention_component, candidate_component in zip(
+            mention_components,
+            candidate_components,
+            strict=True,
+        )
+    )
 
 
 def _has_equivalent_track_titles(

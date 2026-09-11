@@ -320,6 +320,54 @@ async def test_resolver_applies_fuzzy_track_title_threshold(
     assert (results[0].track is not None) is (expected_status is ResultStatus.RESOLVED)
 
 
+async def test_resolver_fuzzy_matches_each_component_of_a_medley() -> None:
+    """Resolve a composite Medley when one component has a minor typo."""
+    mention = _mention(
+        track_title="Just A Gogolo / I Ain't Got Nobody",
+        artists=("Louis Prima",),
+    )
+    catalog = _FakeTrackCatalog(
+        (
+            (
+                _candidate(
+                    spotify_track_id="gigolo-medley",
+                    title=("Just A Gigolo / I Ain't Got Nobody - Medley / Remastered 2002"),
+                    artists=("Louis Prima",),
+                ),
+            ),
+        )
+    )
+
+    results = await _resolve_tracks(SpotifyMusicResolver(catalog), [mention])
+
+    assert results[0].status is ResultStatus.RESOLVED
+    assert results[0].track is not None
+    assert results[0].track.spotify_track_id == "gigolo-medley"
+
+
+async def test_resolver_rejects_medley_with_an_unmatched_component() -> None:
+    """Leave a Medley unresolved when its component titles do not all match."""
+    mention = _mention(
+        track_title="Just A Gogolo / I Ain't Got Nobody",
+        artists=("Louis Prima",),
+    )
+    catalog = _FakeTrackCatalog(
+        (
+            (
+                _candidate(
+                    title=("Just A Gigolo / Jump, Jive an' Wail - Medley / Remastered 2002"),
+                    artists=("Louis Prima",),
+                ),
+            ),
+        )
+    )
+
+    results = await _resolve_tracks(SpotifyMusicResolver(catalog), [mention])
+
+    assert results[0].status is ResultStatus.UNRESOLVED
+    assert results[0].track is None
+
+
 async def test_resolver_requires_explicit_attached_music_release_title() -> None:
     """Skip a wrong attached Album and accept a later exact one regardless of year."""
     mention = _mention(release_title="Discovery", release_year=2001)
