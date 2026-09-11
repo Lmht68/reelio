@@ -1143,7 +1143,7 @@ async def test_extract_rejects_invalid_composite_medley_structure(
 async def test_extract_blocks_fuzzy_similarity_for_changed_medley_base() -> None:
     """Reject a changed Medley base that would otherwise exceed fuzzy similarity."""
     result = await _extract_track_version(
-        "Just a Gigolo / I Ain't Got Nobody",
+        "A Gigolo / I Ain't Got Nobody",
         (
             _spotify_track_payload(
                 title="Just a Gigolo / I Ain't Got Someboody - Medley",
