@@ -1017,6 +1017,163 @@ async def test_extract_strips_stacked_track_versions_from_the_right() -> None:
     assert result["track"] is not None
 
 
+async def test_extract_resolves_louis_prima_controlled_composite_medley() -> None:
+    """Resolve Louis Prima's composite Medley with Spotify-owned metadata."""
+    result = await _extract_track_version(
+        "Just a Gigolo / I Ain’t Got Nobody",
+        (
+            _spotify_track_payload(
+                spotify_track_id="louis-prima-medley",
+                title="Just A Gigolo / I Ain't Got Nobody - Medley / Remastered 2002",
+                artist_names=("Louis Prima",),
+                attached_album_id="louis-prima-wildest",
+                attached_album_title="The Wildest!",
+                attached_album_artist_names=("Louis Prima",),
+                attached_album_release_date="2002-10-22",
+            ),
+        ),
+        artists=("Louis Prima",),
+    )
+
+    assert result == {
+        "status": "resolved",
+        "track_mention": {
+            "track_title": "Just a Gigolo / I Ain’t Got Nobody",
+            "artists": ["Louis Prima"],
+            "release_title": None,
+            "release_year": None,
+        },
+        "track": {
+            "track_title": ("Just A Gigolo / I Ain't Got Nobody - Medley / Remastered 2002"),
+            "artists": [{"spotify_artist_id": "artist-0", "name": "Louis Prima"}],
+            "spotify_track_id": "louis-prima-medley",
+            "spotify_url": "https://open.spotify.com/track/louis-prima-medley",
+            "preferred_music_release": {
+                "release_title": "The Wildest!",
+                "artists": [
+                    {"spotify_artist_id": "artist-0", "name": "Louis Prima"},
+                ],
+                "release_date": "2002-10-22",
+                "album_type": "album",
+                "spotify_album_id": "louis-prima-wildest",
+                "spotify_url": ("https://open.spotify.com/album/louis-prima-wildest"),
+                "cover_url": "https://i.scdn.co/image/attached-primary",
+            },
+            "cover_url": "https://i.scdn.co/image/attached-primary",
+        },
+    }
+
+
+async def test_extract_resolves_explicit_compound_medley_with_retained_designation() -> None:
+    """Resolve an explicit composite Medley when the Candidate retains Medley."""
+    result = await _extract_track_version(
+        "First Work / Second Work - Medley",
+        (
+            _spotify_track_payload(
+                spotify_track_id="retained-compound-medley",
+                title="First Work/Second Work - Remastered 2002/Medley",
+            ),
+        ),
+    )
+
+    assert result["status"] == "resolved"
+    track = cast(dict[str, object], result["track"])
+    assert track["spotify_track_id"] == "retained-compound-medley"
+    assert track["track_title"] == "First Work/Second Work - Remastered 2002/Medley"
+
+
+@pytest.mark.parametrize(
+    "component",
+    (
+        "Live",
+        "2024 Remix",
+        "Acoustic",
+        "Instrumental",
+        "Radio Edit",
+        "Karaoke",
+        "A Tribute Performance",
+        "Deluxe Edition",
+        "Unknown Version",
+    ),
+)
+async def test_extract_rejects_ineligible_compound_medley_component(
+    component: str,
+) -> None:
+    """Reject a composite Medley containing blocked or unrecognized material."""
+    result = await _extract_track_version(
+        "First Work / Second Work",
+        (
+            _spotify_track_payload(
+                title=f"First Work / Second Work - Medley / {component}",
+            ),
+        ),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["track"] is None
+
+
+@pytest.mark.parametrize(
+    ("mention_title", "candidate_title"),
+    (
+        (
+            "Single Work",
+            "Single Work - Medley / Remastered 2002",
+        ),
+        (
+            "First Work / Second Work",
+            "First Work / Different Work - Medley / Remastered 2002",
+        ),
+    ),
+)
+async def test_extract_rejects_invalid_composite_medley_structure(
+    mention_title: str,
+    candidate_title: str,
+) -> None:
+    """Reject non-composite and changed-base composite Medley Candidates."""
+    result = await _extract_track_version(
+        mention_title,
+        (_spotify_track_payload(title=candidate_title),),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["track"] is None
+
+
+async def test_extract_blocks_fuzzy_similarity_for_changed_medley_base() -> None:
+    """Reject a changed Medley base that would otherwise exceed fuzzy similarity."""
+    result = await _extract_track_version(
+        "Just a Gigolo / I Ain't Got Nobody",
+        (
+            _spotify_track_payload(
+                title="Just a Gigolo / I Ain't Got Someboody - Medley",
+                artist_names=("Louis Prima",),
+            ),
+        ),
+        artists=("Louis Prima",),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["track"] is None
+
+
+async def test_extract_requires_candidate_to_retain_explicit_medley() -> None:
+    """Reject a bare Candidate for a Mention that explicitly names a Medley."""
+    result = await _extract_track_version(
+        "Just a Gigolo / I Ain't Got Nobody - Medley",
+        (
+            _spotify_track_payload(
+                title="Just a Gigolo / I Ain't Got Nobody",
+                artist_names=("Louis Prima",),
+            ),
+        ),
+        artists=("Louis Prima",),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["track"] is None
+
+
 @pytest.mark.parametrize(
     ("candidate_title", "spotify_album_id"),
     _MUSIC_RELEASE_EDITION_CASES,

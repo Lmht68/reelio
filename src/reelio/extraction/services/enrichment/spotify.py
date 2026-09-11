@@ -28,6 +28,7 @@ from reelio.extraction.types import (
 _CANDIDATE_LIMIT = 3
 _CANDIDATE_ARTIST_ALIAS_DELIMITER = " / "
 _FUZZY_TITLE_SCORE_THRESHOLD = 80.0
+_MEDLEY_DESIGNATION = "medley"
 
 _TRACK_AND_RELEASE_EDITION_DESIGNATIONS = frozenset(
     {
@@ -85,6 +86,7 @@ class _EditionTitleIdentity:
 
     base_title: str
     designation_removed: bool
+    medley_designation_removed: bool
 
 
 class _MusicCatalog(Protocol):
@@ -222,6 +224,9 @@ def _resolve_track_mention(
     )
     if candidate is None:
         mention_track_title_identity = normalize_music_title_identity(track_mention.track_title)
+        mention_has_medley_designation = _has_trailing_medley_designation(
+            mention_track_title_identity
+        )
         mention_track_edition_identity = _track_edition_identity(mention_track_title_identity)
         mention_release_title_identity: str | None = None
         mention_release_edition_identity: _EditionTitleIdentity | None = None
@@ -253,6 +258,7 @@ def _resolve_track_mention(
                     if _has_fuzzy_track_titles(
                         mention_track_title_identity,
                         mention_release_title_identity,
+                        mention_has_medley_designation,
                         candidate,
                     )
                 ),
@@ -370,18 +376,30 @@ def _has_fuzzy_title_match(
 def _has_fuzzy_track_titles(
     mention_track_title_identity: str,
     mention_release_title_identity: str | None,
+    mention_has_medley_designation: bool,
     candidate: TrackCandidate,
 ) -> bool:
     """Return whether required normalized Track and release titles are fuzzy matches."""
+    candidate_track_title_identity = normalize_music_title_identity(candidate.title)
+    if mention_has_medley_designation or _has_trailing_medley_designation(
+        candidate_track_title_identity
+    ):
+        return False
     if not _has_fuzzy_title_match(
         mention_track_title_identity,
-        normalize_music_title_identity(candidate.title),
+        candidate_track_title_identity,
     ):
         return False
     return mention_release_title_identity is None or _has_fuzzy_title_match(
         mention_release_title_identity,
         normalize_music_title_identity(candidate.album.title),
     )
+
+
+def _is_composite_track_base_title(base_title: str) -> bool:
+    """Return whether a normalized Track base title names multiple works."""
+    title_components = base_title.split("/")
+    return len(title_components) >= 2 and all(title_components)
 
 
 def _has_equivalent_track_titles(
@@ -399,6 +417,16 @@ def _has_equivalent_track_titles(
     if (
         candidate_track_edition_identity is None
         or mention_track_edition_identity.base_title != candidate_track_edition_identity.base_title
+    ):
+        return False
+    if (
+        candidate_track_edition_identity.medley_designation_removed
+        and not _is_composite_track_base_title(candidate_track_edition_identity.base_title)
+    ):
+        return False
+    if (
+        mention_track_edition_identity.medley_designation_removed
+        and not candidate_track_edition_identity.medley_designation_removed
     ):
         return False
     if mention_release_title_identity is None:
@@ -439,16 +467,33 @@ def _split_trailing_title_segment(normalized_title: str) -> tuple[str, str] | No
     return longest_match
 
 
-def _is_track_edition_designation(segment_title: str) -> bool:
-    """Return whether a normalized title segment names a supported Track version."""
+def _split_edition_designation_components(segment_title: str) -> tuple[str, ...]:
+    """Split one normalized designation segment into slash-separated components."""
+    return tuple(segment_title.split("/"))
+
+
+def _has_trailing_medley_designation(normalized_title: str) -> bool:
+    """Return whether a supported trailing segment contains a Medley component."""
+    scan_title = normalized_title
+    while (trailing_segment := _split_trailing_title_segment(scan_title)) is not None:
+        base_title, segment_title = trailing_segment
+        if _MEDLEY_DESIGNATION in _split_edition_designation_components(segment_title):
+            return True
+        scan_title = base_title
+    return False
+
+
+def _is_track_edition_designation_component(segment_title: str) -> bool:
+    """Return whether one normalized component names a supported Track version."""
     return (
-        segment_title in _TRACK_AND_RELEASE_EDITION_DESIGNATIONS
+        segment_title == _MEDLEY_DESIGNATION
+        or segment_title in _TRACK_AND_RELEASE_EDITION_DESIGNATIONS
         or _YEAR_REMASTER_DESIGNATION_PATTERN.fullmatch(segment_title) is not None
     )
 
 
-def _is_music_release_edition_designation(segment_title: str) -> bool:
-    """Return whether a normalized title segment names a supported release edition."""
+def _is_music_release_edition_designation_component(segment_title: str) -> bool:
+    """Return whether one normalized component names a supported release edition."""
     return (
         segment_title in _MUSIC_RELEASE_EDITION_DESIGNATIONS
         or _YEAR_REMASTER_DESIGNATION_PATTERN.fullmatch(segment_title) is not None
@@ -458,27 +503,38 @@ def _is_music_release_edition_designation(segment_title: str) -> bool:
 
 def _edition_title_identity(
     normalized_title: str,
-    is_edition_designation: Callable[[str], bool],
+    is_edition_designation_component: Callable[[str], bool],
     blocked_material_pattern: re.Pattern[str],
 ) -> _EditionTitleIdentity | None:
     """Return a comparison identity or None when trailing material is excluded."""
     comparison_base = normalized_title
     scan_title = normalized_title
     designation_removed = False
+    medley_designation_removed = False
     stripping_designations = True
     while (trailing_segment := _split_trailing_title_segment(scan_title)) is not None:
         base_title, segment_title = trailing_segment
-        if blocked_material_pattern.search(segment_title) is not None:
+        designation_components = _split_edition_designation_components(segment_title)
+        if any(
+            blocked_material_pattern.search(component) is not None
+            for component in designation_components
+        ):
             return None
-        if stripping_designations and is_edition_designation(segment_title):
+        if stripping_designations and all(
+            is_edition_designation_component(component) for component in designation_components
+        ):
             comparison_base = base_title
             designation_removed = True
+            medley_designation_removed = (
+                medley_designation_removed or _MEDLEY_DESIGNATION in designation_components
+            )
         else:
             stripping_designations = False
         scan_title = base_title
     return _EditionTitleIdentity(
         base_title=comparison_base,
         designation_removed=designation_removed,
+        medley_designation_removed=medley_designation_removed,
     )
 
 
@@ -486,7 +542,7 @@ def _track_edition_identity(normalized_title: str) -> _EditionTitleIdentity | No
     """Return a comparison identity for a Track title."""
     return _edition_title_identity(
         normalized_title,
-        _is_track_edition_designation,
+        _is_track_edition_designation_component,
         _BLOCKED_TRACK_VERSION_MATERIAL_PATTERN,
     )
 
@@ -497,7 +553,7 @@ def _music_release_edition_identity(
     """Return a comparison identity for a Music Release title."""
     return _edition_title_identity(
         normalized_title,
-        _is_music_release_edition_designation,
+        _is_music_release_edition_designation_component,
         _BLOCKED_MUSIC_RELEASE_EDITION_MATERIAL_PATTERN,
     )
 
