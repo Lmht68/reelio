@@ -79,6 +79,31 @@ def normalize_music_title_identity(title: str) -> str:
     )
 
 
+def normalize_book_text(text: str) -> str:
+    """Normalize Book Work text for display without changing case.
+
+    Args:
+        text: Book Work title or Author Credit name to normalize.
+
+    Returns:
+        str: NFC-normalized text with leading, trailing, and repeated whitespace
+        removed.
+    """
+    return " ".join(unicodedata.normalize("NFC", text).split())
+
+
+def normalize_book_identity(text: str) -> str:
+    """Normalize Book Work text for case-insensitive identity comparison.
+
+    Args:
+        text: Book Work title or Author Credit name to normalize.
+
+    Returns:
+        str: Display-normalized text with Unicode case folding applied.
+    """
+    return normalize_book_text(text).casefold()
+
+
 AlbumType = Literal["album", "single", "compilation"]
 
 
@@ -244,6 +269,41 @@ class MusicMentions:
     music_releases: list[MusicReleaseMention]
 
 
+@dataclass(frozen=True, slots=True)
+class AuthorCredit:
+    """Identify one interpreted Book Work author credit in display order.
+
+    Attributes:
+        name: Canonical credited author name.
+    """
+
+    name: str
+
+
+@dataclass
+class BookMention:
+    """Contain a Book Work Mention interpreted from source material.
+
+    Attributes:
+        title: Canonical Book Work title.
+        authors: Ordered interpreted Author Credits, which may be empty.
+    """
+
+    title: str
+    authors: list[AuthorCredit]
+
+
+@dataclass
+class BookMentions:
+    """Contain Book Work Mentions in first-reference order.
+
+    Attributes:
+        books: Canonical Book Work Mentions in first-reference order.
+    """
+
+    books: list[BookMention]
+
+
 @dataclass
 class ExtractionMentions:
     """Contain interpreted mentions grouped by service scope.
@@ -251,10 +311,12 @@ class ExtractionMentions:
     Attributes:
         screen_works: Ordered Screen Work Mentions grouped by kind.
         music: Ordered Music Mentions grouped by kind.
+        books: Ordered Book Work Mentions.
     """
 
     screen_works: ScreenWorkMentions
     music: MusicMentions
+    books: BookMentions
 
 
 @dataclass
@@ -365,6 +427,38 @@ class EnrichedTrack:
     cover_url: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class EnrichedAuthorCredit:
+    """Identify one Open Library-backed Book Work author credit.
+
+    Attributes:
+        open_library_author_id: Open Library Author identifier.
+        name: Provider-authoritative author name.
+        open_library_url: Canonical Open Library URL for the author.
+    """
+
+    open_library_author_id: str
+    name: str
+    open_library_url: str
+
+
+@dataclass
+class EnrichedBookWork:
+    """Contain provider-verified metadata for one Book Work.
+
+    Attributes:
+        title: Open Library-authoritative Book Work title.
+        authors: Ordered Open Library-backed Author Credits.
+        open_library_work_id: Open Library Work identifier.
+        open_library_url: Canonical Open Library URL for the Work.
+    """
+
+    title: str
+    authors: list[EnrichedAuthorCredit]
+    open_library_work_id: str
+    open_library_url: str
+
+
 @dataclass
 class MovieResult:
     """Represent one Movie Mention and its resolution outcome.
@@ -426,6 +520,21 @@ class MusicReleaseResult:
 
 
 @dataclass
+class BookResult:
+    """Represent one Book Work Mention and its resolution outcome.
+
+    Attributes:
+        status: Current resolution state of the Book Work Mention.
+        book_mention: Canonical Book Work title and Author Credits.
+        book: Enriched Book Work, or ``None`` when unresolved.
+    """
+
+    status: ResultStatus
+    book_mention: BookMention
+    book: EnrichedBookWork | None
+
+
+@dataclass
 class ScreenWorkResults:
     """Contain ordered Screen Work Results grouped by kind.
 
@@ -455,16 +564,29 @@ class MusicResults:
 
 
 @dataclass
+class BookResults:
+    """Contain ordered Book Work Results.
+
+    Attributes:
+        books: Book Work Results in first-reference order.
+    """
+
+    books: list[BookResult]
+
+
+@dataclass
 class ExtractionResults:
     """Contain resolved results grouped by service scope.
 
     Attributes:
         screen_works: Ordered Screen Work Results grouped by kind.
         music: Ordered Music Results grouped by kind.
+        books: Ordered Book Work Results.
     """
 
     screen_works: ScreenWorkResults
     music: MusicResults
+    books: BookResults
 
 
 @dataclass

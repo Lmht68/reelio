@@ -20,6 +20,8 @@ from reelio.extraction.service import ExtractionPipeline
 from reelio.extraction.services.transcription.inspection import PreparedAudio
 from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
+    BookMentions,
+    BookResults,
     ExtractionMentions,
     ExtractionResults,
     MovieMention,
@@ -163,6 +165,7 @@ async def test_pipeline_returns_empty_grouped_results_and_aggregates_once() -> N
     extraction_mentions = ExtractionMentions(
         screen_works=screen_work_mentions,
         music=MusicMentions(tracks=[], music_releases=[]),
+        books=BookMentions(books=[]),
     )
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator()
@@ -201,10 +204,12 @@ async def test_pipeline_returns_ordered_movie_results_unchanged() -> None:
     extraction_mentions = ExtractionMentions(
         screen_works=screen_work_mentions,
         music=MusicMentions(tracks=[], music_releases=[]),
+        books=BookMentions(books=[]),
     )
     extraction_results = ExtractionResults(
         screen_works=screen_work_results,
         music=MusicResults(tracks=[], music_releases=[]),
+        books=BookResults(books=[]),
     )
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator(results=extraction_results)
@@ -235,6 +240,7 @@ async def test_pipeline_returns_tv_only_results_from_aggregator() -> None:
     extraction_mentions = ExtractionMentions(
         screen_works=screen_work_mentions,
         music=MusicMentions(tracks=[], music_releases=[]),
+        books=BookMentions(books=[]),
     )
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator()
@@ -278,10 +284,12 @@ async def test_pipeline_groups_mixed_interpretation_results() -> None:
     extraction_mentions = ExtractionMentions(
         screen_works=screen_work_mentions,
         music=MusicMentions(tracks=[], music_releases=[]),
+        books=BookMentions(books=[]),
     )
     extraction_results = ExtractionResults(
         screen_works=screen_work_results,
         music=MusicResults(tracks=[], music_releases=[]),
+        books=BookResults(books=[]),
     )
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator(results=extraction_results)
@@ -401,6 +409,7 @@ async def test_pipeline_propagates_aggregation_errors_unchanged() -> None:
     extraction_mentions = ExtractionMentions(
         screen_works=screen_work_mentions,
         music=MusicMentions(tracks=[], music_releases=[]),
+        books=BookMentions(books=[]),
     )
     result_aggregator = _FakeResultAggregator(error=aggregation_error)
     pipeline = _pipeline(

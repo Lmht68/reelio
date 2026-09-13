@@ -24,6 +24,9 @@ from reelio.extraction.services.interpretation.prompt import (
 from reelio.extraction.services.interpretation.schemas import InterpretationResponse
 from reelio.extraction.services.interpretation.types import LLMMessage
 from reelio.extraction.types import (
+    AuthorCredit,
+    BookMention,
+    BookMentions,
     ExtractionMentions,
     MovieMention,
     MusicMentions,
@@ -33,6 +36,7 @@ from reelio.extraction.types import (
     TrackMention,
     Transcript,
     TVSeriesMention,
+    normalize_book_identity,
     normalize_music_identity,
     normalize_music_title_identity,
     normalize_screen_work_title,
@@ -171,6 +175,7 @@ class MentionInterpretationService:
                 "tv_series_mention_count": len(mentions.screen_works.tv_series),
                 "track_mention_count": len(mentions.music.tracks),
                 "music_release_mention_count": len(mentions.music.music_releases),
+                "book_mention_count": len(mentions.books.books),
             },
         )
         return mentions
@@ -266,6 +271,23 @@ def _deduplicate(response: InterpretationResponse) -> ExtractionMentions:
             )
         )
 
+    seen_book_identities: set[tuple[str, tuple[str, ...]]] = set()
+    book_mentions: list[BookMention] = []
+    for book in response.books:
+        book_identity = (
+            normalize_book_identity(book.title),
+            tuple(normalize_book_identity(author) for author in book.authors),
+        )
+        if book_identity in seen_book_identities:
+            continue
+        seen_book_identities.add(book_identity)
+        book_mentions.append(
+            BookMention(
+                title=book.title,
+                authors=[AuthorCredit(name=author) for author in book.authors],
+            )
+        )
+
     return ExtractionMentions(
         screen_works=ScreenWorkMentions(
             movies=movie_mentions,
@@ -275,6 +297,7 @@ def _deduplicate(response: InterpretationResponse) -> ExtractionMentions:
             tracks=track_mentions,
             music_releases=music_release_mentions,
         ),
+        books=BookMentions(books=book_mentions),
     )
 
 

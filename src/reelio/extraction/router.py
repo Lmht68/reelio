@@ -9,6 +9,10 @@ from reelio.extraction import schemas as extraction_schemas
 from reelio.extraction.service import ExtractionPipelineProtocol
 from reelio.extraction.types import (
     ArtistCredit,
+    BookMention,
+    BookResult,
+    EnrichedAuthorCredit,
+    EnrichedBookWork,
     EnrichedMovie,
     EnrichedMusicRelease,
     EnrichedTrack,
@@ -25,7 +29,7 @@ from reelio.extraction.types import (
     TVSeriesResult,
 )
 
-_ExtractionResult = MovieResult | TVSeriesResult | TrackResult | MusicReleaseResult
+_ExtractionResult = MovieResult | TVSeriesResult | TrackResult | MusicReleaseResult | BookResult
 
 _EXTRACT_RESPONSE_EXAMPLE = {
     "market": "US",
@@ -33,13 +37,16 @@ _EXTRACT_RESPONSE_EXAMPLE = {
         "platform": "youtube",
         "video_id": "dQw4w9WgXcQ",
         "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        "title": "Screen Work and Music review",
-        "description": "A review mentioning Movies, TV Series, and Music.",
+        "title": "Screen Work, Music, and Book Work review",
+        "description": "A review mentioning Movies, TV Series, Music, and Book Works.",
         "channel": "Example channel",
         "duration_seconds": 42,
     },
     "transcript": {
-        "text": "Dune: Part One, The Last of Us, One More Time, and Discovery are excellent.",
+        "text": (
+            "Dune: Part One, The Last of Us, One More Time, Discovery, and "
+            "Pride and Prejudice are excellent."
+        ),
         "language": "en",
         "method": "youtube_captions",
     },
@@ -48,6 +55,7 @@ _EXTRACT_RESPONSE_EXAMPLE = {
         "tv_series": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
         "tracks": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
         "music_releases": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+        "books": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
     },
     "results": {
         "movies": [
@@ -177,6 +185,35 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                     "release_year": None,
                 },
                 "music_release": None,
+            },
+        ],
+        "books": [
+            {
+                "status": "resolved",
+                "book_mention": {
+                    "title": "Pride and Prejudice",
+                    "authors": ["Jane Austen"],
+                },
+                "book": {
+                    "title": "Pride and Prejudice",
+                    "authors": [
+                        {
+                            "open_library_author_id": "OL21594A",
+                            "name": "Jane Austen",
+                            "open_library_url": "https://openlibrary.org/authors/OL21594A",
+                        }
+                    ],
+                    "open_library_work_id": "OL66554W",
+                    "open_library_url": "https://openlibrary.org/works/OL66554W",
+                },
+            },
+            {
+                "status": "unresolved",
+                "book_mention": {
+                    "title": "Unknown Book",
+                    "authors": [],
+                },
+                "book": None,
             },
         ],
     },
@@ -350,6 +387,47 @@ def _to_music_release_result_schema(
     )
 
 
+def _to_book_mention_schema(
+    mention: BookMention,
+) -> extraction_schemas.BookMentionModel:
+    return extraction_schemas.BookMentionModel(
+        title=mention.title,
+        authors=[author_credit.name for author_credit in mention.authors],
+    )
+
+
+def _to_enriched_author_credit_schema(
+    author_credit: EnrichedAuthorCredit,
+) -> extraction_schemas.EnrichedAuthorCreditModel:
+    return extraction_schemas.EnrichedAuthorCreditModel(
+        open_library_author_id=author_credit.open_library_author_id,
+        name=author_credit.name,
+        open_library_url=author_credit.open_library_url,
+    )
+
+
+def _to_book_schema(book: EnrichedBookWork) -> extraction_schemas.BookModel:
+    return extraction_schemas.BookModel(
+        title=book.title,
+        authors=[
+            _to_enriched_author_credit_schema(author_credit) for author_credit in book.authors
+        ],
+        open_library_work_id=book.open_library_work_id,
+        open_library_url=book.open_library_url,
+    )
+
+
+def _to_book_result_schema(
+    result: BookResult,
+) -> extraction_schemas.BookResultModel:
+    book = _to_book_schema(result.book) if result.book is not None else None
+    return extraction_schemas.BookResultModel(
+        status=result.status,
+        book_mention=_to_book_mention_schema(result.book_mention),
+        book=book,
+    )
+
+
 def _to_result_counts_schema(
     results: Sequence[_ExtractionResult],
 ) -> extraction_schemas.ResultCountsModel:
@@ -392,6 +470,7 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
             tv_series=_to_result_counts_schema(result.results.screen_works.tv_series),
             tracks=_to_result_counts_schema(result.results.music.tracks),
             music_releases=_to_result_counts_schema(result.results.music.music_releases),
+            books=_to_result_counts_schema(result.results.books.books),
         ),
         results=extraction_schemas.ExtractionResultsModel(
             movies=[_to_movie_result_schema(item) for item in result.results.screen_works.movies],
@@ -403,6 +482,7 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
                 _to_music_release_result_schema(item)
                 for item in result.results.music.music_releases
             ],
+            books=[_to_book_result_schema(item) for item in result.results.books.books],
         ),
     )
 
@@ -411,13 +491,14 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
     "/extract",
     status_code=status.HTTP_200_OK,
     response_model=extraction_schemas.ExtractResponse,
-    summary="Extract mentioned Movies, TV Series, Tracks, and Music Releases from a public video Source",
+    summary="Extract mentioned Movies, TV Series, Tracks, Music Releases, and Book Works from a public video Source",
     description=(
         "Accept a public YouTube, Instagram, Facebook, TikTok, or X video URL and "
         "return the normalized Source, the Transcript with its acquisition method, "
         "the effective Spotify market, category-specific result statistics, and "
-        "grouped Movie, TV Series, Track, and Music Release results. Each statistics "
-        "category counts returned results, Resolved Results, and Unresolved Results. "
+        "grouped Movie, TV Series, Track, Music Release, and Book Work results. Each "
+        "statistics category counts returned results, Resolved Results, and Unresolved "
+        "Results. "
         "Each list preserves first-reference order within its kind, with no cross-kind "
         "ordering. The optional market must use "
         "uppercase ISO 3166-1 alpha-2 syntax; an omitted market uses configured "
@@ -440,7 +521,10 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         "Album identity, provider-reported release date, album type, and direct "
         "URL after a verified match; the contract makes no worldwide-edition, "
         "sibling-release, release-family, inferred-subtype, or "
-        "earliest-worldwide-date claims. Each Track Mention and Music Release "
+        "earliest-worldwide-date claims. Book Work Results retain their interpreted "
+        "Book Mention and expose the Open Library Work title, provider-ordered Author "
+        "Credits, Work ID, and canonical URL after a verified exact match. Each Track "
+        "Mention and Music Release "
         "Mention causes one Spotify search in the effective market at offset zero "
         "and limit three, using the Mention title and first ordered Artist Credit "
         "only. Candidates remain eligible when at least one Artist Credit matches "
@@ -470,16 +554,16 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         "Resolved Result with Spotify identity and metadata unchanged. Release year "
         "does not participate in retrieval or Candidate verification, and a "
         "completed search without an exact or eligible equivalent Candidate returns "
-        "an Unresolved Result. Any TMDB or Spotify provider failure fails the "
-        "complete request."
+        "an Unresolved Result. Any TMDB, Spotify, or Open Library provider failure "
+        "fails the complete request."
     ),
     response_description=(
         "Effective market, Source, transcript, category-specific result statistics, "
-        "and grouped Movie, TV Series, Track, and Music Release results."
+        "and grouped Movie, TV Series, Track, Music Release, and Book Work results."
     ),
     responses={
         200: {
-            "description": "Result statistics and grouped Movie, TV Series, Track, and Music Release results.",
+            "description": "Result statistics and grouped Movie, TV Series, Track, Music Release, and Book Work results.",
             "content": {
                 "application/json": {"example": _EXTRACT_RESPONSE_EXAMPLE},
             },
@@ -503,8 +587,9 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         502: {
             "model": extraction_schemas.ErrorResponse,
             "description": (
-                "Metadata, transcript, LLM, TMDB, or Spotify provider failure. Any "
-                "TMDB or Spotify provider failure fails the complete request."
+                "Metadata, transcript, LLM, TMDB, Spotify, or Open Library provider "
+                "failure. Any TMDB, Spotify, or Open Library provider failure fails "
+                "the complete request."
             ),
         },
         504: {

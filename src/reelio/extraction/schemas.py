@@ -205,6 +205,38 @@ class MusicReleaseResultModel(BaseModel):
     music_release: MusicReleaseModel | None
 
 
+class BookMentionModel(BaseModel):
+    """One interpreted Book Work Mention and its ordered Author Credits."""
+
+    title: str
+    authors: list[str]
+
+
+class EnrichedAuthorCreditModel(BaseModel):
+    """One Open Library-backed Author Credit in provider display order."""
+
+    open_library_author_id: str
+    name: str
+    open_library_url: str
+
+
+class BookModel(BaseModel):
+    """Open Library-verified metadata for one Book Work."""
+
+    title: str
+    authors: list[EnrichedAuthorCreditModel]
+    open_library_work_id: str
+    open_library_url: str
+
+
+class BookResultModel(BaseModel):
+    """One interpreted Book Work Mention and its resolution outcome."""
+
+    status: ResultStatus
+    book_mention: BookMentionModel
+    book: BookModel | None
+
+
 class ResultCountsModel(BaseModel):
     """Counts returned results in one category by resolution outcome."""
 
@@ -229,6 +261,7 @@ class ExtractionStatisticsModel(BaseModel):
     tv_series: ResultCountsModel
     tracks: ResultCountsModel
     music_releases: ResultCountsModel
+    books: ResultCountsModel
 
 
 class ExtractionResultsModel(BaseModel):
@@ -238,6 +271,7 @@ class ExtractionResultsModel(BaseModel):
     tv_series: list[TVSeriesResultModel]
     tracks: list[TrackResultModel]
     music_releases: list[MusicReleaseResultModel]
+    books: list[BookResultModel]
 
 
 class ExtractResponse(BaseModel):

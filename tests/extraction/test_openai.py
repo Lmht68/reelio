@@ -91,7 +91,7 @@ async def test_openai_adapter_sends_strict_responses_request_and_closes_client()
     response_json = (
         '{"movies":[{"title":"Dune: Part One","year":2021}],'
         '"tv_series":[{"title":"The Last of Us","year":2023}],"tracks":[],'
-        '"music_releases":[]}'
+        '"music_releases":[],"books":[]}'
     )
     fake_responses = _FakeResponses(SimpleNamespace(status="completed", output_text=response_json))
     fake_client = _FakeOpenAIClient(fake_responses)
@@ -122,7 +122,13 @@ async def test_openai_adapter_sends_strict_responses_request_and_closes_client()
     assert fake_client.closed is True
 
     schema = InterpretationResponse.model_json_schema()
-    assert schema["required"] == ["movies", "tv_series", "tracks", "music_releases"]
+    assert schema["required"] == [
+        "movies",
+        "tv_series",
+        "tracks",
+        "music_releases",
+        "books",
+    ]
     assert schema["additionalProperties"] is False
     assert schema["$defs"]["InterpretedScreenWorkMention"]["additionalProperties"] is False
     assert schema["$defs"]["InterpretedTrackMention"]["additionalProperties"] is False
@@ -138,6 +144,8 @@ async def test_openai_adapter_sends_strict_responses_request_and_closes_client()
         "artists",
         "release_year",
     ]
+    assert schema["$defs"]["InterpretedBookMention"]["additionalProperties"] is False
+    assert schema["$defs"]["InterpretedBookMention"]["required"] == ["title", "authors"]
 
 
 async def test_openai_adapter_maps_refusal_response() -> None:

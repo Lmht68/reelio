@@ -31,7 +31,7 @@ from reelio.extraction.types import (
     TranscriptMethod,
 )
 from reelio.main import app
-from tests.extraction.fakes import FakeScreenWorkResolver
+from tests.extraction.fakes import FakeBookResolver, FakeScreenWorkResolver
 
 _CANONICAL_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
@@ -220,6 +220,7 @@ def _interpretation_response(
         "tv_series": [],
         "tracks": tracks,
         "music_releases": music_releases,
+        "books": [],
     }
 
 
@@ -241,6 +242,7 @@ async def _post_extract(
         ExtractionResultAggregator(
             FakeScreenWorkResolver(),
             SpotifyMusicResolver(catalog),
+            FakeBookResolver(),
         ),
         SpotifyMarket("US"),
     )

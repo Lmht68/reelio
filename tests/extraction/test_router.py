@@ -41,6 +41,13 @@ from reelio.extraction.services.transcription.service import (
 )
 from reelio.extraction.types import (
     ArtistCredit,
+    AuthorCredit,
+    BookMention,
+    BookMentions,
+    BookResult,
+    BookResults,
+    EnrichedAuthorCredit,
+    EnrichedBookWork,
     EnrichedMovie,
     EnrichedMusicRelease,
     EnrichedTrack,
@@ -220,6 +227,22 @@ def _enriched_movie(movie_mention: MovieMention) -> EnrichedMovie:
     )
 
 
+def _enriched_book(book_mention: BookMention) -> EnrichedBookWork:
+    return EnrichedBookWork(
+        title=book_mention.title,
+        authors=[
+            EnrichedAuthorCredit(
+                open_library_author_id="OL21594A",
+                name=author_credit.name,
+                open_library_url="https://openlibrary.org/authors/OL21594A",
+            )
+            for author_credit in book_mention.authors
+        ],
+        open_library_work_id="OL66554W",
+        open_library_url="https://openlibrary.org/works/OL66554W",
+    )
+
+
 def _enriched_tv_series(tv_series_mention: TVSeriesMention) -> EnrichedTVSeries:
     return EnrichedTVSeries(
         title=tv_series_mention.title,
@@ -293,6 +316,8 @@ def _pipeline(
     results: ScreenWorkResults | None = None,
     music_mentions: MusicMentions | None = None,
     music_results: MusicResults | None = None,
+    book_mentions: BookMentions | None = None,
+    book_results: BookResults | None = None,
 ) -> ExtractionPipeline:
     movie_mention = MovieMention(title="Dune: Part One", year=2021)
     interpreted_screen_works = (
@@ -349,6 +374,22 @@ def _pipeline(
             ],
         )
     )
+    interpreted_books = book_mentions if book_mentions is not None else BookMentions(books=[])
+    resolved_books = (
+        book_results
+        if book_results is not None
+        else BookResults(
+            books=[
+                BookResult(
+                    status=ResultStatus.UNRESOLVED,
+                    book_mention=book_mention,
+                    book=None,
+                )
+                for book_mention in interpreted_books.books
+            ]
+        )
+    )
+
     return ExtractionPipeline(
         metadata_service,
         transcription_service,
@@ -356,12 +397,14 @@ def _pipeline(
             ExtractionMentions(
                 screen_works=interpreted_screen_works,
                 music=interpreted_music,
+                books=interpreted_books,
             )
         ),
         _FakeResultAggregator(
             ExtractionResults(
                 screen_works=screen_work_results,
                 music=resolved_music,
+                books=resolved_books,
             )
         ),
     )
@@ -465,6 +508,29 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
             ),
         ],
     )
+    resolved_book_mention = BookMention(
+        title="Pride and Prejudice",
+        authors=[AuthorCredit(name="Jane Austen")],
+    )
+    unresolved_book_mention = BookMention(
+        title="Unknown Book",
+        authors=[AuthorCredit(name="Unknown Author")],
+    )
+    interpreted_books = BookMentions(books=[resolved_book_mention, unresolved_book_mention])
+    resolved_books = BookResults(
+        books=[
+            BookResult(
+                status=ResultStatus.RESOLVED,
+                book_mention=resolved_book_mention,
+                book=_enriched_book(resolved_book_mention),
+            ),
+            BookResult(
+                status=ResultStatus.UNRESOLVED,
+                book_mention=unresolved_book_mention,
+                book=None,
+            ),
+        ]
+    )
     pipeline = _pipeline(
         SourceMetadataService(
             extractor=metadata_extractor,
@@ -477,6 +543,8 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
         results,
         music_mentions=music_mentions,
         music_results=music_results,
+        book_mentions=interpreted_books,
+        book_results=resolved_books,
     )
     _install_pipeline(app, pipeline)
 
@@ -507,6 +575,7 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
         "tv_series": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
         "tracks": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
         "music_releases": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+        "books": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
     }
     raw_results = raw_response["results"]
     assert [item["status"] for item in raw_results["movies"]] == ["resolved", "unresolved"]
@@ -516,6 +585,7 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
         "resolved",
         "unresolved",
     ]
+    assert [item["status"] for item in raw_results["books"]] == ["resolved", "unresolved"]
     assert raw_results["movies"][1]["movie"] is None
     assert "movie" in raw_results["movies"][1]
     assert raw_results["tv_series"][1]["tv_series"] is None
@@ -524,6 +594,8 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
     assert "track" in raw_results["tracks"][1]
     assert raw_results["music_releases"][1]["music_release"] is None
     assert "music_release" in raw_results["music_releases"][1]
+    assert raw_results["books"][1]["book"] is None
+    assert "book" in raw_results["books"][1]
     assert set(raw_results["tracks"][0]["track"]) == {
         "track_title",
         "artists",
@@ -569,6 +641,12 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
         "imdb_id",
         "imdb_url",
         "tmdb_score",
+    }
+    assert set(raw_results["books"][0]["book"]) == {
+        "title",
+        "authors",
+        "open_library_work_id",
+        "open_library_url",
     }
 
     resolved_movie = payload.results.movies[0]
@@ -674,6 +752,23 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
         == unresolved_music_release_mention.release_year
     )
     assert payload.results.music_releases[1].music_release is None
+    resolved_book = payload.results.books[0]
+    assert resolved_book.status is ResultStatus.RESOLVED
+    assert resolved_book.book_mention.title == resolved_book_mention.title
+    assert resolved_book.book_mention.authors == ["Jane Austen"]
+    assert resolved_book.book is not None
+    assert resolved_book.book.title == "Pride and Prejudice"
+    assert resolved_book.book.authors[0].open_library_author_id == "OL21594A"
+    assert resolved_book.book.authors[0].name == "Jane Austen"
+    assert (
+        resolved_book.book.authors[0].open_library_url == "https://openlibrary.org/authors/OL21594A"
+    )
+    assert resolved_book.book.open_library_work_id == "OL66554W"
+    assert resolved_book.book.open_library_url == "https://openlibrary.org/works/OL66554W"
+    assert payload.results.books[1].status is ResultStatus.UNRESOLVED
+    assert payload.results.books[1].book_mention.title == unresolved_book_mention.title
+    assert payload.results.books[1].book_mention.authors == ["Unknown Author"]
+    assert payload.results.books[1].book is None
 
 
 async def test_extract_maps_unavailable_captions_to_502(
@@ -761,13 +856,14 @@ async def test_extract_groups_screen_work_results(
 
     assert response.status_code == 200
     results = response.json()["results"]
-    assert set(results) == {"movies", "tv_series", "tracks", "music_releases"}
+    assert set(results) == {"movies", "tv_series", "tracks", "music_releases", "books"}
     assert [item["movie_mention"]["title"] for item in results["movies"]] == expected_movies
     assert [
         item["tv_series_mention"]["title"] for item in results["tv_series"]
     ] == expected_tv_series
     assert results["tracks"] == []
     assert results["music_releases"] == []
+    assert results["books"] == []
     assert all(set(item) == {"status", "movie_mention", "movie"} for item in results["movies"])
     assert all(
         set(item) == {"status", "tv_series_mention", "tv_series"} for item in results["tv_series"]
@@ -1051,7 +1147,7 @@ async def test_unhandled_failures_do_not_leak_internals() -> None:
 
 
 async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
-    """Document result statistics, grouped Music resolution, TV metadata, and failures."""
+    """Document result statistics, grouped Music and Book resolution, and failures."""
     response = await client.get("/openapi.json")
 
     assert response.status_code == 200
@@ -1115,12 +1211,14 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "tv_series": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
         "tracks": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
         "music_releases": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+        "books": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
     }
     assert set(example["results"]) == {
         "movies",
         "tv_series",
         "tracks",
         "music_releases",
+        "books",
     }
     resolved_tv_series_example = example["results"]["tv_series"][0]
     assert resolved_tv_series_example["status"] == "resolved"
@@ -1222,6 +1320,31 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "Unknown Artist"
     ]
     assert unresolved_music_release_example.get("music_release") is None
+    resolved_book_example = example["results"]["books"][0]
+    assert resolved_book_example["status"] == "resolved"
+    assert resolved_book_example["book_mention"] == {
+        "title": "Pride and Prejudice",
+        "authors": ["Jane Austen"],
+    }
+    assert resolved_book_example["book"] == {
+        "title": "Pride and Prejudice",
+        "authors": [
+            {
+                "open_library_author_id": "OL21594A",
+                "name": "Jane Austen",
+                "open_library_url": "https://openlibrary.org/authors/OL21594A",
+            }
+        ],
+        "open_library_work_id": "OL66554W",
+        "open_library_url": "https://openlibrary.org/works/OL66554W",
+    }
+    unresolved_book_example = example["results"]["books"][1]
+    assert unresolved_book_example["status"] == "unresolved"
+    assert unresolved_book_example["book_mention"] == {
+        "title": "Unknown Book",
+        "authors": [],
+    }
+    assert unresolved_book_example.get("book") is None
 
     assert "ResultModel" not in schemas
     assert all("cover" not in schema_name.casefold() for schema_name in schemas)
@@ -1247,6 +1370,7 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "tv_series",
         "tracks",
         "music_releases",
+        "books",
     ]
     assert extraction_results["properties"]["movies"] == {
         "items": {"$ref": "#/components/schemas/MovieResultModel"},
@@ -1268,18 +1392,25 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "type": "array",
         "title": "Music Releases",
     }
+    assert extraction_results["properties"]["books"] == {
+        "items": {"$ref": "#/components/schemas/BookResultModel"},
+        "type": "array",
+        "title": "Books",
+    }
     extraction_statistics = schemas["ExtractionStatisticsModel"]
     assert extraction_statistics["required"] == [
         "movies",
         "tv_series",
         "tracks",
         "music_releases",
+        "books",
     ]
     assert extraction_statistics["properties"] == {
         "movies": {"$ref": "#/components/schemas/ResultCountsModel"},
         "tv_series": {"$ref": "#/components/schemas/ResultCountsModel"},
         "tracks": {"$ref": "#/components/schemas/ResultCountsModel"},
         "music_releases": {"$ref": "#/components/schemas/ResultCountsModel"},
+        "books": {"$ref": "#/components/schemas/ResultCountsModel"},
     }
     result_counts = schemas["ResultCountsModel"]
     assert result_counts["required"] == ["n_mentions", "n_resolved", "n_unresolved"]
@@ -1323,6 +1454,17 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert music_release_result_schema["properties"]["music_release"] == {
         "anyOf": [
             {"$ref": "#/components/schemas/MusicReleaseModel"},
+            {"type": "null"},
+        ],
+    }
+    book_result_schema = schemas["BookResultModel"]
+    assert book_result_schema["required"] == ["status", "book_mention", "book"]
+    assert book_result_schema["properties"]["book_mention"] == {
+        "$ref": "#/components/schemas/BookMentionModel"
+    }
+    assert book_result_schema["properties"]["book"] == {
+        "anyOf": [
+            {"$ref": "#/components/schemas/BookModel"},
             {"type": "null"},
         ],
     }
@@ -1420,6 +1562,31 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     ]
     artist_credit_schema = schemas["ArtistCreditModel"]
     assert artist_credit_schema["required"] == ["spotify_artist_id", "name"]
+    book_mention_schema = schemas["BookMentionModel"]
+    assert book_mention_schema["required"] == ["title", "authors"]
+    assert book_mention_schema["properties"]["authors"] == {
+        "items": {"type": "string"},
+        "type": "array",
+        "title": "Authors",
+    }
+    book_schema = schemas["BookModel"]
+    assert book_schema["required"] == [
+        "title",
+        "authors",
+        "open_library_work_id",
+        "open_library_url",
+    ]
+    assert book_schema["properties"]["authors"] == {
+        "items": {"$ref": "#/components/schemas/EnrichedAuthorCreditModel"},
+        "type": "array",
+        "title": "Authors",
+    }
+    enriched_author_credit_schema = schemas["EnrichedAuthorCreditModel"]
+    assert enriched_author_credit_schema["required"] == [
+        "open_library_author_id",
+        "name",
+        "open_library_url",
+    ]
     assert set(document["components"]["schemas"]["Platform"]["enum"]) == {
         "youtube",
         "instagram",
@@ -1441,12 +1608,15 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert "artwork link-back" in operation["description"]
     assert "worldwide-edition" in operation["description"]
     assert "Music Releases" in operation["summary"]
+    assert "Book Works" in operation["summary"]
+    assert "Book Work Results retain their interpreted Book Mention" in operation["description"]
+    assert "Open Library Work title" in operation["description"]
     assert (
-        "Any TMDB or Spotify provider failure fails the complete request."
+        "Any TMDB, Spotify, or Open Library provider failure fails the complete request."
         in operation["description"]
     )
     assert (
-        "Any TMDB or Spotify provider failure fails the complete request."
+        "Any TMDB, Spotify, or Open Library provider failure fails the complete request."
         in responses["502"]["description"]
     )
 
@@ -1482,6 +1652,7 @@ class _MarketPipeline:
             results=ExtractionResults(
                 screen_works=ScreenWorkResults(movies=[], tv_series=[]),
                 music=MusicResults(tracks=[], music_releases=[]),
+                books=BookResults(books=[]),
             ),
             market=market or _DEFAULT_MARKET,
         )
@@ -1517,6 +1688,7 @@ async def test_extract_validates_forwards_and_exposes_the_effective_market(
         "tv_series": {"n_mentions": 0, "n_resolved": 0, "n_unresolved": 0},
         "tracks": {"n_mentions": 0, "n_resolved": 0, "n_unresolved": 0},
         "music_releases": {"n_mentions": 0, "n_resolved": 0, "n_unresolved": 0},
+        "books": {"n_mentions": 0, "n_resolved": 0, "n_unresolved": 0},
     }
     assert default_response.status_code == 200
     assert default_response.json()["market"] == "US"

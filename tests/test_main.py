@@ -59,6 +59,14 @@ class _FakeScreenWorkResolver:
         self.close_calls += 1
 
 
+class _FakeBookResolver:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
 def _transcription_settings(device: str) -> TranscriptionConfig:
     settings_type = cast(Callable[..., TranscriptionConfig], TranscriptionConfig)
     return settings_type(
@@ -199,7 +207,10 @@ async def test_production_lifespan_closes_one_selected_provider(
     """Construct one selected provider and close it when production stops."""
     monkeypatch.setenv("REELIO_LLM_PROVIDER", "openai")
     provider = _FakeProvider()
+    monkeypatch.setenv("REELIO_OPEN_LIBRARY_CONTACT_EMAIL", "test@example.invalid")
     resolver = _FakeScreenWorkResolver()
+    book_resolver = _FakeBookResolver()
+    book_resolver_factory_calls = 0
     provider_factory_calls = 0
     resolver_factory_calls = 0
 
@@ -214,17 +225,29 @@ async def test_production_lifespan_closes_one_selected_provider(
         resolver_factory_calls += 1
         return resolver
 
+    def create_book_resolver(settings: object) -> _FakeBookResolver:
+        nonlocal book_resolver_factory_calls
+        book_resolver_factory_calls += 1
+        return book_resolver
+
     monkeypatch.setattr(main_module, "create_mention_interpretation_provider", create_provider)
     monkeypatch.setattr(main_module, "load_whisper_transcriber", lambda settings: object())
     monkeypatch.setattr(main_module, "create_tmdb_screen_work_resolver", create_resolver)
+    monkeypatch.setattr(
+        main_module,
+        "create_open_library_book_resolver",
+        create_book_resolver,
+    )
     application = create_app()
 
     async with application.router.lifespan_context(application):
         assert provider_factory_calls == 1
         assert resolver_factory_calls == 1
+        assert book_resolver_factory_calls == 1
 
     assert provider.close_calls == 1
     assert resolver.close_calls == 1
+    assert book_resolver.close_calls == 1
 
 
 async def test_production_lifespan_closes_provider_after_partial_startup_failure(
@@ -261,8 +284,10 @@ async def test_production_lifespan_closes_resolver_after_aggregation_setup_failu
 ) -> None:
     """Close every acquired resource when aggregation setup aborts startup."""
     monkeypatch.setenv("REELIO_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("REELIO_OPEN_LIBRARY_CONTACT_EMAIL", "test@example.invalid")
     provider = _FakeProvider()
     resolver = _FakeScreenWorkResolver()
+    book_resolver = _FakeBookResolver()
     resolver_factory_calls = 0
 
     def create_provider(selection: LLMProviderSelectionConfig) -> _FakeProvider:
@@ -277,14 +302,21 @@ async def test_production_lifespan_closes_resolver_after_aggregation_setup_failu
     def fail_aggregation_setup(
         screen_work_resolver: object,
         music_resolver: object,
+        configured_book_resolver: object,
     ) -> NoReturn:
         assert screen_work_resolver is resolver
         assert music_resolver is not None
+        assert configured_book_resolver is book_resolver
         raise RuntimeError("aggregation setup failed")
 
     monkeypatch.setattr(main_module, "create_mention_interpretation_provider", create_provider)
     monkeypatch.setattr(main_module, "load_whisper_transcriber", lambda settings: object())
     monkeypatch.setattr(main_module, "create_tmdb_screen_work_resolver", create_resolver)
+    monkeypatch.setattr(
+        main_module,
+        "create_open_library_book_resolver",
+        lambda settings: book_resolver,
+    )
     monkeypatch.setattr(
         main_module,
         "ExtractionResultAggregator",
@@ -299,6 +331,7 @@ async def test_production_lifespan_closes_resolver_after_aggregation_setup_failu
     assert resolver_factory_calls == 1
     assert provider.close_calls == 1
     assert resolver.close_calls == 1
+    assert book_resolver.close_calls == 1
     assert not hasattr(application.state, "extraction_pipeline")
 
 

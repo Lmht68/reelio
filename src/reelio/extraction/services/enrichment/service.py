@@ -5,6 +5,8 @@ from typing import Protocol
 
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.types import (
+    BookMentions,
+    BookResults,
     ExtractionMentions,
     ExtractionResults,
     MusicMentions,
@@ -22,6 +24,18 @@ class _ScreenWorkResolver(Protocol):
         screen_work_mentions: ScreenWorkMentions,
     ) -> ScreenWorkResults:
         """Return resolved Screen Work Results for grouped mentions."""
+        ...
+
+    async def aclose(self) -> None:
+        """Release provider-owned resources."""
+        ...
+
+
+class _BookResolver(Protocol):
+    """Resolve Book Work Mentions with provider-backed enrichment."""
+
+    async def resolve(self, book_mentions: BookMentions) -> BookResults:
+        """Return resolved Book Work Results for ordered Mentions."""
         ...
 
     async def aclose(self) -> None:
@@ -47,20 +61,25 @@ class ExtractionResultAggregator:
     Args:
         screen_work_resolver: Resolver for Movie and TV Series mentions.
         music_resolver: Resolver for Spotify Track and Music Release mentions.
+        book_resolver: Resolver for Open Library Book Work mentions.
     """
 
     def __init__(
         self,
         screen_work_resolver: _ScreenWorkResolver,
         music_resolver: _MusicResolver,
+        book_resolver: _BookResolver,
     ) -> None:
         """Initialize aggregation with resolvers for each service scope.
+
         Args:
             screen_work_resolver: Resolver for Movie and TV Series mentions.
             music_resolver: Resolver for Spotify Track and Music Release mentions.
+            book_resolver: Resolver for Open Library Book Work mentions.
         """
         self._screen_work_resolver = screen_work_resolver
         self._music_resolver = music_resolver
+        self._book_resolver = book_resolver
 
     async def aggregate(
         self,
@@ -76,15 +95,20 @@ class ExtractionResultAggregator:
         Returns:
             ExtractionResults: Results grouped by service scope.
         """
-        resolved_screen_works, resolved_music = await asyncio.gather(
+        resolved_screen_works, resolved_music, resolved_books = await asyncio.gather(
             self._screen_work_resolver.resolve(mentions.screen_works),
             self._music_resolver.resolve(mentions.music, market),
+            self._book_resolver.resolve(mentions.books),
         )
         return ExtractionResults(
             screen_works=resolved_screen_works,
             music=resolved_music,
+            books=resolved_books,
         )
 
     async def aclose(self) -> None:
-        """Release resources owned by kind-specific resolvers."""
-        await self._screen_work_resolver.aclose()
+        """Release resources owned by Screen Work and Book Work resolvers."""
+        try:
+            await self._screen_work_resolver.aclose()
+        finally:
+            await self._book_resolver.aclose()

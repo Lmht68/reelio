@@ -10,24 +10,27 @@ from reelio.extraction.types import (
 
 
 def build_system_prompt() -> str:
-    """Build trusted instructions for Screen Work and Music Mention interpretation.
+    """Build trusted instructions for Screen Work, Music, and Book Work interpretation.
 
     Returns:
         str: System instructions containing current valid year horizons.
     """
     maximum_screen_work_year = maximum_screen_work_mention_year()
     current_year = date.today().year
-    return f"""You perform Screen Work and Music Mention interpretation, not literal title
-        extraction.
-        Identify every eligible Movie, TV Series, released Track, and Music Release
-        referenced explicitly or implicitly in the supplied Interpretation Material.
+    return f"""You perform Screen Work, Music, and Book Work Mention interpretation,
+        not literal title extraction.
+        Identify every eligible Movie, TV Series, released Track, Music Release, and
+        Book Work referenced explicitly or implicitly in the supplied Interpretation
+        Material.
         Return JSON only with exactly this shape:
-        {{"movies":[{{"title":"Full canonical movie title","year":2021}}],"tv_series":[{{"title":"Full canonical TV Series title","year":2023}}],"tracks":[{{"track_title":"Complete recording title","artists":["First credited artist"],"release_title":null,"release_year":null}}],"music_releases":[{{"release_title":"Complete release title","artists":["First credited artist"],"release_year":null}}]}}.
-        All four arrays are required, even when empty.
+        {{"movies":[{{"title":"Full canonical movie title","year":2021}}],"tv_series":[{{"title":"Full canonical TV Series title","year":2023}}],"tracks":[{{"track_title":"Complete recording title","artists":["First credited artist"],"release_title":null,"release_year":null}}],"music_releases":[{{"release_title":"Complete release title","artists":["First credited artist"],"release_year":null}}],"books":[{{"title":"Full canonical Book Work title","authors":["First credited author"]}}]}}.
+        All five arrays are required, even when empty.
         Every Track must include track_title, a nonempty ordered artists array,
         release_title, and release_year.
         Every Music Release must include release_title, a nonempty ordered artists
         array, and release_year.
+        Every Book Work must include title and an ordered authors array, which may be
+        empty.
         Nullable release fields must be present as null when not explicitly supported.
         Do not return explanations, confidence, evidence, reasoning, chain-of-thought,
         version, or any field beyond this shape.
@@ -113,6 +116,22 @@ def build_system_prompt() -> str:
           background audio, humming, singing without an identified recording, and
           audio fingerprinting.
 
+        Book rules:
+        - Put canonical standalone Book Works only in "books".
+        - Use the complete canonical Book Work title, expanding shorthand only when the
+          complete Work is unambiguous from the material.
+        - Include every person or organization credited as an author in displayed credit
+          order.
+          Exclude translators, editors, illustrators, compilers, introduction writers,
+          and other non-author contributors unless separately credited as authors.
+        - Preserve first-reference order and deduplicate Book Works by complete title
+          plus ordered Author Credits.
+        - Omit ambiguous Work references, Book Series or franchises, author-only
+          references, quotations, chapters, articles, other Book Parts, and Edition-only
+          or ISBN-only references.
+        - Ignore publishers, ISBNs, publication dates, formats, languages, Edition
+          names, Edition designations, and other Edition signals.
+
         Required Movie examples:
         Input reference: Dune, meaning Denis Villeneuve's 2021 film.
         JSON movie: {{"title":"Dune: Part One","year":2021}}
@@ -133,7 +152,7 @@ def build_system_prompt() -> str:
         Che is a two-part work; return one part only when context identifies that part.
 
         An empty result is valid and must be
-        {{"movies":[],"tv_series":[],"tracks":[],"music_releases":[]}}."""
+        {{"movies":[],"tv_series":[],"tracks":[],"music_releases":[],"books":[]}}."""
 
 
 def build_interpretation_material(

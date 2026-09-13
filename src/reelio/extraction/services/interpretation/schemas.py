@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from reelio.extraction.types import (
     MINIMUM_SCREEN_WORK_MENTION_YEAR,
     maximum_screen_work_mention_year,
+    normalize_book_text,
     normalize_music_text,
     normalize_screen_work_title,
 )
@@ -29,6 +30,27 @@ def _normalize_music_field(value: str, field_name: str) -> str:
     if any(unicodedata.category(character) == "Cc" for character in value):
         raise ValueError(f"{field_name} must not contain control characters")
     normalized_value = normalize_music_text(value)
+    if not normalized_value:
+        raise ValueError(f"{field_name} must contain non-whitespace characters")
+    return normalized_value
+
+
+def _normalize_book_field(value: str, field_name: str) -> str:
+    """Validate and normalize one Book Work identity field.
+
+    Args:
+        value: Book Work title or Author Credit supplied by the interpretation provider.
+        field_name: Schema field used in validation messages.
+
+    Returns:
+        str: NFC-normalized text with collapsed whitespace.
+
+    Raises:
+        ValueError: If the source text is blank or contains a control character.
+    """
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise ValueError(f"{field_name} must not contain control characters")
+    normalized_value = normalize_book_text(value)
     if not normalized_value:
         raise ValueError(f"{field_name} must contain non-whitespace characters")
     return normalized_value
@@ -81,6 +103,41 @@ class InterpretedScreenWorkMention(BaseModel):
         if value > maximum_screen_work_year:
             raise ValueError(f"year must be no later than {maximum_screen_work_year}")
         return value
+
+
+class InterpretedBookMention(BaseModel):
+    """Validate one canonical Book Work title and ordered Author Credits."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    title: str = Field(min_length=1)
+    authors: list[str]
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        """Normalize a canonical Book Work title.
+
+        Args:
+            value: Canonical Book Work title returned by the provider.
+
+        Returns:
+            str: Normalized nonblank Book Work title.
+        """
+        return _normalize_book_field(value, "title")
+
+    @field_validator("authors")
+    @classmethod
+    def normalize_authors(cls, value: list[str]) -> list[str]:
+        """Normalize ordered Author Credit names.
+
+        Args:
+            value: Author Credit names returned by the provider.
+
+        Returns:
+            list[str]: Normalized nonblank Author Credit names in provider order.
+        """
+        return [_normalize_book_field(author, "authors") for author in value]
 
 
 class _InterpretedMusicMention(BaseModel):
@@ -190,3 +247,4 @@ class InterpretationResponse(BaseModel):
     tv_series: list[InterpretedScreenWorkMention]
     tracks: list[InterpretedTrackMention]
     music_releases: list[InterpretedMusicReleaseMention]
+    books: list[InterpretedBookMention]

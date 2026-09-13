@@ -35,6 +35,8 @@ from reelio.extraction.services.interpretation.service import (
 )
 from reelio.extraction.services.interpretation.types import LLMMessage
 from reelio.extraction.types import (
+    AuthorCredit,
+    BookMention,
     ExtractionMentions,
     MovieMention,
     MusicReleaseMention,
@@ -49,6 +51,7 @@ from reelio.extraction.types import (
 
 TrackResponse = tuple[str, Sequence[str], str | None, int | None]
 MusicReleaseResponse = tuple[str, Sequence[str], int | None]
+BookResponse = tuple[str, Sequence[str]]
 
 
 class _ProviderLogRecord(logging.LogRecord):
@@ -150,6 +153,7 @@ def _response(
     tv_series: Sequence[tuple[str, int]] = (),
     tracks: Sequence[TrackResponse] = (),
     music_releases: Sequence[MusicReleaseResponse] = (),
+    books: Sequence[BookResponse] = (),
 ) -> str:
     return json.dumps(
         {
@@ -172,6 +176,7 @@ def _response(
                 }
                 for release_title, artists, release_year in music_releases
             ],
+            "books": [{"title": title, "authors": list(authors)} for title, authors in books],
         }
     )
 
@@ -197,6 +202,41 @@ def _assert_prompt(
     assert rule_fragment.casefold() in system_message.content.casefold()
     assert user_message.role == "user"
     assert json.loads(user_message.content)["transcript"] == transcript_text
+
+
+async def test_book_mentions_preserve_normalized_author_credits_and_first_occurrence() -> None:
+    """Return deduplicated Book Work Mentions with ordered Author Credits."""
+    mentions, provider = await _interpret(
+        "Pride and Prejudice, then The Left Hand of Darkness.",
+        _response(
+            books=(
+                ("  Pride  and  Prejudice  ", ("  Jane  Austen  ",)),
+                ("pride and prejudice", ("JANE AUSTEN",)),
+                ("Pride and Prejudice", ()),
+                ("  The  Left Hand  of Darkness ", ("Ursula K. Le Guin", "  A. N. Other")),
+            )
+        ),
+    )
+
+    assert mentions.books.books == [
+        BookMention(
+            title="Pride and Prejudice",
+            authors=[AuthorCredit(name="Jane Austen")],
+        ),
+        BookMention(title="Pride and Prejudice", authors=[]),
+        BookMention(
+            title="The Left Hand of Darkness",
+            authors=[
+                AuthorCredit(name="Ursula K. Le Guin"),
+                AuthorCredit(name="A. N. Other"),
+            ],
+        ),
+    ]
+    _assert_prompt(
+        provider,
+        "Pride and Prejudice, then The Left Hand of Darkness.",
+        "canonical standalone Book Works",
+    )
 
 
 async def test_directly_named_movie_returns_canonical_title_and_year() -> None:
@@ -641,6 +681,15 @@ async def test_maximum_future_screen_work_year_is_accepted() -> None:
         "humming",
         "audio fingerprinting",
         "unreleased",
+        "canonical standalone Book Works",
+        "complete canonical Book Work title",
+        "credited as an author",
+        "Book Series or franchises",
+        "author-only",
+        "quotations",
+        "Book Parts",
+        "ISBN-only references",
+        "publishers, ISBNs, publication dates, formats, languages",
     ],
 )
 def test_system_prompt_defines_grouped_screen_work_policy(rule_fragment: str) -> None:
@@ -751,19 +800,19 @@ async def test_prompt_injection_remains_json_content_without_channel() -> None:
     ("invalid_response", "corrected_response"),
     [
         (
-            '{"movies":[],"tracks":[],"music_releases":[]}',
+            '{"movies":[],"tracks":[],"music_releases":[],"books":[]}',
             _response(),
         ),
         (
-            '{"tv_series":[],"tracks":[],"music_releases":[]}',
+            '{"tv_series":[],"tracks":[],"music_releases":[],"books":[]}',
             _response(),
         ),
         (
-            '{"movies":[],"tv_series":[],"music_releases":[]}',
+            '{"movies":[],"tv_series":[],"music_releases":[],"books":[]}',
             _response(),
         ),
         (
-            '{"movies":[],"tv_series":[],"tracks":[]}',
+            '{"movies":[],"tv_series":[],"tracks":[],"books":[]}',
             _response(),
         ),
         (
@@ -771,126 +820,154 @@ async def test_prompt_injection_remains_json_content_without_channel() -> None:
             _response(),
         ),
         (
-            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":[],"version":1}',
+            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":[],"books":[],"version":1}',
             _response(),
         ),
         (
             '{"movies":[{"title":"Dune","year":"2021"}],"tv_series":[],"tracks":[],'
-            '"music_releases":[]}',
+            '"music_releases":[],"books":[]}',
             _response(("Dune", 2021)),
         ),
         (
             '{"movies":[{"title":"Dune","year":1887}],"tv_series":[],"tracks":[],'
-            '"music_releases":[]}',
+            '"music_releases":[],"books":[]}',
             _response(("Dune", 2021)),
         ),
         (
             '{"movies":[{"title":"Dune","year":'
             f"{maximum_screen_work_mention_year() + 1}"
-            '}],"tv_series":[],"tracks":[],"music_releases":[]}',
+            '}],"tv_series":[],"tracks":[],"music_releases":[],"books":[]}',
             _response(("Dune", maximum_screen_work_mention_year())),
         ),
         (
             '{"movies":[{"title":"Dune","year":2021,"confidence":1}],"tv_series":[],'
-            '"tracks":[],"music_releases":[]}',
+            '"tracks":[],"music_releases":[],"books":[]}',
             _response(("Dune", 2021)),
         ),
         (
             '{"movies":[{"title":"   ","year":2021}],"tv_series":[],"tracks":[],'
-            '"music_releases":[]}',
+            '"music_releases":[],"books":[]}',
             _response(("Dune", 2021)),
         ),
         (
             '{"movies":[{"title":"Dune\\u0000","year":2021}],"tv_series":[],"tracks":[],'
-            '"music_releases":[]}',
+            '"music_releases":[],"books":[]}',
             _response(("Dune", 2021)),
         ),
         (
             '{"movies":[],"tv_series":[{"title":"The Last of Us","year":"2023"}],'
-            '"tracks":[],"music_releases":[]}',
+            '"tracks":[],"music_releases":[],"books":[]}',
             _response(tv_series=(("The Last of Us", 2023),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[{"artists":["Queen"],'
-            '"release_title":null,"release_year":null}],"music_releases":[]}',
+            '"release_title":null,"release_year":null}],"music_releases":[],"books":[]}',
             _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
-            '"release_title":null,"release_year":null}],"music_releases":[]}',
+            '"release_title":null,"release_year":null}],"music_releases":[],"books":[]}',
             _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
-            '"artists":[],"release_title":null,"release_year":null}],"music_releases":[]}',
+            '"artists":[],"release_title":null,"release_year":null}],"music_releases":[],"books":[]}',
             _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
             '"artists":["  "],"release_title":null,"release_year":null}],'
-            '"music_releases":[]}',
+            '"music_releases":[],"books":[]}',
             _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
             '"artists":["Queen\\u0000"],"release_title":null,"release_year":null}],'
-            '"music_releases":[]}',
+            '"music_releases":[],"books":[]}',
             _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[{"track_title":"  ","artists":["Queen"],'
-            '"release_title":null,"release_year":null}],"music_releases":[]}',
+            '"release_title":null,"release_year":null}],"music_releases":[],"books":[]}',
             _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
-            '"artists":["Queen"],"release_year":null}],"music_releases":[]}',
+            '"artists":["Queen"],"release_year":null}],"music_releases":[],"books":[]}',
             _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
-            '"artists":["Queen"],"release_title":null}],"music_releases":[]}',
+            '"artists":["Queen"],"release_title":null}],"music_releases":[],"books":[]}',
             _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
             '"artists":["Queen"],"release_title":" ","release_year":null}],'
-            '"music_releases":[]}',
+            '"music_releases":[],"books":[]}',
             _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
             '"artists":["Queen"],"release_title":null,"release_year":0}],'
-            '"music_releases":[]}',
+            '"music_releases":[],"books":[]}',
             _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
             '"artists":["Queen"],"release_title":null,"release_year":'
             f"{date.today().year + 1}"
-            '}],"music_releases":[]}',
+            '}],"music_releases":[],"books":[]}',
             _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[{"track_title":"Bohemian Rhapsody",'
             '"artists":["Queen"],"release_title":null,"release_year":null,"version":1}],'
-            '"music_releases":[]}',
+            '"music_releases":[],"books":[]}',
             _response(tracks=(("Bohemian Rhapsody", ("Queen",), None, None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[],"music_releases":'
-            '[{"release_title":"A Night at the Opera","artists":["Queen"]}]}',
+            '[{"release_title":"A Night at the Opera","artists":["Queen"]}],"books":[]}',
             _response(music_releases=(("A Night at the Opera", ("Queen",), None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[],"music_releases":'
-            '[{"release_title":"A Night at the Opera","artists":[],"release_year":null}]}',
+            '[{"release_title":"A Night at the Opera","artists":[],"release_year":null}],"books":[]}',
             _response(music_releases=(("A Night at the Opera", ("Queen",), None),)),
         ),
         (
             '{"movies":[],"tv_series":[],"tracks":[],"music_releases":'
-            '[{"release_title":" ","artists":["Queen"],"release_year":null}]}',
+            '[{"release_title":" ","artists":["Queen"],"release_year":null}],"books":[]}',
             _response(music_releases=(("A Night at the Opera", ("Queen",), None),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":[]}',
+            _response(),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":[],"books":"Pride and Prejudice"}',
+            _response(),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":[],"books":[{"title":1,"authors":[]}]}',
+            _response(books=(("Pride and Prejudice", ()),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":[],"books":[{"title":"Pride and Prejudice"}]}',
+            _response(books=(("Pride and Prejudice", ()),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":[],"books":[{"title":" ","authors":[]}]}',
+            _response(books=(("Pride and Prejudice", ()),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":[],"books":[{"title":"Pride and Prejudice","authors":[" "]}]}',
+            _response(books=(("Pride and Prejudice", ("Jane Austen",)),)),
+        ),
+        (
+            '{"movies":[],"tv_series":[],"tracks":[],"music_releases":[],"books":[{"title":"Pride and Prejudice","authors":[],"isbn":"9780141439518"}]}',
+            _response(books=(("Pride and Prejudice", ()),)),
         ),
     ],
     ids=[
@@ -922,6 +999,13 @@ async def test_prompt_injection_remains_json_content_without_channel() -> None:
         "missing-music-release-year",
         "empty-music-release-artists",
         "blank-music-release-title",
+        "missing-books",
+        "wrong-type-books",
+        "wrong-type-book-title",
+        "missing-book-authors",
+        "blank-book-title",
+        "blank-book-author",
+        "edition-specific-book-field",
     ],
 )
 async def test_strict_response_schema_rejects_invalid_fields(

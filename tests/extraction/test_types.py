@@ -8,6 +8,13 @@ from reelio.extraction.types import (
     MINIMUM_SCREEN_WORK_MENTION_YEAR,
     AlbumType,
     ArtistCredit,
+    AuthorCredit,
+    BookMention,
+    BookMentions,
+    BookResult,
+    BookResults,
+    EnrichedAuthorCredit,
+    EnrichedBookWork,
     EnrichedMusicRelease,
     EnrichedTrack,
     EnrichedTVSeries,
@@ -32,6 +39,8 @@ from reelio.extraction.types import (
     TVSeriesMention,
     TVSeriesResult,
     maximum_screen_work_mention_year,
+    normalize_book_identity,
+    normalize_book_text,
     normalize_music_identity,
     normalize_music_text,
     normalize_music_title_identity,
@@ -57,6 +66,51 @@ def test_normalize_music_title_identity_unifies_apostrophes_and_slash_spacing() 
     """Normalize Music title apostrophes and whitespace adjacent to slashes."""
     assert normalize_music_identity("  D’Angelo / The Band  ") == "d’angelo / the band"
     assert normalize_music_title_identity("  ‘TIL\tI CAN’T  /  STOP  ") == "'til i can't/stop"
+
+
+def test_book_work_types_preserve_identity_and_provider_author_order() -> None:
+    """Separate Book Work identity from display text and retain ordered provider data."""
+    assert normalize_book_text("  A\u0308nne\tof Green\nGables  ") == "Änne of Green Gables"
+    assert normalize_book_identity("  A\u0308NNE\tOF GREEN\nGABLES  ") == "änne of green gables"
+
+    mention = BookMention(
+        title="Good Omens",
+        authors=[AuthorCredit(name="Terry Pratchett"), AuthorCredit(name="Neil Gaiman")],
+    )
+    book = EnrichedBookWork(
+        title="Good Omens",
+        authors=[
+            EnrichedAuthorCredit(
+                open_library_author_id="OL25782A",
+                name="Terry Pratchett",
+                open_library_url="https://openlibrary.org/authors/OL25782A",
+            ),
+            EnrichedAuthorCredit(
+                open_library_author_id="OL53379A",
+                name="Neil Gaiman",
+                open_library_url="https://openlibrary.org/authors/OL53379A",
+            ),
+        ],
+        open_library_work_id="OL149507W",
+        open_library_url="https://openlibrary.org/works/OL149507W",
+    )
+    result = BookResult(
+        status=ResultStatus.RESOLVED,
+        book_mention=mention,
+        book=book,
+    )
+    mentions = BookMentions(books=[mention])
+    results = BookResults(books=[result])
+
+    assert mentions.books == [mention]
+    assert results.books == [result]
+    assert result.book_mention is mention
+    assert result.book is book
+    assert [author.name for author in book.authors] == ["Terry Pratchett", "Neil Gaiman"]
+    assert [author.open_library_url for author in book.authors] == [
+        "https://openlibrary.org/authors/OL25782A",
+        "https://openlibrary.org/authors/OL53379A",
+    ]
 
 
 def test_album_type_alias_matches_spotify_values() -> None:
@@ -94,8 +148,7 @@ def test_extraction_domain_types_preserve_nested_service_scope_identity() -> Non
         music_releases=[music_release_mention],
     )
     mentions = ExtractionMentions(
-        screen_works=screen_work_mentions,
-        music=music_mentions,
+        screen_works=screen_work_mentions, music=music_mentions, books=BookMentions(books=[])
     )
     movie_result = MovieResult(
         status=ResultStatus.UNRESOLVED,
@@ -157,8 +210,7 @@ def test_extraction_domain_types_preserve_nested_service_scope_identity() -> Non
         music_releases=[music_release_result],
     )
     results = ExtractionResults(
-        screen_works=screen_work_results,
-        music=music_results,
+        screen_works=screen_work_results, music=music_results, books=BookResults(books=[])
     )
     pipeline_result = PipelineResult(
         source=Source(

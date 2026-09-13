@@ -2,6 +2,9 @@
 
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.types import (
+    BookMentions,
+    BookResult,
+    BookResults,
     ExtractionMentions,
     ExtractionResults,
     MovieResult,
@@ -38,6 +41,7 @@ class FakeInterpretationService:
             else ExtractionMentions(
                 screen_works=ScreenWorkMentions(movies=[], tv_series=[]),
                 music=MusicMentions(tracks=[], music_releases=[]),
+                books=BookMentions(books=[]),
             )
         )
         self.error = error
@@ -115,6 +119,19 @@ def _unresolved_music_results(music_mentions: MusicMentions) -> MusicResults:
     )
 
 
+def _unresolved_book_results(book_mentions: BookMentions) -> BookResults:
+    return BookResults(
+        books=[
+            BookResult(
+                status=ResultStatus.UNRESOLVED,
+                book_mention=book_mention,
+                book=None,
+            )
+            for book_mention in book_mentions.books
+        ]
+    )
+
+
 class FakeScreenWorkResolver:
     """Provide deterministic grouped Screen Work resolution for pipeline tests."""
 
@@ -156,6 +173,39 @@ class FakeScreenWorkResolver:
         if self.results is not None:
             return self.results
         return _unresolved_screen_work_results(screen_work_mentions)
+
+    async def aclose(self) -> None:
+        """Record release of resolution resources."""
+        self.closed = True
+
+
+class FakeBookResolver:
+    """Provide deterministic Book Work resolution for aggregation tests."""
+
+    def __init__(
+        self,
+        results: BookResults | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        """Configure returned Book Work Results or a raised exception.
+
+        Args:
+            results: Results returned by ``resolve`` when provided.
+            error: Exception raised by ``resolve`` when provided.
+        """
+        self.results = results
+        self.error = error
+        self.calls: list[BookMentions] = []
+        self.closed = False
+
+    async def resolve(self, book_mentions: BookMentions) -> BookResults:
+        """Record and resolve Book Work Mentions."""
+        self.calls.append(book_mentions)
+        if self.error is not None:
+            raise self.error
+        if self.results is not None:
+            return self.results
+        return _unresolved_book_results(book_mentions)
 
     async def aclose(self) -> None:
         """Record release of resolution resources."""
@@ -241,6 +291,7 @@ class FakeResultAggregator:
         return ExtractionResults(
             screen_works=_unresolved_screen_work_results(mentions.screen_works),
             music=_unresolved_music_results(mentions.music),
+            books=_unresolved_book_results(mentions.books),
         )
 
     async def aclose(self) -> None:

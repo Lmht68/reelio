@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from pydantic_settings import BaseSettings
 
 from reelio.config import AppConfig, Environment
-from reelio.extraction.services.enrichment.config import TMDBConfig
+from reelio.extraction.services.enrichment.config import OpenLibraryConfig, TMDBConfig
 from reelio.extraction.services.interpretation.config import (
     DeepSeekConfig,
     InterpretationConfig,
@@ -36,6 +36,70 @@ def test_tmdb_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(ValidationError, match="REELIO_TMDB_API_KEY"):
         _without_dotenv(TMDBConfig)
+
+
+def test_open_library_requires_nonblank_safe_contact_and_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Require a safe operational contact and credential-free HTTP endpoint."""
+    monkeypatch.delenv("REELIO_OPEN_LIBRARY_CONTACT_EMAIL", raising=False)
+
+    with pytest.raises(ValidationError, match="REELIO_OPEN_LIBRARY_CONTACT_EMAIL"):
+        _without_dotenv(OpenLibraryConfig)
+    for contact_email in (
+        "",
+        "  ",
+        "catalog@example.invalid\u0000",
+        "catalog\u0085@example.invalid",
+    ):
+        with pytest.raises(ValidationError):
+            _without_dotenv(OpenLibraryConfig, contact_email=contact_email)
+    for base_url in (
+        "ftp://openlibrary.org",
+        "https://user:password@openlibrary.org",
+        "https://openlibrary.org/search?title=Dune",
+        "https://openlibrary.org/#fragment",
+    ):
+        with pytest.raises(ValidationError):
+            _without_dotenv(
+                OpenLibraryConfig,
+                contact_email="catalog@example.invalid",
+                base_url=base_url,
+            )
+
+
+def test_open_library_configuration_defaults_and_valid_overrides() -> None:
+    """Provide the exact conservative Open Library request defaults."""
+    defaults = _without_dotenv(
+        OpenLibraryConfig,
+        contact_email="  catalog@example.invalid  ",
+    )
+    overrides = _without_dotenv(
+        OpenLibraryConfig,
+        contact_email="catalog@example.invalid",
+        base_url="https://catalog.example/",
+        request_timeout_seconds=4.5,
+        requests_per_second=2.5,
+    )
+
+    assert defaults.contact_email == "catalog@example.invalid"
+    assert defaults.base_url == "https://openlibrary.org"
+    assert defaults.request_timeout_seconds == 10.0
+    assert defaults.requests_per_second == 3.0
+    assert overrides.base_url == "https://catalog.example"
+    assert overrides.request_timeout_seconds == 4.5
+    assert overrides.requests_per_second == 2.5
+
+
+@pytest.mark.parametrize("requests_per_second", [0, -1, 3.1])
+def test_open_library_rejects_invalid_request_rates(requests_per_second: float) -> None:
+    """Reject nonpositive rates and values above the Open Library ceiling."""
+    with pytest.raises(ValidationError):
+        _without_dotenv(
+            OpenLibraryConfig,
+            contact_email="catalog@example.invalid",
+            requests_per_second=requests_per_second,
+        )
 
 
 def test_provider_selection_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
