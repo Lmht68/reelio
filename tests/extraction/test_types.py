@@ -72,6 +72,11 @@ def test_book_work_types_preserve_identity_and_provider_author_order() -> None:
     """Separate Book Work identity from display text and retain ordered provider data."""
     assert normalize_book_text("  A\u0308nne\tof Green\nGables  ") == "Änne of Green Gables"
     assert normalize_book_identity("  A\u0308NNE\tOF GREEN\nGABLES  ") == "änne of green gables"
+    assert normalize_book_identity("  CAFÉ,\tA TITLE.  ") == normalize_book_identity(
+        "cafe\u0301, a title."
+    )
+    assert normalize_book_identity("Café") != normalize_book_identity("Cafe")
+    assert normalize_book_identity("A Title.") != normalize_book_identity("A Title")
 
     mention = BookMention(
         title="Good Omens",

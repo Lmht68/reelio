@@ -167,12 +167,25 @@ def _search_response(*candidates: dict[str, object]) -> dict[str, object]:
     return {"docs": list(candidates)}
 
 
+def _work_record(work_id: str) -> dict[str, object]:
+    """Build one Open Library terminal Work identity response."""
+    return {"type": {"key": "/type/work"}, "key": f"/works/{work_id}"}
+
+
+def _terminal_work_response(request: httpx.Request) -> httpx.Response:
+    """Return a terminal Work identity record for a Work lookup request."""
+    work_id = request.url.path.removeprefix("/works/").removesuffix(".json")
+    return httpx.Response(200, json=_work_record(work_id))
+
+
 async def test_extract_returns_resolved_and_unresolved_exact_book_works() -> None:
     """Expose deduplicated exact Book Work results in first-reference order."""
     requests: list[httpx.Request] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
         if request.url.params["title"] == "Pride and Prejudice":
             return httpx.Response(
                 200,
@@ -201,10 +214,12 @@ async def test_extract_returns_resolved_and_unresolved_exact_book_works() -> Non
     assert response.status_code == 200
     assert len(interpretation_provider.calls) == 1
     assert http_client.is_closed is True
-    assert [request.url.params["title"] for request in requests] == [
+    searches = [request for request in requests if request.url.path == "/search.json"]
+    assert [request.url.params["title"] for request in searches] == [
         "Pride and Prejudice",
         "Unknown Book",
     ]
+    assert searches[0].url.params["author"] == "Jane Austen"
     payload = response.json()
     assert payload["market"] == "JP"
     assert payload["results"]["movies"] == []
@@ -239,6 +254,101 @@ async def test_extract_returns_resolved_and_unresolved_exact_book_works() -> Non
         {
             "status": "unresolved",
             "book_mention": {"title": "Unknown Book", "authors": []},
+            "book": None,
+        },
+    ]
+
+
+async def test_extract_resolves_fuzzy_authorful_books_and_leaves_authorless_ambiguity() -> None:
+    """Expose bounded resolver policy through the production-shaped HTTP endpoint."""
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        title = request.url.params["title"]
+        if title == "Pride and Prejudce":
+            return httpx.Response(
+                200,
+                json=_search_response(
+                    {
+                        "key": "/works/OL66554W",
+                        "title": "Pride and Prejudice",
+                        "author_key": ["OL21594A"],
+                        "author_name": ["Jane Austen"],
+                    }
+                ),
+            )
+        if title == "Shared Title":
+            return httpx.Response(
+                200,
+                json=_search_response(
+                    {
+                        "key": "/works/OL1W",
+                        "title": "Shared Title",
+                        "author_key": ["OL1A"],
+                        "author_name": ["First Author"],
+                    },
+                    {
+                        "key": "/works/OL2W",
+                        "title": "Shared Title",
+                        "author_key": ["OL2A"],
+                        "author_name": ["Second Author"],
+                    },
+                ),
+            )
+        raise AssertionError(f"unexpected Search request: {request.url}")
+
+    response, interpretation_provider, http_client = await _post_extract(
+        _interpretation_response(
+            [
+                {"title": "Pride and Prejudce", "authors": ["Jane Austen"]},
+                {"title": "Shared Title", "authors": []},
+            ]
+        ),
+        httpx.MockTransport(handle),
+    )
+
+    assert response.status_code == 200
+    assert len(interpretation_provider.calls) == 1
+    assert http_client.is_closed is True
+    searches = [request for request in requests if request.url.path == "/search.json"]
+    assert [
+        (request.url.params["title"], request.url.params.get("author")) for request in searches
+    ] == [
+        ("Pride and Prejudce", "Jane Austen"),
+        ("Shared Title", None),
+    ]
+    payload = response.json()
+    assert payload["statistics"]["books"] == {
+        "n_mentions": 2,
+        "n_resolved": 1,
+        "n_unresolved": 1,
+    }
+    assert payload["results"]["books"] == [
+        {
+            "status": "resolved",
+            "book_mention": {
+                "title": "Pride and Prejudce",
+                "authors": ["Jane Austen"],
+            },
+            "book": {
+                "title": "Pride and Prejudice",
+                "authors": [
+                    {
+                        "open_library_author_id": "OL21594A",
+                        "name": "Jane Austen",
+                        "open_library_url": "https://openlibrary.org/authors/OL21594A",
+                    }
+                ],
+                "open_library_work_id": "OL66554W",
+                "open_library_url": "https://openlibrary.org/works/OL66554W",
+            },
+        },
+        {
+            "status": "unresolved",
+            "book_mention": {"title": "Shared Title", "authors": []},
             "book": None,
         },
     ]
