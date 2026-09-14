@@ -216,6 +216,8 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                         "open_library_url": "https://openlibrary.org/books/OL12345M",
                         "cover_url": "https://covers.openlibrary.org/b/id/12345-L.jpg",
                     },
+                    "cover_url": "https://covers.openlibrary.org/b/id/12345-L.jpg",
+                    "cover_edition_id": "OL12345M",
                 },
             },
             {
@@ -441,6 +443,8 @@ def _to_book_schema(book: EnrichedBookWork) -> extraction_schemas.BookModel:
         open_library_work_id=book.open_library_work_id,
         open_library_url=book.open_library_url,
         edition=(_to_book_edition_schema(book.edition) if book.edition is not None else None),
+        cover_url=book.cover_url,
+        cover_edition_id=book.cover_edition_id,
     )
 
 
@@ -551,8 +555,12 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         "earliest-worldwide-date claims. Book Work Results retain their interpreted "
         "Book Mention and expose the Open Library Work title, provider-ordered Author "
         "Credits, Work ID, canonical URL, and nullable provider-preferred Edition "
-        "after a verified exact match. Edition selection uses English-first Open "
-        "Library relevance, with one unrestricted fallback for missing or audiobook "
+        "after a verified exact match. Book Work cover_url first uses the selected "
+        "Edition's own cover, then accepted Work Search cover metadata. A fallback "
+        "cover_edition_id is exposed when Open Library identifies its source Edition; "
+        "the fallback never populates edition.cover_url. Missing artwork returns null "
+        "Book Work cover fields without another request. Edition selection uses English-first "
+        "Open Library relevance, with one unrestricted fallback for missing or audiobook "
         "English results. Missing or audiobook Editions remain null, and selection is "
         "independent of Effective Market and Source Edition signals. Each Track "
         "Mention and Music Release "

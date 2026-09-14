@@ -241,6 +241,8 @@ class BookModel(BaseModel):
     open_library_work_id: str
     open_library_url: str
     edition: BookEditionModel | None
+    cover_url: str | None
+    cover_edition_id: str | None
 
 
 class BookResultModel(BaseModel):

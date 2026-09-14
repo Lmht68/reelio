@@ -251,6 +251,8 @@ def _enriched_book(book_mention: BookMention) -> EnrichedBookWork:
             open_library_url="https://openlibrary.org/books/OL12345M",
             cover_url="https://covers.openlibrary.org/b/id/12345-L.jpg",
         ),
+        cover_url="https://covers.openlibrary.org/b/id/67890-L.jpg",
+        cover_edition_id="OL67890M",
     )
 
 
@@ -659,6 +661,8 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
         "open_library_work_id",
         "open_library_url",
         "edition",
+        "cover_url",
+        "cover_edition_id",
     }
 
     resolved_movie = payload.results.movies[0]
@@ -777,6 +781,8 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
     )
     assert resolved_book.book.open_library_work_id == "OL66554W"
     assert resolved_book.book.open_library_url == "https://openlibrary.org/works/OL66554W"
+    assert resolved_book.book.cover_url == "https://covers.openlibrary.org/b/id/67890-L.jpg"
+    assert resolved_book.book.cover_edition_id == "OL67890M"
     assert resolved_book.book.edition is not None
     assert resolved_book.book.edition.title == "Pride and Prejudice: A Collector's Edition"
     assert resolved_book.book.edition.publication_year == 1813
@@ -1368,6 +1374,8 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
             "open_library_url": "https://openlibrary.org/books/OL12345M",
             "cover_url": "https://covers.openlibrary.org/b/id/12345-L.jpg",
         },
+        "cover_url": "https://covers.openlibrary.org/b/id/12345-L.jpg",
+        "cover_edition_id": "OL12345M",
     }
     unresolved_book_example = example["results"]["books"][1]
     assert unresolved_book_example["status"] == "unresolved"
@@ -1607,6 +1615,8 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "open_library_work_id",
         "open_library_url",
         "edition",
+        "cover_url",
+        "cover_edition_id",
     ]
     assert book_schema["properties"]["authors"] == {
         "items": {"$ref": "#/components/schemas/EnrichedAuthorCreditModel"},
@@ -1619,6 +1629,14 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
             {"type": "null"},
         ]
     }
+    assert book_schema["properties"]["cover_url"]["anyOf"] == [
+        {"type": "string"},
+        {"type": "null"},
+    ]
+    assert book_schema["properties"]["cover_edition_id"]["anyOf"] == [
+        {"type": "string"},
+        {"type": "null"},
+    ]
     book_edition_schema = schemas["BookEditionModel"]
     assert book_edition_schema["required"] == [
         "title",
@@ -1687,6 +1705,12 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert "Book Works" in operation["summary"]
     assert "Book Work Results retain their interpreted Book Mention" in operation["description"]
     assert "Open Library Work title" in operation["description"]
+    assert (
+        "Book Work cover_url first uses the selected Edition's own cover"
+        in operation["description"]
+    )
+    assert "the fallback never populates edition.cover_url" in operation["description"]
+    assert "Book Work cover fields without another request" in operation["description"]
     assert "English-first Open Library relevance" in operation["description"]
     assert (
         "unrestricted fallback for missing or audiobook English results" in operation["description"]

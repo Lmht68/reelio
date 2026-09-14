@@ -29,7 +29,8 @@ from tests.extraction.fakes import FakeMusicResolver, FakeScreenWorkResolver
 _CANONICAL_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 _WORK_SEARCH_FIELDS = (
     "key,title,alternative_title,author_key,author_name,"
-    "author_alternative_name,editions,editions.key,editions.title"
+    "author_alternative_name,editions,editions.key,editions.title,cover_i,"
+    "cover_edition_key"
 )
 _EDITION_SEARCH_FIELDS = (
     "key,editions,editions.key,editions.title,editions.format,"
@@ -295,6 +296,8 @@ async def test_extract_returns_resolved_and_unresolved_exact_book_works() -> Non
                 "open_library_work_id": "OL66554W",
                 "open_library_url": "https://openlibrary.org/works/OL66554W",
                 "edition": None,
+                "cover_url": None,
+                "cover_edition_id": None,
             },
         },
         {
@@ -391,6 +394,8 @@ async def test_extract_resolves_fuzzy_authorful_books_and_leaves_authorless_ambi
                 "open_library_work_id": "OL66554W",
                 "open_library_url": "https://openlibrary.org/works/OL66554W",
                 "edition": None,
+                "cover_url": None,
+                "cover_edition_id": None,
             },
         },
         {
@@ -471,11 +476,24 @@ async def test_extract_exposes_provider_preferred_editions_independent_of_source
                         ]
                     },
                 )
-            if query in {
-                "key:/works/OL2W AND language:eng",
-                "key:/works/OL2W",
-            }:
-                return httpx.Response(200, json={"docs": []})
+            if query == "key:/works/OL2W AND language:eng":
+                return httpx.Response(
+                    200,
+                    json={
+                        "docs": [
+                            {
+                                "key": "/works/OL2W",
+                                "editions": {
+                                    "docs": [
+                                        {
+                                            "key": "/books/OL1002M",
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                )
             raise AssertionError(f"unexpected preferred Edition Search: {request.url}")
         if request.url.path == "/books/OL1001M.json":
             return httpx.Response(
@@ -490,6 +508,13 @@ async def test_extract_exposes_provider_preferred_editions_independent_of_source
                     "covers": [0, 901],
                 },
             )
+        if request.url.path == "/books/OL1002M.json":
+            return httpx.Response(
+                200,
+                json={
+                    "key": "/books/OL1002M",
+                },
+            )
         if request.url.path.startswith("/works/"):
             return _terminal_work_response(request)
         title = request.url.params["title"]
@@ -497,12 +522,18 @@ async def test_extract_exposes_provider_preferred_editions_independent_of_source
             "Interpreted First Mention": "OL1W",
             "Interpreted Second Mention": "OL2W",
         }[title]
+        cover_id, cover_edition_key = {
+            "OL1W": (801, "OL2001M"),
+            "OL2W": (802, "OL2002M"),
+        }[work_id]
         return httpx.Response(
             200,
             json=_search_response(
                 {
                     "key": f"/works/{work_id}",
                     "title": title,
+                    "cover_i": cover_id,
+                    "cover_edition_key": cover_edition_key,
                 }
             ),
         )
@@ -543,17 +574,30 @@ async def test_extract_exposes_provider_preferred_editions_independent_of_source
         "open_library_url": "https://openlibrary.org/books/OL1001M",
         "cover_url": "https://covers.openlibrary.org/b/id/901-L.jpg",
     }
+    assert first_book["book"]["cover_url"] == "https://covers.openlibrary.org/b/id/901-L.jpg"
+    assert first_book["book"]["cover_edition_id"] == "OL1001M"
     assert first_book["book"]["edition"]["title"] != first_book["book_mention"]["title"]
     assert first_book["book"]["edition"]["title"] != first_book["book"]["title"]
     second_book = payload["results"]["books"][1]
     assert second_book["status"] == "resolved"
-    assert second_book["book"]["edition"] is None
+    assert second_book["book_mention"]["title"] == "Interpreted Second Mention"
+    assert second_book["book"]["edition"] == {
+        "title": None,
+        "publication_year": None,
+        "publishers": [],
+        "isbn_10": [],
+        "isbn_13": [],
+        "open_library_edition_id": "OL1002M",
+        "open_library_url": "https://openlibrary.org/books/OL1002M",
+        "cover_url": None,
+    }
+    assert second_book["book"]["cover_url"] == "https://covers.openlibrary.org/b/id/802-L.jpg"
+    assert second_book["book"]["cover_edition_id"] == "OL2002M"
     assert {
         request.url.params["q"] for request in requests if _is_preferred_edition_search(request)
     } == {
         "key:/works/OL1W AND language:eng",
         "key:/works/OL2W AND language:eng",
-        "key:/works/OL2W",
     }
     for request in requests:
         if not _is_preferred_edition_search(request):

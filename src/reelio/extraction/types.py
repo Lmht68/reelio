@@ -477,6 +477,8 @@ class EnrichedBookWork:
         open_library_work_id: Open Library Work identifier.
         open_library_url: Canonical Open Library URL for the Work.
         edition: Provider-preferred Book Edition when eligible and available.
+        cover_url: Selected presentation cover URL when available.
+        cover_edition_id: Source Open Library Edition ID for the presentation cover when known.
     """
 
     title: str
@@ -484,6 +486,8 @@ class EnrichedBookWork:
     open_library_work_id: str
     open_library_url: str
     edition: BookEdition | None
+    cover_url: str | None
+    cover_edition_id: str | None
 
 
 @dataclass

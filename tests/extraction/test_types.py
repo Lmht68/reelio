@@ -111,6 +111,8 @@ def test_book_work_types_preserve_identity_and_provider_author_order() -> None:
         open_library_work_id="OL149507W",
         open_library_url="https://openlibrary.org/works/OL149507W",
         edition=edition,
+        cover_url="https://covers.openlibrary.org/b/id/67890-L.jpg",
+        cover_edition_id="OL67890M",
     )
     result = BookResult(
         status=ResultStatus.RESOLVED,
@@ -130,6 +132,10 @@ def test_book_work_types_preserve_identity_and_provider_author_order() -> None:
         "https://openlibrary.org/authors/OL53379A",
     ]
     assert book.edition is edition
+    assert book.cover_url == "https://covers.openlibrary.org/b/id/67890-L.jpg"
+    assert book.cover_edition_id == "OL67890M"
+    assert book.edition.cover_url == "https://covers.openlibrary.org/b/id/12345-L.jpg"
+    assert book.edition.open_library_edition_id == "OL12345M"
     assert book.edition.title == "Good Omens: The Nice and Accurate Prophecies"
     assert book.edition.publishers == ["Gollancz", " Gollancz "]
     assert book.edition.isbn_10 == ["057504800X", "invalid-isbn"]

@@ -24,7 +24,8 @@ from reelio.extraction.types import (
 
 _WORK_SEARCH_FIELDS = (
     "key,title,alternative_title,author_key,author_name,"
-    "author_alternative_name,editions,editions.key,editions.title"
+    "author_alternative_name,editions,editions.key,editions.title,cover_i,"
+    "cover_edition_key"
 )
 _EDITION_SEARCH_FIELDS = (
     "key,editions,editions.key,editions.title,editions.format,"
@@ -85,6 +86,8 @@ def _candidate(
     alternative_titles: list[str] | None = None,
     author_aliases: list[str] | None = None,
     edition_titles: list[str] | None = None,
+    cover_id: int | None = None,
+    cover_edition_key: str | None = None,
 ) -> dict[str, object]:
     candidate: dict[str, object] = {"key": key, "title": title}
     if author_keys is not None:
@@ -97,6 +100,10 @@ def _candidate(
         candidate["author_alternative_name"] = author_aliases
     if edition_titles is not None:
         candidate["editions"] = {"docs": [{"title": value} for value in edition_titles]}
+    if cover_id is not None:
+        candidate["cover_i"] = cover_id
+    if cover_edition_key is not None:
+        candidate["cover_edition_key"] = cover_edition_key
     return candidate
 
 
@@ -180,6 +187,26 @@ def _redirect_record(work_id: str) -> dict[str, object]:
 def _terminal_work_response(request: httpx.Request) -> httpx.Response:
     work_id = request.url.path.removeprefix("/works/").removesuffix(".json")
     return httpx.Response(200, json=_work_record(work_id))
+
+
+def _assert_single_mention_cover_requests(
+    requests: list[httpx.Request],
+    selected_edition_id: str,
+) -> None:
+    assert [request.url.path for request in requests] == [
+        "/search.json",
+        "/works/OL1W.json",
+        "/search.json",
+        f"/books/{selected_edition_id}.json",
+    ]
+    assert all(request.url.host == "openlibrary.org" for request in requests)
+    assert not any(request.url.host == "covers.openlibrary.org" for request in requests)
+    assert not any(request.url.path.startswith("/covers/") for request in requests)
+    assert not any(request.url.path.startswith("/editions/") for request in requests)
+    assert [request.url.path for request in requests if request.url.path.startswith("/books/")] == [
+        f"/books/{selected_edition_id}.json"
+    ]
+    assert not any("isbn" in str(request.url).casefold() for request in requests)
 
 
 class _FakeClock:
@@ -967,7 +994,14 @@ async def test_resolver_selects_first_english_relevance_edition() -> None:
         return httpx.Response(
             200,
             json=_work_search_response(
-                _candidate("OL1W", "Provider Work", ["OL1A"], ["Author"]),
+                _candidate(
+                    "OL1W",
+                    "Provider Work",
+                    ["OL1A"],
+                    ["Author"],
+                    cover_id=802,
+                    cover_edition_key="/books/OL902M",
+                ),
             ),
         )
 
@@ -994,6 +1028,8 @@ async def test_resolver_selects_first_english_relevance_edition() -> None:
     assert result.book.edition.open_library_edition_id == "OL101M"
     assert result.book.edition.open_library_url == "https://openlibrary.org/books/OL101M"
     assert result.book.edition.cover_url == "https://covers.openlibrary.org/b/id/321-L.jpg"
+    assert result.book.cover_url == "https://covers.openlibrary.org/b/id/321-L.jpg"
+    assert result.book.cover_edition_id == "OL101M"
     edition_searches = [request for request in requests if _is_preferred_edition_search(request)]
     assert [dict(request.url.params) for request in edition_searches] == [
         {
@@ -1003,10 +1039,75 @@ async def test_resolver_selects_first_english_relevance_edition() -> None:
         }
     ]
     assert all("sort" not in request.url.params for request in edition_searches)
-    assert [request.url.path for request in requests if request.url.path.startswith("/books/")] == [
-        "/books/OL101M.json"
+    _assert_single_mention_cover_requests(requests, "OL101M")
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    ("cover_edition_key", "expected_cover_edition_id"),
+    [
+        ("OL902M", "OL902M"),
+        (None, None),
+    ],
+)
+async def test_resolver_uses_work_cover_fallback_without_reassigning_selected_edition(
+    cover_edition_key: str | None,
+    expected_cover_edition_id: str | None,
+) -> None:
+    """Retain a coverless selected Edition while exposing Work Search artwork."""
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if _is_preferred_edition_search(request):
+            assert request.url.params["q"] == "key:/works/OL1W AND language:eng"
+            return httpx.Response(
+                200,
+                json=_preferred_edition_search_response(
+                    "OL1W",
+                    _selected_edition("OL901M"),
+                ),
+            )
+        if request.url.path == "/books/OL901M.json":
+            return httpx.Response(200, json=_edition_record("OL901M"))
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate(
+                    "OL1W",
+                    "Target",
+                    cover_id=802,
+                    cover_edition_key=cover_edition_key,
+                )
+            ),
+        )
+
+    resolver = _resolver(
+        httpx.MockTransport(handle),
+        default_missing_preferred_edition=False,
+    )
+    results = await resolver.resolve(_mentions(BookMention(title="Target", authors=[])))
+
+    result = results.books[0]
+    assert result.status is ResultStatus.RESOLVED
+    assert result.book is not None
+    assert result.book.edition is not None
+    assert result.book.edition.open_library_edition_id == "OL901M"
+    assert result.book.edition.cover_url is None
+    assert result.book.cover_url == "https://covers.openlibrary.org/b/id/802-L.jpg"
+    assert result.book.cover_edition_id == expected_cover_edition_id
+    assert [
+        dict(request.url.params) for request in requests if _is_preferred_edition_search(request)
+    ] == [
+        {
+            "q": "key:/works/OL1W AND language:eng",
+            "fields": _EDITION_SEARCH_FIELDS,
+            "limit": "1",
+        }
     ]
-    assert not any("/editions" in request.url.path for request in requests)
+    _assert_single_mention_cover_requests(requests, "OL901M")
     await resolver.aclose()
 
 
@@ -1299,18 +1400,20 @@ async def test_resolver_does_not_reload_an_english_edition_rejected_as_audio() -
 
 async def test_resolver_returns_sparse_selected_edition_metadata() -> None:
     """Return valid Edition identity with nullable optional provider metadata."""
+    requests: list[httpx.Request] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         if _is_preferred_edition_search(request):
             return httpx.Response(
                 200,
                 json=_preferred_edition_search_response(
                     "OL1W",
-                    _selected_edition("OL701M"),
+                    _selected_edition("OL701M", cover_id=0),
                 ),
             )
         if request.url.path == "/books/OL701M.json":
-            return httpx.Response(200, json=_edition_record("OL701M"))
+            return httpx.Response(200, json=_edition_record("OL701M", covers=[0, -1]))
         if request.url.path.startswith("/works/"):
             return _terminal_work_response(request)
         return httpx.Response(200, json=_work_search_response(_candidate("OL1W", "Target")))
@@ -1321,14 +1424,19 @@ async def test_resolver_returns_sparse_selected_edition_metadata() -> None:
     )
     results = await resolver.resolve(_mentions(BookMention(title="Target", authors=[])))
 
-    assert results.books[0].book is not None
-    assert results.books[0].book.edition is not None
-    assert results.books[0].book.edition.title is None
-    assert results.books[0].book.edition.publication_year is None
-    assert results.books[0].book.edition.publishers == []
-    assert results.books[0].book.edition.isbn_10 == []
-    assert results.books[0].book.edition.isbn_13 == []
-    assert results.books[0].book.edition.cover_url is None
+    result = results.books[0]
+    assert result.status is ResultStatus.RESOLVED
+    assert result.book is not None
+    assert result.book.edition is not None
+    assert result.book.edition.title is None
+    assert result.book.edition.publication_year is None
+    assert result.book.edition.publishers == []
+    assert result.book.edition.isbn_10 == []
+    assert result.book.edition.isbn_13 == []
+    assert result.book.edition.cover_url is None
+    assert result.book.cover_url is None
+    assert result.book.cover_edition_id is None
+    _assert_single_mention_cover_requests(requests, "OL701M")
     await resolver.aclose()
 
 
@@ -1497,6 +1605,14 @@ async def test_resolver_maps_invalid_selected_edition_record_to_catalog_failure(
                 }
             ]
         },
+        _work_search_response(
+            _candidate(
+                "OL1W",
+                "Target",
+                cover_id=802,
+                cover_edition_key="not-an-edition",
+            )
+        ),
     ],
 )
 async def test_resolver_maps_invalid_search_responses_to_catalog_failure(

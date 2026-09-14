@@ -37,7 +37,8 @@ _SEARCH_LIMIT = 5
 _FUZZY_TITLE_SCORE_THRESHOLD = 80.0
 _WORK_SEARCH_FIELDS = (
     "key,title,alternative_title,author_key,author_name,"
-    "author_alternative_name,editions,editions.key,editions.title"
+    "author_alternative_name,editions,editions.key,editions.title,cover_i,"
+    "cover_edition_key"
 )
 _EDITION_SEARCH_FIELDS = (
     "key,editions,editions.key,editions.title,editions.format,"
@@ -84,6 +85,8 @@ class _OpenLibrarySearchCandidateModel(_OpenLibraryModel):
     alternative_title: list[str] | None = None
     author_alternative_name: list[str] | None = None
     editions: _OpenLibrarySearchEditionsModel | None = None
+    cover_i: int | None = None
+    cover_edition_key: str | None = None
 
 
 class _OpenLibraryPreferredEditionWorkModel(_OpenLibraryModel):
@@ -141,6 +144,8 @@ class _OpenLibraryCandidate:
     open_library_work_id: str
     candidate_titles: tuple[str, ...]
     author_aliases: tuple[str, ...]
+    cover_url: str | None
+    cover_edition_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +244,14 @@ class OpenLibraryBookResolver:
                 book=None,
             )
         edition = await self._select_preferred_edition(candidate.open_library_work_id)
+        cover_url: str | None
+        cover_edition_id: str | None
+        if edition is not None and edition.cover_url is not None:
+            cover_url = edition.cover_url
+            cover_edition_id = edition.open_library_edition_id
+        else:
+            cover_url = candidate.cover_url
+            cover_edition_id = candidate.cover_edition_id
 
         return BookResult(
             status=ResultStatus.RESOLVED,
@@ -251,6 +264,8 @@ class OpenLibraryBookResolver:
                     f"https://openlibrary.org/works/{candidate.open_library_work_id}"
                 ),
                 edition=edition,
+                cover_url=cover_url,
+                cover_edition_id=cover_edition_id,
             ),
         )
 
@@ -402,11 +417,7 @@ class OpenLibraryBookResolver:
                 isbn_13=record.isbn_13 or [],
                 open_library_edition_id=record_edition_id,
                 open_library_url=f"https://openlibrary.org/books/{record_edition_id}",
-                cover_url=(
-                    f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg"
-                    if cover_id is not None
-                    else None
-                ),
+                cover_url=_cover_url(cover_id),
             )
         except (ValidationError, ValueError) as exc:
             logger.error(
@@ -570,6 +581,16 @@ def _to_candidate(
         _require_provider_text(author_alias, "author alternative name")
         for author_alias in candidate_model.author_alternative_name or []
     )
+    cover_url = _cover_url(candidate_model.cover_i)
+    cover_edition_id = (
+        _parse_provider_id(
+            candidate_model.cover_edition_key,
+            _EDITION_ID_PATTERN,
+            "Edition",
+        )
+        if cover_url is not None and candidate_model.cover_edition_key is not None
+        else None
+    )
     return _OpenLibraryCandidate(
         title=primary_title,
         authors=authors,
@@ -580,7 +601,17 @@ def _to_candidate(
             *selected_edition_title,
         ),
         author_aliases=author_aliases,
+        cover_url=cover_url,
+        cover_edition_id=cover_edition_id,
     )
+
+
+def _cover_url(cover_id: int | None) -> str | None:
+    """Return the large HTTPS Open Library cover URL for a positive cover ID."""
+
+    if cover_id is None or cover_id <= 0:
+        return None
+    return f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg"
 
 
 def _unique_candidate_titles(*titles: str) -> tuple[str, ...]:
