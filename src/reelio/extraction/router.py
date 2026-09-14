@@ -9,6 +9,7 @@ from reelio.extraction import schemas as extraction_schemas
 from reelio.extraction.service import ExtractionPipelineProtocol
 from reelio.extraction.types import (
     ArtistCredit,
+    BookEdition,
     BookMention,
     BookResult,
     EnrichedAuthorCredit,
@@ -205,6 +206,16 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                     ],
                     "open_library_work_id": "OL66554W",
                     "open_library_url": "https://openlibrary.org/works/OL66554W",
+                    "edition": {
+                        "title": "Pride and Prejudice: A Collector's Edition",
+                        "publication_year": 1813,
+                        "publishers": ["T. Egerton"],
+                        "isbn_10": ["0141439513"],
+                        "isbn_13": ["9780141439518"],
+                        "open_library_edition_id": "OL12345M",
+                        "open_library_url": "https://openlibrary.org/books/OL12345M",
+                        "cover_url": "https://covers.openlibrary.org/b/id/12345-L.jpg",
+                    },
                 },
             },
             {
@@ -406,6 +417,21 @@ def _to_enriched_author_credit_schema(
     )
 
 
+def _to_book_edition_schema(
+    edition: BookEdition,
+) -> extraction_schemas.BookEditionModel:
+    return extraction_schemas.BookEditionModel(
+        title=edition.title,
+        publication_year=edition.publication_year,
+        publishers=edition.publishers,
+        isbn_10=edition.isbn_10,
+        isbn_13=edition.isbn_13,
+        open_library_edition_id=edition.open_library_edition_id,
+        open_library_url=edition.open_library_url,
+        cover_url=edition.cover_url,
+    )
+
+
 def _to_book_schema(book: EnrichedBookWork) -> extraction_schemas.BookModel:
     return extraction_schemas.BookModel(
         title=book.title,
@@ -414,6 +440,7 @@ def _to_book_schema(book: EnrichedBookWork) -> extraction_schemas.BookModel:
         ],
         open_library_work_id=book.open_library_work_id,
         open_library_url=book.open_library_url,
+        edition=(_to_book_edition_schema(book.edition) if book.edition is not None else None),
     )
 
 
@@ -523,7 +550,11 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         "sibling-release, release-family, inferred-subtype, or "
         "earliest-worldwide-date claims. Book Work Results retain their interpreted "
         "Book Mention and expose the Open Library Work title, provider-ordered Author "
-        "Credits, Work ID, and canonical URL after a verified exact match. Each Track "
+        "Credits, Work ID, canonical URL, and nullable provider-preferred Edition "
+        "after a verified exact match. Edition selection uses English-first Open "
+        "Library relevance, with one unrestricted fallback for missing or audiobook "
+        "English results. Missing or audiobook Editions remain null, and selection is "
+        "independent of Effective Market and Source Edition signals. Each Track "
         "Mention and Music Release "
         "Mention causes one Spotify search in the effective market at offset zero "
         "and limit three, using the Mention title and first ordered Artist Credit "

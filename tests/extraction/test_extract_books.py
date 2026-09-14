@@ -27,6 +27,14 @@ from reelio.main import app
 from tests.extraction.fakes import FakeMusicResolver, FakeScreenWorkResolver
 
 _CANONICAL_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+_WORK_SEARCH_FIELDS = (
+    "key,title,alternative_title,author_key,author_name,"
+    "author_alternative_name,editions,editions.key,editions.title"
+)
+_EDITION_SEARCH_FIELDS = (
+    "key,editions,editions.key,editions.title,editions.format,"
+    "editions.publish_year,editions.cover_i"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +67,11 @@ class _MetadataService:
 class _TranscriptionService:
     """Return deterministic transcript material for endpoint coverage."""
 
+    def __init__(self, text: str, language: str) -> None:
+        """Initialize deterministic transcript material for one request."""
+        self._text = text
+        self._language = language
+
     async def acquire(
         self,
         source: Source,
@@ -69,10 +82,33 @@ class _TranscriptionService:
         assert source.url == submitted_url
         assert prepared_audio is None
         return Transcript(
-            text="Pride and Prejudice by Jane Austen is a classic.",
-            language="en",
+            text=self._text,
+            language=self._language,
             method=TranscriptMethod.YOUTUBE_CAPTIONS,
         )
+
+
+class _AbsentPreferredEditionTransport(httpx.AsyncBaseTransport):
+    """Return nullable Edition Search data around existing resolver fixtures."""
+
+    def __init__(self, delegate: httpx.AsyncBaseTransport) -> None:
+        """Initialize the transport wrapping legacy Work-resolution responses."""
+        self._delegate = delegate
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        """Return absent preferred Editions or delegate Work-resolution requests."""
+        if _is_preferred_edition_search(request):
+            return httpx.Response(200, json={"docs": []})
+        return await self._delegate.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        """Close the wrapped provider transport."""
+        await self._delegate.aclose()
+
+
+def _is_preferred_edition_search(request: httpx.Request) -> bool:
+    """Return whether the provider request selects a Work's preferred Edition."""
+    return request.url.path == "/search.json" and "q" in request.url.params
 
 
 class _InterpretationProvider:
@@ -122,11 +158,20 @@ def _interpretation_response(books: list[dict[str, object]]) -> dict[str, object
 async def _post_extract(
     interpretation_response: dict[str, object],
     open_library_transport: httpx.AsyncBaseTransport,
+    *,
+    transcript_text: str = "Pride and Prejudice by Jane Austen is a classic.",
+    transcript_language: str = "en",
+    default_missing_preferred_edition: bool = True,
 ) -> tuple[httpx.Response, _InterpretationProvider, httpx.AsyncClient]:
     """Run the real Book extraction pipeline through the HTTP endpoint and close owners."""
+    catalog_transport = (
+        _AbsentPreferredEditionTransport(open_library_transport)
+        if default_missing_preferred_edition
+        else open_library_transport
+    )
     http_client = httpx.AsyncClient(
         base_url="https://openlibrary.test/",
-        transport=open_library_transport,
+        transport=catalog_transport,
         headers={"User-Agent": "Reelio (test@example.invalid)"},
     )
     book_resolver = OpenLibraryBookResolver(
@@ -138,7 +183,7 @@ async def _post_extract(
     interpretation_provider = _InterpretationProvider(interpretation_response)
     pipeline = ExtractionPipeline(
         _MetadataService(),
-        _TranscriptionService(),
+        _TranscriptionService(transcript_text, transcript_language),
         MentionInterpretationService(interpretation_provider, _interpretation_settings()),
         ExtractionResultAggregator(
             FakeScreenWorkResolver(),
@@ -249,6 +294,7 @@ async def test_extract_returns_resolved_and_unresolved_exact_book_works() -> Non
                 ],
                 "open_library_work_id": "OL66554W",
                 "open_library_url": "https://openlibrary.org/works/OL66554W",
+                "edition": None,
             },
         },
         {
@@ -344,6 +390,7 @@ async def test_extract_resolves_fuzzy_authorful_books_and_leaves_authorless_ambi
                 ],
                 "open_library_work_id": "OL66554W",
                 "open_library_url": "https://openlibrary.org/works/OL66554W",
+                "edition": None,
             },
         },
         {
@@ -391,4 +438,148 @@ async def test_extract_maps_open_library_timeout_to_pipeline_timeout() -> None:
             "code": "pipeline_timeout",
             "message": "Open Library catalog request timed out.",
         }
+    }
+
+
+async def test_extract_exposes_provider_preferred_editions_independent_of_source_signals() -> None:
+    """Keep Edition selection English-first and Work-ID-only through the HTTP endpoint."""
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if _is_preferred_edition_search(request):
+            query = request.url.params["q"]
+            if query == "key:/works/OL1W AND language:eng":
+                return httpx.Response(
+                    200,
+                    json={
+                        "docs": [
+                            {
+                                "key": "/works/OL1W",
+                                "editions": {
+                                    "docs": [
+                                        {
+                                            "key": "/books/OL1001M",
+                                            "title": "Search Edition Title",
+                                            "format": ["Print"],
+                                            "publish_year": [1995],
+                                            "cover_i": 101,
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                )
+            if query in {
+                "key:/works/OL2W AND language:eng",
+                "key:/works/OL2W",
+            }:
+                return httpx.Response(200, json={"docs": []})
+            raise AssertionError(f"unexpected preferred Edition Search: {request.url}")
+        if request.url.path == "/books/OL1001M.json":
+            return httpx.Response(
+                200,
+                json={
+                    "key": "/books/OL1001M",
+                    "title": "Provider Edition Title",
+                    "publishers": ["Example Press", " Example Press "],
+                    "isbn_10": ["0123456789", "not-an-isbn"],
+                    "isbn_13": ["9780123456786", "9780123456786"],
+                    "publish_date": "1995",
+                    "covers": [0, 901],
+                },
+            )
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        title = request.url.params["title"]
+        work_id = {
+            "Interpreted First Mention": "OL1W",
+            "Interpreted Second Mention": "OL2W",
+        }[title]
+        return httpx.Response(
+            200,
+            json=_search_response(
+                {
+                    "key": f"/works/{work_id}",
+                    "title": title,
+                }
+            ),
+        )
+
+    response, interpretation_provider, http_client = await _post_extract(
+        _interpretation_response(
+            [
+                {"title": "Interpreted First Mention", "authors": []},
+                {"title": "Interpreted Second Mention", "authors": []},
+            ]
+        ),
+        httpx.MockTransport(handle),
+        transcript_text=(
+            "Japanese narration discusses a French paperback audiobook from 2001 with "
+            "ISBN 9780123456786."
+        ),
+        transcript_language="ja",
+        default_missing_preferred_edition=False,
+    )
+
+    assert response.status_code == 200
+    assert len(interpretation_provider.calls) == 1
+    assert http_client.is_closed is True
+    payload = response.json()
+    assert payload["market"] == "JP"
+    assert payload["transcript"]["language"] == "ja"
+    first_book = payload["results"]["books"][0]
+    assert first_book["status"] == "resolved"
+    assert first_book["book_mention"]["title"] == "Interpreted First Mention"
+    assert first_book["book"]["title"] == "Interpreted First Mention"
+    assert first_book["book"]["edition"] == {
+        "title": "Provider Edition Title",
+        "publication_year": 1995,
+        "publishers": ["Example Press", " Example Press "],
+        "isbn_10": ["0123456789", "not-an-isbn"],
+        "isbn_13": ["9780123456786", "9780123456786"],
+        "open_library_edition_id": "OL1001M",
+        "open_library_url": "https://openlibrary.org/books/OL1001M",
+        "cover_url": "https://covers.openlibrary.org/b/id/901-L.jpg",
+    }
+    assert first_book["book"]["edition"]["title"] != first_book["book_mention"]["title"]
+    assert first_book["book"]["edition"]["title"] != first_book["book"]["title"]
+    second_book = payload["results"]["books"][1]
+    assert second_book["status"] == "resolved"
+    assert second_book["book"]["edition"] is None
+    assert {
+        request.url.params["q"] for request in requests if _is_preferred_edition_search(request)
+    } == {
+        "key:/works/OL1W AND language:eng",
+        "key:/works/OL2W AND language:eng",
+        "key:/works/OL2W",
+    }
+    for request in requests:
+        if not _is_preferred_edition_search(request):
+            continue
+        assert dict(request.url.params) == {
+            "q": request.url.params["q"],
+            "fields": _EDITION_SEARCH_FIELDS,
+            "limit": "1",
+        }
+        assert "JP" not in str(request.url)
+        assert "audiobook" not in request.url.params["q"].casefold()
+        assert "isbn" not in request.url.params["q"].casefold()
+    work_searches = [
+        request
+        for request in requests
+        if request.url.path == "/search.json" and not _is_preferred_edition_search(request)
+    ]
+    assert {tuple(sorted(request.url.params.items())) for request in work_searches} == {
+        (
+            ("fields", _WORK_SEARCH_FIELDS),
+            ("limit", "5"),
+            ("title", "Interpreted First Mention"),
+        ),
+        (
+            ("fields", _WORK_SEARCH_FIELDS),
+            ("limit", "5"),
+            ("title", "Interpreted Second Mention"),
+        ),
     }

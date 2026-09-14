@@ -442,6 +442,31 @@ class EnrichedAuthorCredit:
     open_library_url: str
 
 
+@dataclass(frozen=True, slots=True)
+class BookEdition:
+    """Contain provider-preferred metadata for one Book Edition.
+
+    Attributes:
+        title: Provider Edition title when available.
+        publication_year: Provider publication year when unambiguous and not future.
+        publishers: Provider publishers in supplied order without normalization.
+        isbn_10: Provider ISBN-10 values in supplied order without normalization.
+        isbn_13: Provider ISBN-13 values in supplied order without normalization.
+        open_library_edition_id: Open Library Edition identifier.
+        open_library_url: Canonical Open Library URL for the Edition.
+        cover_url: Provider Edition cover URL when available.
+    """
+
+    title: str | None
+    publication_year: int | None
+    publishers: list[str]
+    isbn_10: list[str]
+    isbn_13: list[str]
+    open_library_edition_id: str
+    open_library_url: str
+    cover_url: str | None
+
+
 @dataclass
 class EnrichedBookWork:
     """Contain provider-verified metadata for one Book Work.
@@ -451,12 +476,14 @@ class EnrichedBookWork:
         authors: Ordered Open Library-backed Author Credits.
         open_library_work_id: Open Library Work identifier.
         open_library_url: Canonical Open Library URL for the Work.
+        edition: Provider-preferred Book Edition when eligible and available.
     """
 
     title: str
     authors: list[EnrichedAuthorCredit]
     open_library_work_id: str
     open_library_url: str
+    edition: BookEdition | None
 
 
 @dataclass

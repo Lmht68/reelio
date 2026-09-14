@@ -220,6 +220,19 @@ class EnrichedAuthorCreditModel(BaseModel):
     open_library_url: str
 
 
+class BookEditionModel(BaseModel):
+    """Provider-preferred metadata for one Open Library Book Edition."""
+
+    title: str | None
+    publication_year: int | None
+    publishers: list[str]
+    isbn_10: list[str]
+    isbn_13: list[str]
+    open_library_edition_id: str
+    open_library_url: str
+    cover_url: str | None
+
+
 class BookModel(BaseModel):
     """Open Library-verified metadata for one Book Work."""
 
@@ -227,6 +240,7 @@ class BookModel(BaseModel):
     authors: list[EnrichedAuthorCreditModel]
     open_library_work_id: str
     open_library_url: str
+    edition: BookEditionModel | None
 
 
 class BookResultModel(BaseModel):

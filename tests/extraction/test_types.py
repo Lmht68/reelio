@@ -9,6 +9,7 @@ from reelio.extraction.types import (
     AlbumType,
     ArtistCredit,
     AuthorCredit,
+    BookEdition,
     BookMention,
     BookMentions,
     BookResult,
@@ -82,6 +83,17 @@ def test_book_work_types_preserve_identity_and_provider_author_order() -> None:
         title="Good Omens",
         authors=[AuthorCredit(name="Terry Pratchett"), AuthorCredit(name="Neil Gaiman")],
     )
+    edition = BookEdition(
+        title="Good Omens: The Nice and Accurate Prophecies",
+        publication_year=1990,
+        publishers=["Gollancz", " Gollancz "],
+        isbn_10=["057504800X", "invalid-isbn"],
+        isbn_13=["9780575048001", "9780575048001"],
+        open_library_edition_id="OL12345M",
+        open_library_url="https://openlibrary.org/books/OL12345M",
+        cover_url="https://covers.openlibrary.org/b/id/12345-L.jpg",
+    )
+
     book = EnrichedBookWork(
         title="Good Omens",
         authors=[
@@ -98,6 +110,7 @@ def test_book_work_types_preserve_identity_and_provider_author_order() -> None:
         ],
         open_library_work_id="OL149507W",
         open_library_url="https://openlibrary.org/works/OL149507W",
+        edition=edition,
     )
     result = BookResult(
         status=ResultStatus.RESOLVED,
@@ -116,6 +129,11 @@ def test_book_work_types_preserve_identity_and_provider_author_order() -> None:
         "https://openlibrary.org/authors/OL25782A",
         "https://openlibrary.org/authors/OL53379A",
     ]
+    assert book.edition is edition
+    assert book.edition.title == "Good Omens: The Nice and Accurate Prophecies"
+    assert book.edition.publishers == ["Gollancz", " Gollancz "]
+    assert book.edition.isbn_10 == ["057504800X", "invalid-isbn"]
+    assert book.edition.isbn_13 == ["9780575048001", "9780575048001"]
 
 
 def test_album_type_alias_matches_spotify_values() -> None:

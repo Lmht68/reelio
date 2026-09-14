@@ -42,6 +42,7 @@ from reelio.extraction.services.transcription.service import (
 from reelio.extraction.types import (
     ArtistCredit,
     AuthorCredit,
+    BookEdition,
     BookMention,
     BookMentions,
     BookResult,
@@ -240,6 +241,16 @@ def _enriched_book(book_mention: BookMention) -> EnrichedBookWork:
         ],
         open_library_work_id="OL66554W",
         open_library_url="https://openlibrary.org/works/OL66554W",
+        edition=BookEdition(
+            title="Pride and Prejudice: A Collector's Edition",
+            publication_year=1813,
+            publishers=["T. Egerton", " T. Egerton "],
+            isbn_10=["0141439513", "not-an-isbn"],
+            isbn_13=["9780141439518", "9780141439518"],
+            open_library_edition_id="OL12345M",
+            open_library_url="https://openlibrary.org/books/OL12345M",
+            cover_url="https://covers.openlibrary.org/b/id/12345-L.jpg",
+        ),
     )
 
 
@@ -647,6 +658,7 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
         "authors",
         "open_library_work_id",
         "open_library_url",
+        "edition",
     }
 
     resolved_movie = payload.results.movies[0]
@@ -765,6 +777,15 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
     )
     assert resolved_book.book.open_library_work_id == "OL66554W"
     assert resolved_book.book.open_library_url == "https://openlibrary.org/works/OL66554W"
+    assert resolved_book.book.edition is not None
+    assert resolved_book.book.edition.title == "Pride and Prejudice: A Collector's Edition"
+    assert resolved_book.book.edition.publication_year == 1813
+    assert resolved_book.book.edition.publishers == ["T. Egerton", " T. Egerton "]
+    assert resolved_book.book.edition.isbn_10 == ["0141439513", "not-an-isbn"]
+    assert resolved_book.book.edition.isbn_13 == ["9780141439518", "9780141439518"]
+    assert resolved_book.book.edition.open_library_edition_id == "OL12345M"
+    assert resolved_book.book.edition.open_library_url == "https://openlibrary.org/books/OL12345M"
+    assert resolved_book.book.edition.cover_url == "https://covers.openlibrary.org/b/id/12345-L.jpg"
     assert payload.results.books[1].status is ResultStatus.UNRESOLVED
     assert payload.results.books[1].book_mention.title == unresolved_book_mention.title
     assert payload.results.books[1].book_mention.authors == ["Unknown Author"]
@@ -1337,6 +1358,16 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         ],
         "open_library_work_id": "OL66554W",
         "open_library_url": "https://openlibrary.org/works/OL66554W",
+        "edition": {
+            "title": "Pride and Prejudice: A Collector's Edition",
+            "publication_year": 1813,
+            "publishers": ["T. Egerton"],
+            "isbn_10": ["0141439513"],
+            "isbn_13": ["9780141439518"],
+            "open_library_edition_id": "OL12345M",
+            "open_library_url": "https://openlibrary.org/books/OL12345M",
+            "cover_url": "https://covers.openlibrary.org/b/id/12345-L.jpg",
+        },
     }
     unresolved_book_example = example["results"]["books"][1]
     assert unresolved_book_example["status"] == "unresolved"
@@ -1575,12 +1606,57 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "authors",
         "open_library_work_id",
         "open_library_url",
+        "edition",
     ]
     assert book_schema["properties"]["authors"] == {
         "items": {"$ref": "#/components/schemas/EnrichedAuthorCreditModel"},
         "type": "array",
         "title": "Authors",
     }
+    assert book_schema["properties"]["edition"] == {
+        "anyOf": [
+            {"$ref": "#/components/schemas/BookEditionModel"},
+            {"type": "null"},
+        ]
+    }
+    book_edition_schema = schemas["BookEditionModel"]
+    assert book_edition_schema["required"] == [
+        "title",
+        "publication_year",
+        "publishers",
+        "isbn_10",
+        "isbn_13",
+        "open_library_edition_id",
+        "open_library_url",
+        "cover_url",
+    ]
+    assert book_edition_schema["properties"]["publishers"] == {
+        "items": {"type": "string"},
+        "type": "array",
+        "title": "Publishers",
+    }
+    assert book_edition_schema["properties"]["isbn_10"] == {
+        "items": {"type": "string"},
+        "type": "array",
+        "title": "Isbn 10",
+    }
+    assert book_edition_schema["properties"]["isbn_13"] == {
+        "items": {"type": "string"},
+        "type": "array",
+        "title": "Isbn 13",
+    }
+    assert book_edition_schema["properties"]["title"]["anyOf"] == [
+        {"type": "string"},
+        {"type": "null"},
+    ]
+    assert book_edition_schema["properties"]["publication_year"]["anyOf"] == [
+        {"type": "integer"},
+        {"type": "null"},
+    ]
+    assert book_edition_schema["properties"]["cover_url"]["anyOf"] == [
+        {"type": "string"},
+        {"type": "null"},
+    ]
     enriched_author_credit_schema = schemas["EnrichedAuthorCreditModel"]
     assert enriched_author_credit_schema["required"] == [
         "open_library_author_id",
@@ -1611,6 +1687,11 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert "Book Works" in operation["summary"]
     assert "Book Work Results retain their interpreted Book Mention" in operation["description"]
     assert "Open Library Work title" in operation["description"]
+    assert "English-first Open Library relevance" in operation["description"]
+    assert (
+        "unrestricted fallback for missing or audiobook English results" in operation["description"]
+    )
+    assert "independent of Effective Market and Source Edition signals" in operation["description"]
     assert (
         "Any TMDB, Spotify, or Open Library provider failure fails the complete request."
         in operation["description"]

@@ -3,8 +3,9 @@
 import asyncio
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
+from datetime import date
 from time import monotonic
 from typing import cast
 
@@ -15,6 +16,7 @@ from rapidfuzz import fuzz
 from reelio.extraction.exceptions import CatalogProviderError, PipelineTimeoutError
 from reelio.extraction.services.enrichment.config import OpenLibraryConfig
 from reelio.extraction.types import (
+    BookEdition,
     BookMention,
     BookMentions,
     BookResult,
@@ -33,24 +35,37 @@ _TIMEOUT_ERROR_MESSAGE = "Open Library catalog request timed out."
 _STAGE = "book_work_resolution"
 _SEARCH_LIMIT = 5
 _FUZZY_TITLE_SCORE_THRESHOLD = 80.0
-_SEARCH_FIELDS = (
+_WORK_SEARCH_FIELDS = (
     "key,title,alternative_title,author_key,author_name,"
     "author_alternative_name,editions,editions.key,editions.title"
 )
+_EDITION_SEARCH_FIELDS = (
+    "key,editions,editions.key,editions.title,editions.format,"
+    "editions.publish_year,editions.cover_i"
+)
 _WORK_ID_PATTERN = re.compile(r"(?:/works/)?(OL[0-9]+W)")
 _AUTHOR_ID_PATTERN = re.compile(r"(?:/authors/)?(OL[0-9]+A)")
+_EDITION_ID_PATTERN = re.compile(r"(?:/books/)?(OL[0-9]+M)")
+_PUBLICATION_YEAR_PATTERN = re.compile(r"(?<!\d)\d{4}(?!\d)")
+_AUDIOBOOK_FORMAT_PATTERN = re.compile(
+    r"(?<!\w)(?:audio|audiobook|audio book|sound recording|cassette|mp3)(?!\w)"
+)
 
 
 class _OpenLibraryModel(BaseModel):
     """Ignore unknown Open Library fields at the resolver boundary."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", strict=True)
 
 
 class _OpenLibrarySearchEditionModel(_OpenLibraryModel):
-    """Model the query-selected Edition title used only for identity matching."""
+    """Model nested Open Library Search Edition metadata."""
 
-    title: str = Field(min_length=1)
+    key: str | None = None
+    title: str | None = None
+    format: list[str] | None = None
+    publish_year: list[int] | None = None
+    cover_i: int | None = None
 
 
 class _OpenLibrarySearchEditionsModel(_OpenLibraryModel):
@@ -68,6 +83,13 @@ class _OpenLibrarySearchCandidateModel(_OpenLibraryModel):
     author_name: list[str] | None = None
     alternative_title: list[str] | None = None
     author_alternative_name: list[str] | None = None
+    editions: _OpenLibrarySearchEditionsModel | None = None
+
+
+class _OpenLibraryPreferredEditionWorkModel(_OpenLibraryModel):
+    """Model one Work result used only for preferred Edition selection."""
+
+    key: str = Field(min_length=1)
     editions: _OpenLibrarySearchEditionsModel | None = None
 
 
@@ -91,6 +113,25 @@ class _OpenLibrarySearchResponseModel(_OpenLibraryModel):
     docs: list[_OpenLibrarySearchCandidateModel]
 
 
+class _OpenLibraryPreferredEditionSearchResponseModel(_OpenLibraryModel):
+    """Model a Search response for one relevance-selected Work Edition."""
+
+    docs: list[_OpenLibraryPreferredEditionWorkModel]
+
+
+class _OpenLibraryEditionRecordModel(_OpenLibraryModel):
+    """Model one direct Open Library Edition record."""
+
+    key: str = Field(min_length=1)
+    title: str | None = None
+    publishers: list[str] | None = None
+    isbn_10: list[str] | None = None
+    isbn_13: list[str] | None = None
+    publish_date: str | None = None
+    physical_format: str | None = None
+    covers: list[int] | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class _OpenLibraryCandidate:
     """Contain bounded Work metadata used for Book Work matching."""
@@ -100,6 +141,17 @@ class _OpenLibraryCandidate:
     open_library_work_id: str
     candidate_titles: tuple[str, ...]
     author_aliases: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenLibrarySelectedEdition:
+    """Contain Search metadata for one relevance-selected Open Library Edition."""
+
+    open_library_edition_id: str
+    title: str | None
+    formats: tuple[str, ...]
+    publication_year: int | None
+    cover_id: int | None
 
 
 class OpenLibraryBookResolver:
@@ -186,6 +238,8 @@ class OpenLibraryBookResolver:
                 book_mention=book_mention,
                 book=None,
             )
+        edition = await self._select_preferred_edition(candidate.open_library_work_id)
+
         return BookResult(
             status=ResultStatus.RESOLVED,
             book_mention=book_mention,
@@ -196,6 +250,7 @@ class OpenLibraryBookResolver:
                 open_library_url=(
                     f"https://openlibrary.org/works/{candidate.open_library_work_id}"
                 ),
+                edition=edition,
             ),
         )
 
@@ -206,7 +261,7 @@ class OpenLibraryBookResolver:
     ) -> list[_OpenLibraryCandidate]:
         params: dict[str, str | int] = {
             "title": title,
-            "fields": _SEARCH_FIELDS,
+            "fields": _WORK_SEARCH_FIELDS,
             "limit": _SEARCH_LIMIT,
         }
         if author is not None:
@@ -226,6 +281,140 @@ class OpenLibraryBookResolver:
             )
             raise CatalogProviderError(_CATALOG_ERROR_MESSAGE) from exc
 
+    async def _select_preferred_edition(self, work_id: str) -> BookEdition | None:
+        english_selected_edition = await self._search_preferred_edition(
+            work_id,
+            require_english=True,
+        )
+        if english_selected_edition is not None and not _is_explicit_audiobook(
+            english_selected_edition.formats
+        ):
+            english_edition = await self._load_selected_edition(english_selected_edition)
+            if english_edition is not None:
+                return english_edition
+            rejected_edition_id = english_selected_edition.open_library_edition_id
+        elif english_selected_edition is not None:
+            rejected_edition_id = english_selected_edition.open_library_edition_id
+        else:
+            rejected_edition_id = None
+
+        fallback_selected_edition = await self._search_preferred_edition(
+            work_id,
+            require_english=False,
+        )
+        if (
+            fallback_selected_edition is None
+            or fallback_selected_edition.open_library_edition_id == rejected_edition_id
+            or _is_explicit_audiobook(fallback_selected_edition.formats)
+        ):
+            return None
+        return await self._load_selected_edition(fallback_selected_edition)
+
+    async def _search_preferred_edition(
+        self,
+        work_id: str,
+        *,
+        require_english: bool,
+    ) -> _OpenLibrarySelectedEdition | None:
+        query = f"key:/works/{work_id}"
+        if require_english:
+            query = f"{query} AND language:eng"
+
+        response = await self._get_catalog_response(
+            "/search.json",
+            {"q": query, "fields": _EDITION_SEARCH_FIELDS, "limit": 1},
+        )
+        try:
+            response_model = _OpenLibraryPreferredEditionSearchResponseModel.model_validate(
+                cast(object, response.json())
+            )
+            if not response_model.docs:
+                return None
+            selected_work = response_model.docs[0]
+            selected_work_id = _parse_provider_id(
+                selected_work.key,
+                _WORK_ID_PATTERN,
+                "Work",
+            )
+            if selected_work_id != work_id:
+                raise ValueError("Open Library preferred Edition Work ID does not match")
+            if selected_work.editions is None or not selected_work.editions.docs:
+                return None
+            selected_edition = selected_work.editions.docs[0]
+            if selected_edition.key is None:
+                raise ValueError("Open Library Edition ID is missing")
+            return _OpenLibrarySelectedEdition(
+                open_library_edition_id=_parse_provider_id(
+                    selected_edition.key,
+                    _EDITION_ID_PATTERN,
+                    "Edition",
+                ),
+                title=_optional_provider_text(selected_edition.title),
+                formats=tuple(selected_edition.format or []),
+                publication_year=(
+                    selected_edition.publish_year[0] if selected_edition.publish_year else None
+                ),
+                cover_id=selected_edition.cover_i,
+            )
+        except (ValidationError, ValueError) as exc:
+            logger.error(
+                "Open Library catalog response validation failed",
+                extra={"stage": _STAGE, "reason": "invalid_provider_response"},
+            )
+            raise CatalogProviderError(_CATALOG_ERROR_MESSAGE) from exc
+
+    async def _load_selected_edition(
+        self,
+        selected_edition: _OpenLibrarySelectedEdition,
+    ) -> BookEdition | None:
+        response = await self._get_catalog_response(
+            f"/books/{selected_edition.open_library_edition_id}.json"
+        )
+        try:
+            record = _OpenLibraryEditionRecordModel.model_validate(cast(object, response.json()))
+            record_edition_id = _parse_provider_id(
+                record.key,
+                _EDITION_ID_PATTERN,
+                "Edition",
+            )
+            if record_edition_id != selected_edition.open_library_edition_id:
+                raise ValueError("Open Library Edition record ID does not match")
+            formats = (*selected_edition.formats,)
+            if record.physical_format is not None:
+                formats += (record.physical_format,)
+            if _is_explicit_audiobook(formats):
+                return None
+            cover_id = next(
+                (cover_id for cover_id in record.covers or [] if cover_id > 0),
+                selected_edition.cover_id,
+            )
+            return BookEdition(
+                title=(
+                    _optional_provider_text(record.title)
+                    or _optional_provider_text(selected_edition.title)
+                ),
+                publication_year=_publication_year(
+                    selected_edition.publication_year,
+                    record.publish_date,
+                ),
+                publishers=record.publishers or [],
+                isbn_10=record.isbn_10 or [],
+                isbn_13=record.isbn_13 or [],
+                open_library_edition_id=record_edition_id,
+                open_library_url=f"https://openlibrary.org/books/{record_edition_id}",
+                cover_url=(
+                    f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg"
+                    if cover_id is not None
+                    else None
+                ),
+            )
+        except (ValidationError, ValueError) as exc:
+            logger.error(
+                "Open Library catalog response validation failed",
+                extra={"stage": _STAGE, "reason": "invalid_provider_response"},
+            )
+            raise CatalogProviderError(_CATALOG_ERROR_MESSAGE) from exc
+
     async def _get_catalog_response(
         self,
         path: str,
@@ -233,7 +422,13 @@ class OpenLibraryBookResolver:
     ) -> httpx.Response:
         try:
             await self._await_request_turn()
-            response = await self._client.get(path, params=params)
+            try:
+                response = await self._client.get(path, params=params)
+            except httpx.TimeoutException:
+                raise
+            except httpx.TransportError:
+                await self._await_request_turn()
+                response = await self._client.get(path, params=params)
             response.raise_for_status()
         except httpx.TimeoutException as exc:
             logger.error(
@@ -365,13 +560,12 @@ def _to_candidate(
         for title in candidate_model.alternative_title or []
     )
     selected_edition_title: tuple[str, ...] = ()
-    if candidate_model.editions is not None and candidate_model.editions.docs:
-        selected_edition_title = (
-            _require_provider_text(
-                candidate_model.editions.docs[0].title,
-                "query-selected Edition title",
-            ),
-        )
+    if candidate_model.editions is not None:
+        for edition in candidate_model.editions.docs:
+            edition_title = _optional_provider_text(edition.title)
+            if edition_title is not None:
+                selected_edition_title = (edition_title,)
+                break
     author_aliases = tuple(
         _require_provider_text(author_alias, "author alternative name")
         for author_alias in candidate_model.author_alternative_name or []
@@ -414,6 +608,38 @@ def _require_provider_text(value: str, field_name: str) -> str:
     if not normalize_book_text(value):
         raise ValueError(f"Open Library {field_name} is blank")
     return value
+
+
+def _optional_provider_text(value: str | None) -> str | None:
+    """Return provider text unchanged when it contains non-whitespace content."""
+
+    if value is None or not normalize_book_text(value):
+        return None
+    return value
+
+
+def _is_explicit_audiobook(formats: Iterable[str]) -> bool:
+    """Return whether provider format metadata explicitly identifies an audiobook."""
+
+    return any(
+        _AUDIOBOOK_FORMAT_PATTERN.search(" ".join(format_value.split()).casefold()) is not None
+        for format_value in formats
+    )
+
+
+def _publication_year(numeric_year: int | None, publication_date: str | None) -> int | None:
+    """Return a non-future provider publication year when it is unambiguous."""
+
+    current_year = date.today().year
+    if numeric_year is not None:
+        return numeric_year if numeric_year <= current_year else None
+    if publication_date is None:
+        return None
+    years = _PUBLICATION_YEAR_PATTERN.findall(publication_date)
+    if len(years) != 1:
+        return None
+    publication_year = int(years[0])
+    return publication_year if publication_year <= current_year else None
 
 
 def _select_unique_exact_candidate(
