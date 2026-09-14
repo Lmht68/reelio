@@ -1,4 +1,4 @@
-"""Screen Work and Music Mention interpretation adapter contract tests."""
+"""Mention interpretation provider contract tests."""
 
 import json
 import logging
@@ -16,7 +16,7 @@ import reelio.extraction.services.interpretation.deepseek as deepseek_adapter
 from reelio.extraction.exceptions import (
     InterpretationInputTooLargeError,
     InvalidLLMResponseError,
-    MovieMentionInterpretationError,
+    MentionInterpretationError,
     PipelineTimeoutError,
 )
 from reelio.extraction.services.interpretation.config import (
@@ -63,7 +63,7 @@ class _FakeProvider:
     def __init__(
         self,
         responses: Sequence[str] = (),
-        error: MovieMentionInterpretationError | None = None,
+        error: MentionInterpretationError | None = None,
     ) -> None:
         self.responses = deque(responses)
         self.error = error
@@ -721,12 +721,12 @@ async def test_second_queued_response_is_not_used_for_repair() -> None:
 
 
 async def test_provider_failure_preserves_interpretation_exception_policy() -> None:
-    """Propagate the provider's typed Movie Mention interpretation failure."""
-    provider_error = MovieMentionInterpretationError("provider unavailable")
+    """Propagate the provider's typed mention interpretation failure."""
+    provider_error = MentionInterpretationError("provider unavailable")
     provider = _FakeProvider(error=provider_error)
     service = MentionInterpretationService(provider, _settings())
 
-    with pytest.raises(MovieMentionInterpretationError) as error:
+    with pytest.raises(MentionInterpretationError) as error:
         await service.interpret(_source(), _transcript("Dune."))
 
     assert error.value is provider_error
@@ -1132,7 +1132,7 @@ async def test_deepseek_adapter_sends_json_options_and_closes_client() -> None:
                 httpx.Request("POST", "https://api.deepseek.com/chat/completions"),
                 body=None,
             ),
-            MovieMentionInterpretationError,
+            MentionInterpretationError,
         ),
     ],
 )

@@ -70,14 +70,14 @@ class TranscriptionError(ExtractionError):
     status_code = 502
 
 
-class MovieMentionInterpretationError(ExtractionError):
-    """Indicate that Movie Mention interpretation failed."""
+class MentionInterpretationError(ExtractionError):
+    """Indicate that mention interpretation failed."""
 
-    code = "movie_mention_interpretation_failed"
+    code = "mention_interpretation_failed"
     status_code = 502
 
 
-class InvalidLLMResponseError(MovieMentionInterpretationError):
+class InvalidLLMResponseError(MentionInterpretationError):
     """Indicate that the LLM returned malformed or invalid structured output."""
 
     code = "invalid_llm_response"

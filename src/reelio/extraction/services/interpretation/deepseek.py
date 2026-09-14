@@ -7,17 +7,18 @@ from openai import APIError, APITimeoutError, AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
 from reelio.extraction.exceptions import (
-    MovieMentionInterpretationError,
+    MentionInterpretationError,
     PipelineTimeoutError,
 )
 from reelio.extraction.services.interpretation.config import (
     DeepSeekConfig,
     LLMProvider,
 )
+from reelio.extraction.services.interpretation.messages import (
+    PROVIDER_ERROR_MESSAGE,
+    PROVIDER_TIMEOUT_MESSAGE,
+)
 from reelio.extraction.services.interpretation.types import LLMMessage
-
-_PROVIDER_ERROR_MESSAGE = "Movie Mention interpretation provider failed."
-_PROVIDER_TIMEOUT_MESSAGE = "Movie Mention interpretation timed out."
 
 
 class DeepSeekProvider:
@@ -54,7 +55,7 @@ class DeepSeekProvider:
 
         Raises:
             PipelineTimeoutError: If the provider exhausts its timeout retries.
-            MovieMentionInterpretationError: If the provider request otherwise fails.
+            MentionInterpretationError: If the provider request otherwise fails.
         """
         provider_messages = cast(
             list[ChatCompletionMessageParam],
@@ -70,9 +71,9 @@ class DeepSeekProvider:
                 extra_body={"thinking": {"type": "disabled"}},
             )
         except APITimeoutError as exc:
-            raise PipelineTimeoutError(_PROVIDER_TIMEOUT_MESSAGE) from exc
+            raise PipelineTimeoutError(PROVIDER_TIMEOUT_MESSAGE) from exc
         except APIError as exc:
-            raise MovieMentionInterpretationError(_PROVIDER_ERROR_MESSAGE) from exc
+            raise MentionInterpretationError(PROVIDER_ERROR_MESSAGE) from exc
 
         if not response.choices:
             return ""

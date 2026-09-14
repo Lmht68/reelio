@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from reelio.extraction.exceptions import (
     InterpretationInputTooLargeError,
     InvalidLLMResponseError,
-    MovieMentionInterpretationError,
+    MentionInterpretationError,
     PipelineTimeoutError,
 )
 from reelio.extraction.services.interpretation.config import (
@@ -45,7 +45,7 @@ from reelio.extraction.types import (
 logger = logging.getLogger(__name__)
 
 _INPUT_LIMIT_MESSAGE = "Interpretation Material exceeds the configured limit."
-_INVALID_RESPONSE_MESSAGE = "The LLM returned an invalid Movie Mention response."
+_INVALID_RESPONSE_MESSAGE = "The LLM returned an invalid mention interpretation response."
 _STAGE = "mention_interpretation"
 
 
@@ -72,7 +72,7 @@ class MentionInterpretationProvider(Protocol):
             str: Raw structured response content.
 
         Raises:
-            MovieMentionInterpretationError: If the provider request fails.
+            MentionInterpretationError: If the provider request fails.
             PipelineTimeoutError: If the provider request times out.
         """
         ...
@@ -118,7 +118,7 @@ class MentionInterpretationService:
             InterpretationInputTooLargeError: If any Interpretation Material field
                 exceeds its configured limit.
             InvalidLLMResponseError: If the provider returns malformed or invalid JSON.
-            MovieMentionInterpretationError: If the provider request fails.
+            MentionInterpretationError: If the provider request fails.
             PipelineTimeoutError: If the provider request times out.
         """
         self._validate_input_limits(source, transcript)
@@ -137,7 +137,7 @@ class MentionInterpretationService:
         started_at = perf_counter()
         try:
             response_content = await self._provider.complete(messages)
-        except (MovieMentionInterpretationError, PipelineTimeoutError) as exc:
+        except (MentionInterpretationError, PipelineTimeoutError) as exc:
             logger.error(
                 "mention interpretation provider request failed",
                 extra={

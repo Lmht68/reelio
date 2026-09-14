@@ -8,15 +8,17 @@ from openai.types.responses import ResponseInputParam, ResponseTextConfigParam
 from openai.types.shared_params import Reasoning
 
 from reelio.extraction.exceptions import (
-    MovieMentionInterpretationError,
+    MentionInterpretationError,
     PipelineTimeoutError,
 )
 from reelio.extraction.services.interpretation.config import LLMProvider, OpenAIConfig
+from reelio.extraction.services.interpretation.messages import (
+    PROVIDER_ERROR_MESSAGE,
+    PROVIDER_TIMEOUT_MESSAGE,
+)
 from reelio.extraction.services.interpretation.schemas import InterpretationResponse
 from reelio.extraction.services.interpretation.types import LLMMessage
 
-_PROVIDER_ERROR_MESSAGE = "Movie Mention interpretation provider failed."
-_PROVIDER_TIMEOUT_MESSAGE = "Movie Mention interpretation timed out."
 _RESPONSE_SCHEMA_NAME = "mention_interpretation"
 _OFFICIAL_BASE_URL = "https://api.openai.com/v1"
 
@@ -55,7 +57,7 @@ class OpenAIProvider:
 
         Raises:
             PipelineTimeoutError: If the provider exhausts its timeout retries.
-            MovieMentionInterpretationError: If the provider rejects, truncates, or
+            MentionInterpretationError: If the provider rejects, truncates, or
                 otherwise fails the request.
         """
         provider_messages = cast(
@@ -84,12 +86,12 @@ class OpenAIProvider:
                 text=response_format,
             )
         except APITimeoutError as exc:
-            raise PipelineTimeoutError(_PROVIDER_TIMEOUT_MESSAGE) from exc
+            raise PipelineTimeoutError(PROVIDER_TIMEOUT_MESSAGE) from exc
         except APIError as exc:
-            raise MovieMentionInterpretationError(_PROVIDER_ERROR_MESSAGE) from exc
+            raise MentionInterpretationError(PROVIDER_ERROR_MESSAGE) from exc
 
         if response.status != "completed" or not response.output_text:
-            raise MovieMentionInterpretationError(_PROVIDER_ERROR_MESSAGE)
+            raise MentionInterpretationError(PROVIDER_ERROR_MESSAGE)
         return response.output_text
 
     async def aclose(self) -> None:

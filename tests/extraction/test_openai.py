@@ -10,7 +10,7 @@ from openai import APIError, APITimeoutError, AsyncOpenAI
 
 import reelio.extraction.services.interpretation.openai as openai_adapter
 from reelio.extraction.exceptions import (
-    MovieMentionInterpretationError,
+    MentionInterpretationError,
     PipelineTimeoutError,
 )
 from reelio.extraction.services.interpretation.config import LLMProvider, OpenAIConfig
@@ -163,7 +163,7 @@ async def test_openai_adapter_maps_refusal_response() -> None:
     fake_client = _FakeOpenAIClient(_FakeResponses(refusal_response))
     provider = OpenAIProvider(cast(AsyncOpenAI, fake_client), _settings())
 
-    with pytest.raises(MovieMentionInterpretationError):
+    with pytest.raises(MentionInterpretationError):
         await provider.complete([])
 
 
@@ -174,7 +174,7 @@ async def test_openai_adapter_maps_incomplete_response() -> None:
     )
     provider = OpenAIProvider(cast(AsyncOpenAI, fake_client), _settings())
 
-    with pytest.raises(MovieMentionInterpretationError):
+    with pytest.raises(MentionInterpretationError):
         await provider.complete([])
 
 
@@ -185,16 +185,17 @@ async def test_openai_adapter_maps_missing_output() -> None:
     )
     provider = OpenAIProvider(cast(AsyncOpenAI, fake_client), _settings())
 
-    with pytest.raises(MovieMentionInterpretationError):
+    with pytest.raises(MentionInterpretationError):
         await provider.complete([])
 
 
 @pytest.mark.parametrize(
-    ("error", "expected_error"),
+    ("error", "expected_error", "expected_message"),
     [
         (
             APITimeoutError(httpx.Request("POST", "https://api.openai.com/v1/responses")),
             PipelineTimeoutError,
+            "Mention interpretation timed out.",
         ),
         (
             APIError(
@@ -202,17 +203,21 @@ async def test_openai_adapter_maps_missing_output() -> None:
                 httpx.Request("POST", "https://api.openai.com/v1/responses"),
                 body=None,
             ),
-            MovieMentionInterpretationError,
+            MentionInterpretationError,
+            "Mention interpretation provider failed.",
         ),
     ],
 )
 async def test_openai_adapter_maps_sdk_failures(
     error: APIError,
     expected_error: type[Exception],
+    expected_message: str,
 ) -> None:
     """Translate OpenAI SDK exceptions to provider-neutral extraction failures."""
     fake_client = _FakeOpenAIClient(_FakeResponses(error=error))
     provider = OpenAIProvider(cast(AsyncOpenAI, fake_client), _settings())
 
-    with pytest.raises(expected_error):
+    with pytest.raises(expected_error) as caught_error:
         await provider.complete([])
+
+    assert str(caught_error.value) == expected_message

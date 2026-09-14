@@ -18,8 +18,8 @@ from reelio.extraction.exceptions import (
     InterpretationInputTooLargeError,
     InvalidLLMResponseError,
     InvalidSourceError,
+    MentionInterpretationError,
     MetadataProviderError,
-    MovieMentionInterpretationError,
     PipelineTimeoutError,
     SourceUnavailableError,
     TranscriptionError,
@@ -1100,9 +1100,9 @@ async def test_concurrent_whisper_http_requests_queue_and_succeed(
         ),
         (TranscriptionError("transcription failed"), 502, "transcription_failed"),
         (
-            MovieMentionInterpretationError("movie mention interpretation failed"),
+            MentionInterpretationError("mention interpretation failed"),
             502,
-            "movie_mention_interpretation_failed",
+            "mention_interpretation_failed",
         ),
         (
             InvalidLLMResponseError("invalid provider response"),
