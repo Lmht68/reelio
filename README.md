@@ -1,6 +1,6 @@
 # Reelio
 
-Reelio is a FastAPI service that extracts Movie, TV Series, Track, and Music Release Mentions from public social-media videos, verifies Screen Works against TMDB and Music against Spotify, and returns grouped enriched results.
+Reelio is a FastAPI service that extracts Movie, TV Series, Track, Music Release, and Book Work Mentions from public social-media videos, verifies Screen Works against TMDB, Music against Spotify, and Books against Open Library, then returns grouped enriched results.
 
 ## Overview
 
@@ -15,13 +15,14 @@ The extraction pipeline:
 7. Searches TMDB's Movie and TV endpoints and resolves a Screen Work Mention by matching its canonical or provider alternative title against the exact interpreted year first, then the immediately following and preceding provider years only if no exact-year Candidate matches.
 8. Makes one bounded Spotify Track search for each Track Mention in the effective market, checks exact artist-eligible titles first, then reuses those Candidates in Spotify order for controlled Equivalent Track Version resolution.
 9. Makes one bounded Spotify Album search for each direct Music Release Mention in the effective market, checks exact artist-eligible titles first, then reuses those Candidates in Spotify order for controlled equivalent-edition resolution.
-10. Returns grouped `movies`, `tv_series`, `tracks`, and `music_releases` result lists, resolving each Mention to enriched metadata or `null` independently within its kind.
+10. Resolves Book Work Mentions against canonical Open Library Work identity and provider-preferred Editions.
+11. Returns grouped `movies`, `tv_series`, `tracks`, `music_releases`, and `books` result lists, resolving each Mention to enriched metadata or `null` independently within its kind.
 
 Movie results can include the title, release year, cast, directors, description, poster URL, TMDB and IMDb identifiers and links, and the TMDB score.
 TV Series results can include the title, first air year, optional final air year, aggregate cast, Creators, description, poster URL, TMDB and IMDb identifiers and links, and the TMDB score.
 Track results can include Spotify's canonical Track title, ordered artist credits, a playable Spotify Track ID and URL, the accepted Candidate's attached Album as `preferred_music_release`, and a Spotify-hosted cover URL.
 Music Release results can include Spotify's canonical Album title, ordered artist credits, provider-reported `release_date`, album type, a Spotify Album ID and URL, and a Spotify-hosted cover URL.
-
+Book results can include the canonical Open Library Work title, ordered Author Credits, Work identity, an eligible provider-preferred Edition, and Work or Edition cover provenance.
 Mention interpretation supports two explicitly selected providers:
 
 - OpenAI uses the Responses API, strict Structured Outputs generated from the application response model, and `store=false`.
@@ -93,7 +94,7 @@ Successful response:
 {"status": "ok"}
 ```
 
-### Extract Movie, TV Series, Track, and Music Release Mentions
+### Extract Movie, TV Series, Track, Music Release, and Book Work Mentions
 
 ```http
 POST /api/extract
@@ -113,12 +114,13 @@ The response contains:
 
 - `market`: The effective uppercase ISO 3166-1 alpha-2 Spotify market.
   Omit it to use configured `REELIO_SPOTIFY_DEFAULT_MARKET`, which defaults to `US`.
+  It remains Spotify-only and does not affect Screen Work or Book Work enrichment.
 - `source`: The canonical platform, external video ID, URL, title, description, channel, and duration.
 - `transcript`: The normalized transcript text, detected language, and acquisition method.
-- `statistics`: A grouped object before `results` with always-present `movies`, `tv_series`, `tracks`, and `music_releases` category objects.
+- `statistics`: A grouped object before `results` with always-present `movies`, `tv_series`, `tracks`, `music_releases`, and `books` category objects.
   Each category contains non-negative integer `n_mentions`, `n_resolved`, and `n_unresolved` fields.
   `n_mentions` counts returned items and equals `n_resolved + n_unresolved`.
-- `results`: A grouped object with four always-present lists, `movies`, `tv_series`, `tracks`, and `music_releases`.
+- `results`: A grouped object with five always-present lists, `movies`, `tv_series`, `tracks`, `music_releases`, and `books`.
   Each list is deduplicated independently and preserves first-reference order within its kind.
   There is no cross-kind ordering.
 - `results.movies[].movie_mention`: The canonical Movie title and release year interpreted by the LLM.
@@ -177,7 +179,16 @@ The response contains:
   Release year does not participate in Spotify retrieval or Candidate verification.
   The contract makes no worldwide-edition, sibling-release, release-family, inferred-subtype, or earliest-worldwide-date claims.
   An unresolved Music Release preserves its original Mention when neither an exact nor an eligible equivalent Candidate appears.
-- Any TMDB or Spotify provider HTTP, timeout, or required-response validation failure fails the complete request rather than returning partial category results.
+- `results.books[].book_mention`: The interpreted Book Work title and ordered Author Credits.
+- `results.books[].book`: Open Library-backed enrichment for a resolved Mention, or `null` for an unresolved Mention.
+  A resolved Book Work exposes provider-authoritative Work identity and ordered Author Credits.
+  Its `edition`, `cover_url`, and `cover_edition_id` are nullable.
+  `edition` is the English-first provider-preferred Edition when eligible, and its `cover_url` may remain `null` even when the resolved Work has fallback cover metadata.
+  An unresolved Book Result always has `book: null`.
+  Book Work selection is independent of `market` and Source Edition signals.
+- `Book Work resolution`: Open Library configuration is exercised only when interpreted Book Mentions exist.
+  Open Library failures are atomic and never produce partial category results.
+- Any TMDB, Spotify, or Open Library provider HTTP, timeout, or required-response validation failure fails the complete request rather than returning partial category results.
 
 Compact success example:
 
@@ -188,13 +199,13 @@ Compact success example:
     "platform": "youtube",
     "video_id": "dQw4w9WgXcQ",
     "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    "title": "Movie, TV Series, Track, and Music Release review",
-    "description": "A review mentioning a Movie, a TV Series, a Track, and a Music Release.",
+    "title": "Movie, TV Series, Track, Music Release, and Book Work review",
+    "description": "A review mentioning a Movie, a TV Series, a Track, a Music Release, and Book Works.",
     "channel": "Example channel",
     "duration_seconds": 42
   },
   "transcript": {
-    "text": "Dune: Part One, The Last of Us, One More Time, and Discovery are excellent.",
+    "text": "Dune: Part One, The Last of Us, One More Time, Discovery, and Pride and Prejudice are excellent.",
     "language": "en",
     "method": "youtube_captions"
   },
@@ -202,7 +213,8 @@ Compact success example:
     "movies": {"n_mentions": 1, "n_resolved": 1, "n_unresolved": 0},
     "tv_series": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
     "tracks": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
-    "music_releases": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1}
+    "music_releases": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1},
+    "books": {"n_mentions": 2, "n_resolved": 1, "n_unresolved": 1}
   },
   "results": {
     "movies": [
@@ -328,6 +340,38 @@ Compact success example:
         },
         "music_release": null
       }
+    ],
+    "books": [
+      {
+        "status": "resolved",
+        "book_mention": {
+          "title": "Pride and Prejudice",
+          "authors": ["Jane Austen"]
+        },
+        "book": {
+          "title": "Pride and Prejudice",
+          "authors": [
+            {
+              "open_library_author_id": "OL21594A",
+              "name": "Jane Austen",
+              "open_library_url": "https://openlibrary.org/authors/OL21594A"
+            }
+          ],
+          "open_library_work_id": "OL66554W",
+          "open_library_url": "https://openlibrary.org/works/OL66554W",
+          "edition": null,
+          "cover_url": null,
+          "cover_edition_id": null
+        }
+      },
+      {
+        "status": "unresolved",
+        "book_mention": {
+          "title": "Unknown Book",
+          "authors": []
+        },
+        "book": null
+      }
     ]
   }
 }
@@ -360,8 +404,8 @@ The API uses these error classes:
 | `404` | Source is unavailable, private, or not found. |
 | `413` | Source duration or interpretation material exceeds its configured limit. |
 | `500` | Unexpected internal failure. |
-| `502` | Metadata, transcription, LLM, TMDB, or Spotify provider failure. Any TMDB or Spotify failure fails the complete request. |
-| `504` | External provider timeout. |
+| `502` | Metadata, transcription, LLM, TMDB, Spotify, or Open Library provider failure. Open Library failures are atomic with `catalog_provider_failed` and `Open Library catalog request failed.` |
+| `504` | External provider timeout. Open Library timeouts are atomic with `pipeline_timeout` and `Open Library catalog request timed out.` |
 
 ## Configuration
 
@@ -376,6 +420,8 @@ All supported settings and their defaults are documented in [`.env.example`](.en
 - Interpretation Material limits default to 500 source-title characters, 2,000 description characters, 64 transcript-language characters, and 100,000 transcript characters.
 - TMDB uses `https://api.themoviedb.org/3`, the `w500` image endpoint, and a 10-second request timeout by default.
 - Spotify catalog requests use the configured default market, API and token endpoints, request timeout, and safe token-expiry skew.
+- Open Library requests use the configured endpoint, logical lookup timeout, and identified request rate only when interpreted Book Mentions exist.
+- `REELIO_OPEN_LIBRARY_CONTACT_EMAIL` is required operator-controlled contact information and must be set to a safe non-blank value.
 
 Credentials are loaded from environment variables and are not written to logs.
 
@@ -383,6 +429,20 @@ Spotify catalog access uses Client Credentials in development mode as a prototyp
 Development account ownership, allowlists, and quota restrictions are not production guarantees.
 Before production use, review Spotify Developer Policy, platform terms, attribution requirements, quota eligibility, and the approved use case.
 Spotify metadata, artwork, identifiers, and URLs are excluded from LLM prompts and model-training flows.
+
+### Open Library operations
+
+The public Open Library integration supports only low-volume, human-triggered extraction.
+It is not for bulk jobs or high-traffic backend use.
+Successful lookups use a 24-hour, 100-entry process-local LRU cache.
+Identical cache misses are coalesced.
+Every actual provider attempt is globally paced within one application process.
+Transient provider failures receive at most one retry within the logical lookup timeout.
+Open Library provider failures fail the complete extraction atomically with HTTP `502`, code `catalog_provider_failed`, and message `Open Library catalog request failed.`
+Open Library timeouts fail the complete extraction atomically with HTTP `504`, code `pipeline_timeout`, and message `Open Library catalog request timed out.`
+
+The supported deployment is one application process with one Uvicorn worker behind one public IP.
+Do not add Uvicorn workers or replicas until a shared limiter is implemented or Open Library approves the aggregate quota.
 
 ## Development
 
@@ -411,7 +471,7 @@ src/reelio/
     ├── types.py                    Extraction domain types
     └── services/
         ├── catalog/                Spotify Client Credentials catalog boundary
-        ├── enrichment/             TMDB and Spotify candidate resolution and enrichment
+        ├── enrichment/             TMDB, Spotify, and Open Library candidate resolution and enrichment
         ├── interpretation/         OpenAI and DeepSeek structured Mention providers
         └── transcription/          Metadata inspection and transcript acquisition
 ```
