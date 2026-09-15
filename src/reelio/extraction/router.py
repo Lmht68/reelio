@@ -555,12 +555,15 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
         "earliest-worldwide-date claims. Book Work Results retain their interpreted "
         "Book Mention and expose the Open Library Work title, provider-ordered Author "
         "Credits, Work ID, canonical URL, and nullable provider-preferred Edition "
-        "after a verified exact match. Book Work cover_url first uses the selected "
+        "after identity verification. A resolved Book Work may have null edition, "
+        "cover_url, and cover_edition_id fields when Open Library lacks eligible "
+        "Edition or cover metadata. Book Work cover_url first uses the selected "
         "Edition's own cover, then accepted Work Search cover metadata. A fallback "
         "cover_edition_id is exposed when Open Library identifies its source Edition; "
         "the fallback never populates edition.cover_url. Missing artwork returns null "
-        "Book Work cover fields without another request. Edition selection uses English-first "
-        "Open Library relevance, with one unrestricted fallback for missing or audiobook "
+        "Book Work cover fields without another request. An unresolved Book Work "
+        "Result has book set to null. Edition selection uses English-first Open "
+        "Library relevance, with one unrestricted fallback for missing or audiobook "
         "English results. Missing or audiobook Editions remain null, and selection is "
         "independent of Effective Market and Source Edition signals. Each Track "
         "Mention and Music Release "
@@ -628,12 +631,17 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
             "description": (
                 "Metadata, transcript, LLM, TMDB, Spotify, or Open Library provider "
                 "failure. Any TMDB, Spotify, or Open Library provider failure fails "
-                "the complete request."
+                "the complete request. Open Library failures are atomic with "
+                "catalog_provider_failed and message Open Library catalog request "
+                "failed."
             ),
         },
         504: {
             "model": extraction_schemas.ErrorResponse,
-            "description": "External provider timeout.",
+            "description": (
+                "External provider timeout. Open Library timeouts are atomic with "
+                "pipeline_timeout and message Open Library catalog request timed out."
+            ),
         },
     },
 )
@@ -641,7 +649,7 @@ async def extract(
     payload: extraction_schemas.ExtractRequest,
     pipeline: Annotated[ExtractionPipelineProtocol, Depends(get_pipeline)],
 ) -> extraction_schemas.ExtractResponse:
-    """Extract structured Movie, TV Series, Track, and Music Release Mentions from a source URL.
+    """Extract structured Movie, TV Series, Track, Music Release, and Book Work Mentions.
 
     Args:
         payload: Validated extraction request containing source URL and optional market.

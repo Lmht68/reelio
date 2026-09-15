@@ -2,14 +2,16 @@
 
 import asyncio
 import logging
+import math
 import re
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import date
 from time import monotonic
-from typing import cast
+from typing import NoReturn, cast
 
 import httpx
+from cachetools import TTLCache
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from rapidfuzz import fuzz
 
@@ -34,6 +36,11 @@ _CATALOG_ERROR_MESSAGE = "Open Library catalog request failed."
 _TIMEOUT_ERROR_MESSAGE = "Open Library catalog request timed out."
 _STAGE = "book_work_resolution"
 _SEARCH_LIMIT = 5
+_CACHE_TTL_SECONDS = 86_400.0
+_CACHE_MAX_ENTRIES = 100
+
+type _CatalogRequestKey = tuple[str, tuple[tuple[str, str], ...]]
+
 _FUZZY_TITLE_SCORE_THRESHOLD = 80.0
 _WORK_SEARCH_FIELDS = (
     "key,title,alternative_title,author_key,author_name,"
@@ -136,11 +143,28 @@ class _OpenLibraryEditionRecordModel(_OpenLibraryModel):
 
 
 @dataclass(frozen=True, slots=True)
+class _TerminalWorkTarget:
+    """Contain the canonical target of a terminal Open Library Work record."""
+
+    work_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RedirectWorkTarget:
+    """Contain the canonical target of an Open Library Work redirect."""
+
+    work_id: str
+
+
+type _OpenLibraryWorkTarget = _TerminalWorkTarget | _RedirectWorkTarget
+
+
+@dataclass(frozen=True, slots=True)
 class _OpenLibraryCandidate:
     """Contain bounded Work metadata used for Book Work matching."""
 
     title: str
-    authors: list[EnrichedAuthorCredit]
+    authors: tuple[EnrichedAuthorCredit, ...]
     open_library_work_id: str
     candidate_titles: tuple[str, ...]
     author_aliases: tuple[str, ...]
@@ -159,28 +183,52 @@ class _OpenLibrarySelectedEdition:
     cover_id: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class _OpenLibraryEditionRecord:
+    """Contain immutable provider metadata from one Open Library Edition record."""
+
+    open_library_edition_id: str
+    title: str | None
+    publishers: tuple[str, ...]
+    isbn_10: tuple[str, ...]
+    isbn_13: tuple[str, ...]
+    publish_date: str | None
+    physical_format: str | None
+    covers: tuple[int, ...]
+
+
 class OpenLibraryBookResolver:
     """Resolve Book Work Mentions with exact Open Library Search matches."""
 
     def __init__(
         self,
         client: httpx.AsyncClient,
-        requests_per_second: float,
-        clock: Callable[[], float],
-        sleep: Callable[[float], Awaitable[None]],
+        settings: OpenLibraryConfig,
+        *,
+        clock: Callable[[], float] = monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         """Initialize a resolver with injectable HTTP and monotonic timing boundaries.
 
         Args:
             client: Reusable Open Library HTTP client owned by this resolver.
-            requests_per_second: Maximum resolver-wide request dispatch rate.
-            clock: Monotonic clock used to schedule request dispatches.
-            sleep: Awaitable delay used to enforce the dispatch interval.
+            settings: Validated Open Library lookup timeout and dispatch rate.
+            clock: Monotonic clock used to schedule requests and cache entries.
+            sleep: Awaitable delay used to enforce dispatch and retry waits.
         """
         self._client = client
-        self._request_interval_seconds = 1 / requests_per_second
+        self._request_timeout_seconds = settings.request_timeout_seconds
+        self._request_interval_seconds = 1 / settings.requests_per_second
         self._clock = clock
         self._sleep = sleep
+        self._cache: TTLCache[_CatalogRequestKey, object] = TTLCache(
+            maxsize=_CACHE_MAX_ENTRIES,
+            ttl=_CACHE_TTL_SECONDS,
+            timer=clock,
+        )
+        self._lookup_lock = asyncio.Lock()
+        self._in_flight_lookups: dict[_CatalogRequestKey, asyncio.Task[object]] = {}
+        self._closed = False
         self._request_lock = asyncio.Lock()
         self._next_request_at = 0.0
 
@@ -206,7 +254,21 @@ class OpenLibraryBookResolver:
         return BookResults(books=_drop_duplicate_resolved_book_works(list(results)))
 
     async def aclose(self) -> None:
-        """Close the resolver-owned Open Library HTTP client."""
+        """Close the resolver-owned Open Library HTTP client and pending lookups."""
+        async with self._lookup_lock:
+            if self._closed:
+                return
+            self._closed = True
+            pending_lookups = tuple(self._in_flight_lookups.values())
+
+        for pending_lookup in pending_lookups:
+            pending_lookup.cancel()
+        if pending_lookups:
+            await asyncio.gather(*pending_lookups, return_exceptions=True)
+
+        async with self._lookup_lock:
+            self._cache.clear()
+            self._in_flight_lookups.clear()
         await self._client.aclose()
 
     async def _resolve_mention(self, book_mention: BookMention) -> BookResult:
@@ -258,7 +320,7 @@ class OpenLibraryBookResolver:
             book_mention=book_mention,
             book=EnrichedBookWork(
                 title=candidate.title,
-                authors=candidate.authors,
+                authors=list(candidate.authors),
                 open_library_work_id=candidate.open_library_work_id,
                 open_library_url=(
                     f"https://openlibrary.org/works/{candidate.open_library_work_id}"
@@ -281,20 +343,12 @@ class OpenLibraryBookResolver:
         }
         if author is not None:
             params["author"] = author
-
-        response = await self._get_catalog_response("/search.json", params)
-
-        try:
-            response_model = _OpenLibrarySearchResponseModel.model_validate(
-                cast(object, response.json())
-            )
-            return [_to_candidate(candidate) for candidate in response_model.docs[:_SEARCH_LIMIT]]
-        except (ValidationError, ValueError) as exc:
-            logger.error(
-                "Open Library catalog response validation failed",
-                extra={"stage": _STAGE, "reason": "invalid_provider_response"},
-            )
-            raise CatalogProviderError(_CATALOG_ERROR_MESSAGE) from exc
+        candidates = await self._get_catalog_value(
+            "/search.json",
+            _to_search_candidates,
+            params,
+        )
+        return list(candidates)
 
     async def _select_preferred_edition(self, work_id: str) -> BookEdition | None:
         english_selected_edition = await self._search_preferred_edition(
@@ -334,130 +388,148 @@ class OpenLibraryBookResolver:
         query = f"key:/works/{work_id}"
         if require_english:
             query = f"{query} AND language:eng"
-
-        response = await self._get_catalog_response(
+        return await self._get_catalog_value(
             "/search.json",
+            lambda value: _to_selected_edition(value, work_id),
             {"q": query, "fields": _EDITION_SEARCH_FIELDS, "limit": 1},
         )
-        try:
-            response_model = _OpenLibraryPreferredEditionSearchResponseModel.model_validate(
-                cast(object, response.json())
-            )
-            if not response_model.docs:
-                return None
-            selected_work = response_model.docs[0]
-            selected_work_id = _parse_provider_id(
-                selected_work.key,
-                _WORK_ID_PATTERN,
-                "Work",
-            )
-            if selected_work_id != work_id:
-                raise ValueError("Open Library preferred Edition Work ID does not match")
-            if selected_work.editions is None or not selected_work.editions.docs:
-                return None
-            selected_edition = selected_work.editions.docs[0]
-            if selected_edition.key is None:
-                raise ValueError("Open Library Edition ID is missing")
-            return _OpenLibrarySelectedEdition(
-                open_library_edition_id=_parse_provider_id(
-                    selected_edition.key,
-                    _EDITION_ID_PATTERN,
-                    "Edition",
-                ),
-                title=_optional_provider_text(selected_edition.title),
-                formats=tuple(selected_edition.format or []),
-                publication_year=(
-                    selected_edition.publish_year[0] if selected_edition.publish_year else None
-                ),
-                cover_id=selected_edition.cover_i,
-            )
-        except (ValidationError, ValueError) as exc:
-            logger.error(
-                "Open Library catalog response validation failed",
-                extra={"stage": _STAGE, "reason": "invalid_provider_response"},
-            )
-            raise CatalogProviderError(_CATALOG_ERROR_MESSAGE) from exc
 
     async def _load_selected_edition(
         self,
         selected_edition: _OpenLibrarySelectedEdition,
     ) -> BookEdition | None:
-        response = await self._get_catalog_response(
-            f"/books/{selected_edition.open_library_edition_id}.json"
+        record = await self._get_catalog_value(
+            f"/books/{selected_edition.open_library_edition_id}.json",
+            lambda value: _to_edition_record(
+                value,
+                selected_edition.open_library_edition_id,
+            ),
         )
+        formats = (*selected_edition.formats,)
+        if record.physical_format is not None:
+            formats += (record.physical_format,)
+        if _is_explicit_audiobook(formats):
+            return None
+        cover_id = next(
+            (cover_id for cover_id in record.covers if cover_id > 0),
+            selected_edition.cover_id,
+        )
+        return BookEdition(
+            title=(
+                _optional_provider_text(record.title)
+                or _optional_provider_text(selected_edition.title)
+            ),
+            publication_year=_publication_year(
+                selected_edition.publication_year,
+                record.publish_date,
+            ),
+            publishers=list(record.publishers),
+            isbn_10=list(record.isbn_10),
+            isbn_13=list(record.isbn_13),
+            open_library_edition_id=record.open_library_edition_id,
+            open_library_url=(f"https://openlibrary.org/books/{record.open_library_edition_id}"),
+            cover_url=_cover_url(cover_id),
+        )
+
+    async def _get_catalog_value[ValueT](
+        self,
+        path: str,
+        parser: Callable[[object], ValueT],
+        params: dict[str, str | int] | None = None,
+    ) -> ValueT:
+        request_key = _catalog_request_key(path, params)
+        async with self._lookup_lock:
+            if self._closed:
+                raise RuntimeError("Open Library resolver is closed.")
+            try:
+                cached_value = self._cache[request_key]
+            except KeyError:
+                lookup = self._in_flight_lookups.get(request_key)
+                if lookup is None:
+                    lookup = cast(
+                        asyncio.Task[object],
+                        asyncio.create_task(
+                            self._load_catalog_value(request_key, path, parser, params)
+                        ),
+                    )
+                    lookup.add_done_callback(_retrieve_task_exception)
+                    self._in_flight_lookups[request_key] = lookup
+            else:
+                return cast(ValueT, cached_value)
+        return cast(ValueT, await asyncio.shield(lookup))
+
+    async def _load_catalog_value[ValueT](
+        self,
+        request_key: _CatalogRequestKey,
+        path: str,
+        parser: Callable[[object], ValueT],
+        params: dict[str, str | int] | None,
+    ) -> ValueT:
         try:
-            record = _OpenLibraryEditionRecordModel.model_validate(cast(object, response.json()))
-            record_edition_id = _parse_provider_id(
-                record.key,
-                _EDITION_ID_PATTERN,
-                "Edition",
+            deadline = self._clock() + self._request_timeout_seconds
+            async with asyncio.timeout(self._request_timeout_seconds):
+                response = await self._get_catalog_response(path, params, deadline)
+                parsed_value = parser(cast(object, response.json()))
+            async with self._lookup_lock:
+                if not self._closed:
+                    self._cache[request_key] = parsed_value
+            return parsed_value
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            logger.error(
+                "Open Library catalog request timed out",
+                extra={"stage": _STAGE, "reason": "provider_timeout"},
             )
-            if record_edition_id != selected_edition.open_library_edition_id:
-                raise ValueError("Open Library Edition record ID does not match")
-            formats = (*selected_edition.formats,)
-            if record.physical_format is not None:
-                formats += (record.physical_format,)
-            if _is_explicit_audiobook(formats):
-                return None
-            cover_id = next(
-                (cover_id for cover_id in record.covers or [] if cover_id > 0),
-                selected_edition.cover_id,
-            )
-            return BookEdition(
-                title=(
-                    _optional_provider_text(record.title)
-                    or _optional_provider_text(selected_edition.title)
-                ),
-                publication_year=_publication_year(
-                    selected_edition.publication_year,
-                    record.publish_date,
-                ),
-                publishers=record.publishers or [],
-                isbn_10=record.isbn_10 or [],
-                isbn_13=record.isbn_13 or [],
-                open_library_edition_id=record_edition_id,
-                open_library_url=f"https://openlibrary.org/books/{record_edition_id}",
-                cover_url=_cover_url(cover_id),
-            )
+            raise PipelineTimeoutError(_TIMEOUT_ERROR_MESSAGE) from exc
         except (ValidationError, ValueError) as exc:
             logger.error(
                 "Open Library catalog response validation failed",
                 extra={"stage": _STAGE, "reason": "invalid_provider_response"},
             )
             raise CatalogProviderError(_CATALOG_ERROR_MESSAGE) from exc
+        finally:
+            async with self._lookup_lock:
+                self._in_flight_lookups.pop(request_key, None)
 
     async def _get_catalog_response(
         self,
         path: str,
-        params: dict[str, str | int] | None = None,
+        params: dict[str, str | int] | None,
+        deadline: float,
     ) -> httpx.Response:
-        try:
-            await self._await_request_turn()
+        for attempt in range(2):
+            await self._await_request_turn(deadline)
             try:
                 response = await self._client.get(path, params=params)
             except httpx.TimeoutException:
                 raise
-            except httpx.TransportError:
-                await self._await_request_turn()
-                response = await self._client.get(path, params=params)
-            response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            logger.error(
-                "Open Library catalog request timed out",
-                extra={"stage": _STAGE, "reason": "timeout"},
-            )
-            raise PipelineTimeoutError(_TIMEOUT_ERROR_MESSAGE) from exc
-        except httpx.HTTPError as exc:
-            logger.error(
-                "Open Library catalog request failed",
-                extra={"stage": _STAGE, "reason": "provider_failure"},
-            )
-            raise CatalogProviderError(_CATALOG_ERROR_MESSAGE) from exc
-        return response
+            except httpx.TransportError as exc:
+                if attempt == 1:
+                    self._raise_catalog_failure("retry_exhausted", exc)
+                continue
+
+            if response.is_success:
+                return response
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt == 1:
+                    self._raise_catalog_failure("retry_exhausted")
+                retry_after_header = response.headers.get("Retry-After")
+                if response.status_code == 429 and retry_after_header is None:
+                    self._raise_catalog_failure("http_failure")
+                if retry_after_header is not None:
+                    try:
+                        retry_after = _retry_after_seconds(response)
+                    except ValueError as exc:
+                        self._raise_catalog_failure("http_failure", exc)
+                    if retry_after > deadline - self._clock():
+                        self._raise_catalog_failure("retry_after_exceeds_timeout")
+                    await self._sleep(retry_after)
+                continue
+            self._raise_catalog_failure("http_failure")
+        raise AssertionError("Open Library request attempts were not exhausted.")
 
     async def _canonicalize_candidates(
         self,
-        candidates: list[_OpenLibraryCandidate],
+        candidates: Sequence[_OpenLibraryCandidate],
         raw_to_canonical_work_ids: dict[str, str],
         seen_work_ids: set[str],
     ) -> list[_OpenLibraryCandidate]:
@@ -479,41 +551,46 @@ class OpenLibraryBookResolver:
         current_work_id = work_id
         while current_work_id not in seen_redirect_ids:
             seen_redirect_ids.add(current_work_id)
-            response = await self._get_catalog_response(f"/works/{current_work_id}.json")
-            try:
-                record = _OpenLibraryWorkRecordModel.model_validate(cast(object, response.json()))
-                if record.type.key == "/type/work":
-                    if record.key is None:
-                        raise ValueError("Open Library Work record is missing its key")
-                    return _parse_provider_id(record.key, _WORK_ID_PATTERN, "Work")
-                if record.type.key == "/type/redirect":
-                    if record.location is None:
-                        raise ValueError("Open Library Work redirect is missing its location")
-                    current_work_id = _parse_provider_id(
-                        record.location,
-                        _WORK_ID_PATTERN,
-                        "Work",
-                    )
-                    continue
-                raise ValueError("Open Library Work record has an invalid type")
-            except (ValidationError, ValueError) as exc:
-                logger.error(
-                    "Open Library catalog response validation failed",
-                    extra={"stage": _STAGE, "reason": "invalid_provider_response"},
-                )
-                raise CatalogProviderError(_CATALOG_ERROR_MESSAGE) from exc
+            target = await self._get_catalog_value(
+                f"/works/{current_work_id}.json",
+                _to_work_target,
+            )
+            if isinstance(target, _TerminalWorkTarget):
+                return target.work_id
+            current_work_id = target.work_id
         logger.error(
             "Open Library catalog response validation failed",
             extra={"stage": _STAGE, "reason": "invalid_provider_response"},
         )
         raise CatalogProviderError(_CATALOG_ERROR_MESSAGE)
 
-    async def _await_request_turn(self) -> None:
+    async def _await_request_turn(self, deadline: float) -> None:
         async with self._request_lock:
-            delay_seconds = self._next_request_at - self._clock()
+            current_time = self._clock()
+            if current_time >= deadline:
+                raise TimeoutError
+            delay_seconds = self._next_request_at - current_time
             if delay_seconds > 0:
+                if delay_seconds > deadline - current_time:
+                    raise TimeoutError
                 await self._sleep(delay_seconds)
-            self._next_request_at = self._clock() + self._request_interval_seconds
+            current_time = self._clock()
+            if current_time >= deadline:
+                raise TimeoutError
+            self._next_request_at = current_time + self._request_interval_seconds
+
+    def _raise_catalog_failure(
+        self,
+        reason: str,
+        exception: Exception | None = None,
+    ) -> NoReturn:
+        logger.error(
+            "Open Library catalog request failed",
+            extra={"stage": _STAGE, "reason": reason},
+        )
+        if exception is None:
+            raise CatalogProviderError(_CATALOG_ERROR_MESSAGE)
+        raise CatalogProviderError(_CATALOG_ERROR_MESSAGE) from exception
 
 
 def create_open_library_book_resolver(
@@ -532,12 +609,107 @@ def create_open_library_book_resolver(
         headers={"User-Agent": f"Reelio ({settings.contact_email})"},
         timeout=settings.request_timeout_seconds,
     )
-    return OpenLibraryBookResolver(
-        client,
-        settings.requests_per_second,
-        monotonic,
-        asyncio.sleep,
+    return OpenLibraryBookResolver(client, settings)
+
+
+def _catalog_request_key(
+    path: str,
+    params: dict[str, str | int] | None,
+) -> _CatalogRequestKey:
+    return (
+        path,
+        tuple(sorted((key, str(value)) for key, value in (params or {}).items())),
     )
+
+
+def _retrieve_task_exception(task: asyncio.Task[object]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+def _retry_after_seconds(response: httpx.Response) -> float:
+    retry_after_header = response.headers["Retry-After"]
+    try:
+        retry_after = float(retry_after_header)
+    except ValueError as exc:
+        raise ValueError("Open Library Retry-After is invalid") from exc
+    if not math.isfinite(retry_after) or retry_after < 0:
+        raise ValueError("Open Library Retry-After is invalid")
+    return retry_after
+
+
+def _to_search_candidates(value: object) -> tuple[_OpenLibraryCandidate, ...]:
+    response_model = _OpenLibrarySearchResponseModel.model_validate(value)
+    return tuple(_to_candidate(candidate) for candidate in response_model.docs[:_SEARCH_LIMIT])
+
+
+def _to_selected_edition(
+    value: object,
+    work_id: str,
+) -> _OpenLibrarySelectedEdition | None:
+    response_model = _OpenLibraryPreferredEditionSearchResponseModel.model_validate(value)
+    if not response_model.docs:
+        return None
+    selected_work = response_model.docs[0]
+    selected_work_id = _parse_provider_id(
+        selected_work.key,
+        _WORK_ID_PATTERN,
+        "Work",
+    )
+    if selected_work_id != work_id:
+        raise ValueError("Open Library preferred Edition Work ID does not match")
+    if selected_work.editions is None or not selected_work.editions.docs:
+        return None
+    selected_edition = selected_work.editions.docs[0]
+    if selected_edition.key is None:
+        raise ValueError("Open Library Edition ID is missing")
+    return _OpenLibrarySelectedEdition(
+        open_library_edition_id=_parse_provider_id(
+            selected_edition.key,
+            _EDITION_ID_PATTERN,
+            "Edition",
+        ),
+        title=_optional_provider_text(selected_edition.title),
+        formats=tuple(selected_edition.format or []),
+        publication_year=(
+            selected_edition.publish_year[0] if selected_edition.publish_year else None
+        ),
+        cover_id=selected_edition.cover_i,
+    )
+
+
+def _to_edition_record(value: object, expected_edition_id: str) -> _OpenLibraryEditionRecord:
+    record = _OpenLibraryEditionRecordModel.model_validate(value)
+    record_edition_id = _parse_provider_id(
+        record.key,
+        _EDITION_ID_PATTERN,
+        "Edition",
+    )
+    if record_edition_id != expected_edition_id:
+        raise ValueError("Open Library Edition record ID does not match")
+    return _OpenLibraryEditionRecord(
+        open_library_edition_id=record_edition_id,
+        title=record.title,
+        publishers=tuple(record.publishers or []),
+        isbn_10=tuple(record.isbn_10 or []),
+        isbn_13=tuple(record.isbn_13 or []),
+        publish_date=record.publish_date,
+        physical_format=record.physical_format,
+        covers=tuple(record.covers or []),
+    )
+
+
+def _to_work_target(value: object) -> _OpenLibraryWorkTarget:
+    record = _OpenLibraryWorkRecordModel.model_validate(value)
+    if record.type.key == "/type/work":
+        if record.key is None:
+            raise ValueError("Open Library Work record is missing its key")
+        return _TerminalWorkTarget(_parse_provider_id(record.key, _WORK_ID_PATTERN, "Work"))
+    if record.type.key == "/type/redirect":
+        if record.location is None:
+            raise ValueError("Open Library Work redirect is missing its location")
+        return _RedirectWorkTarget(_parse_provider_id(record.location, _WORK_ID_PATTERN, "Work"))
+    raise ValueError("Open Library Work record has an invalid type")
 
 
 def _to_candidate(
@@ -593,7 +765,7 @@ def _to_candidate(
     )
     return _OpenLibraryCandidate(
         title=primary_title,
-        authors=authors,
+        authors=tuple(authors),
         open_library_work_id=work_id,
         candidate_titles=_unique_candidate_titles(
             primary_title,

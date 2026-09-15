@@ -220,6 +220,10 @@ class _FakeClock:
         """Return the current deterministic monotonic time."""
         return self.value
 
+    def advance(self, seconds: float) -> None:
+        """Advance the deterministic monotonic clock without recording a sleep."""
+        self.value += seconds
+
     async def sleep(self, delay_seconds: float) -> None:
         """Record and advance one deterministic request delay."""
         self.delays.append(delay_seconds)
@@ -230,6 +234,7 @@ def _resolver(
     handler: httpx.AsyncBaseTransport,
     clock: _FakeClock | None = None,
     *,
+    settings: OpenLibraryConfig | None = None,
     default_missing_preferred_edition: bool = True,
 ) -> OpenLibraryBookResolver:
     fake_clock = clock or _FakeClock()
@@ -238,9 +243,9 @@ def _resolver(
     )
     return OpenLibraryBookResolver(
         _client(transport),
-        3.0,
-        fake_clock,
-        fake_clock.sleep,
+        settings or _settings(),
+        clock=fake_clock,
+        sleep=fake_clock.sleep,
     )
 
 
@@ -808,7 +813,6 @@ async def test_resolver_canonicalizes_redirects_before_candidate_deduplication()
         "/works/OL1W.json",
         "/works/OL3W.json",
         "/works/OL2W.json",
-        "/works/OL3W.json",
     ]
     await resolver.aclose()
 
@@ -1703,7 +1707,7 @@ async def test_resolver_maps_http_failures_and_timeouts_to_typed_errors() -> Non
     async def handle(request: httpx.Request) -> httpx.Response:
         nonlocal request_count
         request_count += 1
-        if request_count == 1:
+        if request_count <= 2:
             return httpx.Response(500)
         raise httpx.ReadTimeout("timed out", request=request)
 
@@ -1714,7 +1718,7 @@ async def test_resolver_maps_http_failures_and_timeouts_to_typed_errors() -> Non
         await resolver.resolve(mentions)
     with pytest.raises(PipelineTimeoutError, match="Open Library catalog request timed out"):
         await resolver.resolve(mentions)
-    assert request_count == 2
+    assert request_count == 3
 
     await resolver.aclose()
 
@@ -1742,8 +1746,442 @@ async def test_resolver_maps_malformed_json_and_transport_errors_to_catalog_fail
     await resolver.aclose()
 
 
+async def test_resolver_caches_empty_search_until_ttl_expiry() -> None:
+    """Reuse a valid empty Search until its fixed 24-hour cache entry expires."""
+    clock = _FakeClock()
+    dispatch_times: list[float] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        dispatch_times.append(clock())
+        return httpx.Response(200, json=_work_search_response())
+
+    resolver = _resolver(httpx.MockTransport(handle), clock)
+    mentions = _mentions(BookMention(title="No Match", authors=[]))
+
+    initial_results = await resolver.resolve(mentions)
+    clock.advance(86_399.999)
+    cached_results = await resolver.resolve(mentions)
+    clock.advance(0.001)
+    expired_results = await resolver.resolve(mentions)
+
+    assert all(
+        results.books[0].status is ResultStatus.UNRESOLVED
+        for results in (initial_results, cached_results, expired_results)
+    )
+    assert dispatch_times == pytest.approx([0.0, 86_400.0])
+    await resolver.aclose()
+
+
+async def test_resolver_keeps_recent_search_cache_entries_when_capacity_is_reached() -> None:
+    """Evict the least-recently-used successful Search cache entry at capacity."""
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_work_search_response())
+
+    resolver = _resolver(httpx.MockTransport(handle))
+
+    for index in range(100):
+        results = await resolver.resolve(_mentions(BookMention(title=f"Title {index}", authors=[])))
+        assert results.books[0].status is ResultStatus.UNRESOLVED
+    await resolver.resolve(_mentions(BookMention(title="Title 0", authors=[])))
+    await resolver.resolve(_mentions(BookMention(title="Title 100", authors=[])))
+    await resolver.resolve(_mentions(BookMention(title="Title 1", authors=[])))
+
+    assert len(requests) == 102
+    assert [request.url.params["title"] for request in requests[-2:]] == [
+        "Title 100",
+        "Title 1",
+    ]
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+async def test_resolver_retries_transient_http_failures_once(
+    status_code: int,
+) -> None:
+    """Retry each retryable HTTP status once through the shared dispatch limiter."""
+    clock = _FakeClock()
+    dispatch_times: list[float] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        dispatch_times.append(clock())
+        if len(dispatch_times) == 1:
+            return httpx.Response(status_code)
+        return httpx.Response(200, json=_work_search_response())
+
+    resolver = _resolver(httpx.MockTransport(handle), clock)
+
+    results = await resolver.resolve(_mentions(BookMention(title="Target", authors=[])))
+
+    assert results.books[0].status is ResultStatus.UNRESOLVED
+    assert dispatch_times == pytest.approx([0.0, 1 / 3])
+    await resolver.aclose()
+
+
+async def test_resolver_retries_transient_transport_failure_once() -> None:
+    """Retry one non-timeout transport failure through the shared dispatch limiter."""
+    clock = _FakeClock()
+    dispatch_times: list[float] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        dispatch_times.append(clock())
+        if len(dispatch_times) == 1:
+            raise httpx.ConnectError("connection failed", request=request)
+        return httpx.Response(200, json=_work_search_response())
+
+    resolver = _resolver(httpx.MockTransport(handle), clock)
+
+    results = await resolver.resolve(_mentions(BookMention(title="Target", authors=[])))
+
+    assert results.books[0].status is ResultStatus.UNRESOLVED
+    assert dispatch_times == pytest.approx([0.0, 1 / 3])
+    await resolver.aclose()
+
+
+async def test_resolver_honors_fitting_retry_after_before_retrying() -> None:
+    """Honor a fitting 429 Retry-After delay before the one allowed retry."""
+    clock = _FakeClock()
+    dispatch_times: list[float] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        dispatch_times.append(clock())
+        if len(dispatch_times) == 1:
+            return httpx.Response(429, headers={"Retry-After": "2"})
+        return httpx.Response(200, json=_work_search_response())
+
+    resolver = _resolver(httpx.MockTransport(handle), clock)
+
+    results = await resolver.resolve(_mentions(BookMention(title="Target", authors=[])))
+
+    assert results.books[0].status is ResultStatus.UNRESOLVED
+    assert dispatch_times == pytest.approx([0.0, 2.0])
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504])
+async def test_resolver_stops_after_second_transient_http_failure(
+    status_code: int,
+) -> None:
+    """Return the stable provider error after exactly two transient HTTP failures."""
+    dispatch_times: list[float] = []
+    clock = _FakeClock()
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        dispatch_times.append(clock())
+        headers = {"Retry-After": "0"} if status_code == 429 else {}
+        return httpx.Response(status_code, headers=headers)
+
+    resolver = _resolver(httpx.MockTransport(handle), clock)
+
+    with pytest.raises(
+        CatalogProviderError,
+        match=r"^Open Library catalog request failed\.$",
+    ):
+        await resolver.resolve(_mentions(BookMention(title="Target", authors=[])))
+
+    assert dispatch_times == pytest.approx([0.0, 1 / 3])
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    ("headers", "settings"),
+    [
+        (None, _settings()),
+        ({"Retry-After": "invalid"}, _settings()),
+        ({"Retry-After": "-1"}, _settings()),
+        ({"Retry-After": "2"}, _settings(request_timeout_seconds=1.0)),
+    ],
+)
+async def test_resolver_rejects_unusable_retry_after(
+    headers: dict[str, str] | None,
+    settings: OpenLibraryConfig,
+) -> None:
+    """Fail a 429 without retrying when its Retry-After cannot fit the deadline."""
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(429, headers=headers)
+
+    resolver = _resolver(httpx.MockTransport(handle), settings=settings)
+
+    with pytest.raises(
+        CatalogProviderError,
+        match=r"^Open Library catalog request failed\.$",
+    ):
+        await resolver.resolve(_mentions(BookMention(title="Target", authors=[])))
+
+    assert len(requests) == 1
+    await resolver.aclose()
+
+
+async def test_resolver_does_not_retry_nontransient_http_or_timeout_failures() -> None:
+    """Map a 4xx and a timeout after one request without leaking provider details."""
+    http_requests: list[httpx.Request] = []
+
+    async def handle_http(request: httpx.Request) -> httpx.Response:
+        http_requests.append(request)
+        return httpx.Response(404)
+
+    http_resolver = _resolver(httpx.MockTransport(handle_http))
+    with pytest.raises(
+        CatalogProviderError,
+        match=r"^Open Library catalog request failed\.$",
+    ):
+        await http_resolver.resolve(_mentions(BookMention(title="Target", authors=[])))
+    assert len(http_requests) == 1
+    await http_resolver.aclose()
+
+    timeout_requests: list[httpx.Request] = []
+
+    async def handle_timeout(request: httpx.Request) -> httpx.Response:
+        timeout_requests.append(request)
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    timeout_resolver = _resolver(httpx.MockTransport(handle_timeout))
+    with pytest.raises(
+        PipelineTimeoutError,
+        match=r"^Open Library catalog request timed out\.$",
+    ):
+        await timeout_resolver.resolve(_mentions(BookMention(title="Target", authors=[])))
+    assert len(timeout_requests) == 1
+    await timeout_resolver.aclose()
+
+
+async def test_resolver_retries_after_malformed_response_without_caching_failure() -> None:
+    """Fetch a later valid Search after a malformed response fails validation."""
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(200, json={"docs": [{"title": "Missing Work ID"}]})
+        return httpx.Response(200, json=_work_search_response())
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    mentions = _mentions(BookMention(title="Target", authors=[]))
+
+    with pytest.raises(
+        CatalogProviderError,
+        match=r"^Open Library catalog request failed\.$",
+    ):
+        await resolver.resolve(mentions)
+    results = await resolver.resolve(mentions)
+
+    assert results.books[0].status is ResultStatus.UNRESOLVED
+    assert len(requests) == 2
+    await resolver.aclose()
+
+
+async def test_resolver_timeout_prevents_retry_beyond_lookup_deadline() -> None:
+    """Return the timeout error before a delayed retry can reach its limiter slot."""
+    clock = _FakeClock()
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    resolver = _resolver(
+        httpx.MockTransport(handle),
+        clock,
+        settings=_settings(request_timeout_seconds=0.1),
+    )
+
+    with pytest.raises(
+        PipelineTimeoutError,
+        match=r"^Open Library catalog request timed out\.$",
+    ):
+        await resolver.resolve(_mentions(BookMention(title="Target", authors=[])))
+
+    assert len(requests) == 1
+    await resolver.aclose()
+
+
+async def test_resolver_coalesces_provider_rich_identical_lookups() -> None:
+    """Share each provider request while allocating independent public result lists."""
+    arrivals: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+    gates: dict[tuple[str, str], asyncio.Event] = {}
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        request_key = (
+            request.url.path,
+            request.url.params.get("q") or request.url.params.get("title") or "",
+        )
+        requests.append(request)
+        gate = gates.setdefault(request_key, asyncio.Event())
+        await arrivals.put(request_key)
+        await gate.wait()
+        if request.url.path == "/works/OL1W.json":
+            return httpx.Response(200, json=_work_record("OL1W"))
+        if request.url.path == "/books/OL101M.json":
+            return httpx.Response(
+                200,
+                json=_edition_record(
+                    "OL101M",
+                    title="Provider Edition",
+                    publishers=["Publisher"],
+                    isbn_10=["0123456789"],
+                    isbn_13=["9780123456786"],
+                    covers=[101],
+                ),
+            )
+        if _is_preferred_edition_search(request):
+            return httpx.Response(
+                200,
+                json=_preferred_edition_search_response(
+                    "OL1W",
+                    _selected_edition("OL101M", title="Provider Edition", cover_id=101),
+                ),
+            )
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate(
+                    "OL1W",
+                    "Provider Work",
+                    ["OL1A"],
+                    ["Provider Author"],
+                    cover_id=802,
+                    cover_edition_key="/books/OL802M",
+                )
+            ),
+        )
+
+    resolver = _resolver(
+        httpx.MockTransport(handle),
+        default_missing_preferred_edition=False,
+    )
+    mentions = _mentions(
+        BookMention(title="Provider Work", authors=[AuthorCredit(name="Provider Author")])
+    )
+    first_lookup = asyncio.create_task(resolver.resolve(mentions))
+    second_lookup = asyncio.create_task(resolver.resolve(mentions))
+
+    expected_request_keys = [
+        ("/search.json", "Provider Work"),
+        ("/works/OL1W.json", ""),
+        ("/search.json", "key:/works/OL1W AND language:eng"),
+        ("/books/OL101M.json", ""),
+    ]
+    for expected_request_key in expected_request_keys:
+        assert await arrivals.get() == expected_request_key
+        await asyncio.sleep(0)
+        assert arrivals.empty()
+        gates[expected_request_key].set()
+
+    first_results, second_results = await asyncio.gather(first_lookup, second_lookup)
+    first_book = first_results.books[0].book
+    second_book = second_results.books[0].book
+    assert first_book is not None
+    assert second_book is not None
+    assert first_book.title == second_book.title == "Provider Work"
+    assert first_book.authors == second_book.authors
+    assert first_book.authors is not second_book.authors
+    assert first_book.authors[0].open_library_author_id == "OL1A"
+    assert first_book.edition is not None
+    assert second_book.edition is not None
+    assert first_book.edition.publishers == second_book.edition.publishers == ["Publisher"]
+    assert first_book.edition.publishers is not second_book.edition.publishers
+    assert first_book.edition.isbn_10 == second_book.edition.isbn_10 == ["0123456789"]
+    assert first_book.edition.isbn_13 == second_book.edition.isbn_13 == ["9780123456786"]
+    assert (
+        first_book.cover_url
+        == second_book.cover_url
+        == ("https://covers.openlibrary.org/b/id/101-L.jpg")
+    )
+    assert first_book.cover_edition_id == second_book.cover_edition_id == "OL101M"
+    assert len(requests) == 4
+
+    cached_results = await resolver.resolve(mentions)
+    cached_book = cached_results.books[0].book
+    assert cached_book is not None
+    assert cached_book.authors == first_book.authors
+    assert cached_book.authors is not first_book.authors
+    assert cached_book.edition is not None
+    assert cached_book.edition.publishers == first_book.edition.publishers
+    assert cached_book.edition.publishers is not first_book.edition.publishers
+    assert len(requests) == 4
+    await resolver.aclose()
+
+
+async def test_resolver_shares_coalesced_timeout_and_retries_later() -> None:
+    """Give coalesced waiters one timeout and retry with a fresh provider request."""
+    request_started = asyncio.Event()
+    requests: list[httpx.Request] = []
+    clock = _FakeClock()
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            request_started.set()
+            await asyncio.Event().wait()
+        return httpx.Response(200, json=_work_search_response())
+
+    resolver = _resolver(
+        httpx.MockTransport(handle),
+        clock,
+        settings=_settings(request_timeout_seconds=0.01),
+    )
+    mentions = _mentions(BookMention(title="Target", authors=[]))
+    first_lookup = asyncio.create_task(resolver.resolve(mentions))
+    second_lookup = asyncio.create_task(resolver.resolve(mentions))
+
+    await request_started.wait()
+    outcomes = await asyncio.gather(first_lookup, second_lookup, return_exceptions=True)
+
+    assert all(isinstance(outcome, PipelineTimeoutError) for outcome in outcomes)
+    assert len(requests) == 1
+    clock.advance(1 / 3)
+    later_results = await resolver.resolve(mentions)
+    assert later_results.books[0].status is ResultStatus.UNRESOLVED
+    assert len(requests) == 2
+    await resolver.aclose()
+
+
+class _TrackingTransport(httpx.AsyncBaseTransport):
+    """Block one request until resolver shutdown closes this transport."""
+
+    def __init__(self) -> None:
+        """Initialize observable request and closure state."""
+        self.request_started = asyncio.Event()
+        self.closed = False
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        """Block the request until resolver shutdown cancels its producer task."""
+        self.request_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("The tracked request should be cancelled before responding.")
+
+    async def aclose(self) -> None:
+        """Record closure by the resolver-owned HTTP client."""
+        self.closed = True
+
+
+async def test_resolver_aclose_cancels_pending_producer_and_closes_transport() -> None:
+    """Cancel and drain an in-flight shielded lookup before closing the owned client."""
+    transport = _TrackingTransport()
+    resolver = _resolver(transport)
+    lookup = asyncio.create_task(
+        resolver.resolve(_mentions(BookMention(title="Target", authors=[])))
+    )
+
+    await transport.request_started.wait()
+    await resolver.aclose()
+
+    with pytest.raises(asyncio.CancelledError):
+        await lookup
+    assert transport.closed is True
+    assert resolver._client.is_closed is True
+    await resolver.aclose()
+
+
 async def test_factory_configures_identifying_contact_and_owned_client() -> None:
     """Build one client with the configured endpoint, timeout, and User-Agent."""
+
     resolver = create_open_library_book_resolver(
         _settings(base_url="https://catalog.example", request_timeout_seconds=4.5),
     )

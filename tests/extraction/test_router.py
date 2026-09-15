@@ -1201,6 +1201,9 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert "blocked trailing segments" in description
     assert "ordinary Resolved Result" in description
     assert "Release year does not participate in retrieval or Candidate verification" in description
+    assert "identity verification" in description
+    assert "null edition, cover_url, and cover_edition_id" in description
+    assert "Result has book set to null" in description
     assert "fuzzy" not in description.lower()
     assert "90 percent" not in description.lower()
     assert "every ordered Artist Credit" not in description
@@ -1209,6 +1212,10 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     for status_code in ("400", "404", "413", "500", "502", "504"):
         schema = responses[status_code]["content"]["application/json"]["schema"]
         assert schema == {"$ref": "#/components/schemas/ErrorResponse"}
+    assert "catalog_provider_failed" in responses["502"]["description"]
+    assert "Open Library catalog request failed." in responses["502"]["description"]
+    assert "pipeline_timeout" in responses["504"]["description"]
+    assert "Open Library catalog request timed out." in responses["504"]["description"]
 
     request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
     assert request_schema == {"$ref": "#/components/schemas/ExtractRequest"}

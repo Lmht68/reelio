@@ -36,7 +36,7 @@ class TMDBConfig(BaseSettings):
 
 
 class OpenLibraryConfig(BaseSettings):
-    """Validate Open Library contact, endpoint, timeout, and request rate."""
+    """Validate Open Library contact, endpoint, logical lookup timeout, and request rate."""
 
     model_config = SettingsConfigDict(
         env_prefix="REELIO_",

@@ -12,6 +12,7 @@ import pytest
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.router import get_pipeline
 from reelio.extraction.service import ExtractionPipeline
+from reelio.extraction.services.enrichment.config import OpenLibraryConfig
 from reelio.extraction.services.enrichment.open_library import OpenLibraryBookResolver
 from reelio.extraction.services.enrichment.service import ExtractionResultAggregator
 from reelio.extraction.services.interpretation.config import (
@@ -156,6 +157,31 @@ def _interpretation_response(books: list[dict[str, object]]) -> dict[str, object
     }
 
 
+def _open_library_settings(**values: object) -> OpenLibraryConfig:
+    settings_type = cast(Callable[..., OpenLibraryConfig], OpenLibraryConfig)
+    return settings_type(
+        _env_file=None,
+        contact_email="catalog-contact@example.invalid",
+        **values,
+    )
+
+
+class _FakeClock:
+    """Advance deterministic monotonic time through resolver request waits."""
+
+    def __init__(self) -> None:
+        """Initialize the deterministic monotonic clock."""
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        """Return the current deterministic monotonic time."""
+        return self.value
+
+    async def sleep(self, delay_seconds: float) -> None:
+        """Advance deterministic monotonic time by a requested delay."""
+        self.value += delay_seconds
+
+
 async def _post_extract(
     interpretation_response: dict[str, object],
     open_library_transport: httpx.AsyncBaseTransport,
@@ -163,6 +189,7 @@ async def _post_extract(
     transcript_text: str = "Pride and Prejudice by Jane Austen is a classic.",
     transcript_language: str = "en",
     default_missing_preferred_edition: bool = True,
+    clock: _FakeClock | None = None,
 ) -> tuple[httpx.Response, _InterpretationProvider, httpx.AsyncClient]:
     """Run the real Book extraction pipeline through the HTTP endpoint and close owners."""
     catalog_transport = (
@@ -177,9 +204,9 @@ async def _post_extract(
     )
     book_resolver = OpenLibraryBookResolver(
         http_client,
-        3.0,
-        monotonic,
-        asyncio.sleep,
+        _open_library_settings(),
+        clock=clock or monotonic,
+        sleep=clock.sleep if clock is not None else asyncio.sleep,
     )
     interpretation_provider = _InterpretationProvider(interpretation_response)
     pipeline = ExtractionPipeline(
@@ -406,15 +433,46 @@ async def test_extract_resolves_fuzzy_authorful_books_and_leaves_authorless_ambi
     ]
 
 
-async def test_extract_maps_open_library_failure_to_catalog_provider_error() -> None:
-    """Map an Open Library provider failure through the stable public error envelope."""
+async def test_extract_retries_open_library_5xx_before_returning_unresolved_book() -> None:
+    """Retry a transient catalog failure through the production-shaped endpoint."""
+    clock = _FakeClock()
+    dispatch_times: list[float] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
+        dispatch_times.append(clock())
+        if len(dispatch_times) == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json=_search_response())
+
+    response, _, http_client = await _post_extract(
+        _interpretation_response([{"title": "Unknown Book", "authors": []}]),
+        httpx.MockTransport(handle),
+        clock=clock,
+    )
+
+    assert response.status_code == 200
+    assert dispatch_times == pytest.approx([0.0, 1 / 3])
+    assert response.json()["statistics"]["books"] == {
+        "n_mentions": 1,
+        "n_resolved": 0,
+        "n_unresolved": 1,
+    }
+    assert http_client.is_closed is True
+
+
+async def test_extract_maps_open_library_failure_to_catalog_provider_error() -> None:
+    """Map an exhausted Open Library retry through the stable public error envelope."""
+    clock = _FakeClock()
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         return httpx.Response(500)
 
-    response, _, _ = await _post_extract(
+    response, _, http_client = await _post_extract(
         _interpretation_response([{"title": "Pride and Prejudice", "authors": ["Jane Austen"]}]),
         httpx.MockTransport(handle),
+        clock=clock,
     )
 
     assert response.status_code == 502
@@ -424,15 +482,19 @@ async def test_extract_maps_open_library_failure_to_catalog_provider_error() -> 
             "message": "Open Library catalog request failed.",
         }
     }
+    assert len(requests) == 2
+    assert http_client.is_closed is True
 
 
 async def test_extract_maps_open_library_timeout_to_pipeline_timeout() -> None:
     """Map an Open Library timeout through the stable public error envelope."""
+    requests: list[httpx.Request] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         raise httpx.ReadTimeout("timed out", request=request)
 
-    response, _, _ = await _post_extract(
+    response, _, http_client = await _post_extract(
         _interpretation_response([{"title": "Pride and Prejudice", "authors": ["Jane Austen"]}]),
         httpx.MockTransport(handle),
     )
@@ -444,6 +506,8 @@ async def test_extract_maps_open_library_timeout_to_pipeline_timeout() -> None:
             "message": "Open Library catalog request timed out.",
         }
     }
+    assert len(requests) == 1
+    assert http_client.is_closed is True
 
 
 async def test_extract_exposes_provider_preferred_editions_independent_of_source_signals() -> None:
