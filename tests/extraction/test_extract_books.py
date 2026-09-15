@@ -226,7 +226,7 @@ async def _post_extract(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
-                "/api/extract",
+                "/api/extractions",
                 json={"url": _CANONICAL_URL, "market": "JP"},
             )
     finally:

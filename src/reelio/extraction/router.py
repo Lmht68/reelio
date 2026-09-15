@@ -519,7 +519,7 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
 
 
 @router.post(
-    "/extract",
+    "/extractions",
     status_code=status.HTTP_200_OK,
     response_model=extraction_schemas.ExtractResponse,
     summary="Extract mentioned Movies, TV Series, Tracks, Music Releases, and Book Works from a public video Source",

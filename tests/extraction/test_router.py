@@ -562,7 +562,7 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
     _install_pipeline(app, pipeline)
 
     response = await client.post(
-        "/api/extract",
+        "/api/extractions",
         json={"url": _CANONICAL_URL},
     )
 
@@ -812,7 +812,7 @@ async def test_extract_maps_unavailable_captions_to_502(
     _install_pipeline(app, pipeline)
 
     response = await client.post(
-        "/api/extract",
+        "/api/extractions",
         json={"url": _CANONICAL_URL},
     )
 
@@ -879,7 +879,7 @@ async def test_extract_groups_screen_work_results(
     )
     _install_pipeline(app, pipeline)
 
-    response = await client.post("/api/extract", json={"url": _CANONICAL_URL})
+    response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
 
     assert response.status_code == 200
     results = response.json()["results"]
@@ -924,7 +924,7 @@ async def test_extract_returns_whisper_transcript(
     )
     _install_pipeline(app, pipeline)
     response = await client.post(
-        "/api/extract",
+        "/api/extractions",
         json={"url": _CANONICAL_URL},
     )
 
@@ -1020,7 +1020,7 @@ async def test_social_sources_serialize_unchanged_response_schema(
     )
     _install_pipeline(app, pipeline)
 
-    response = await client.post("/api/extract", json={"url": submitted_url})
+    response = await client.post("/api/extractions", json={"url": submitted_url})
 
     assert response.status_code == 200
     payload = ExtractResponse.model_validate(response.json())
@@ -1057,9 +1057,9 @@ async def test_concurrent_whisper_http_requests_queue_and_succeed(
     )
     _install_pipeline(app, pipeline)
 
-    first = asyncio.create_task(client.post("/api/extract", json={"url": _CANONICAL_URL}))
+    first = asyncio.create_task(client.post("/api/extractions", json={"url": _CANONICAL_URL}))
     assert await asyncio.to_thread(transcriber.started.wait, 5)
-    second = asyncio.create_task(client.post("/api/extract", json={"url": _CANONICAL_URL}))
+    second = asyncio.create_task(client.post("/api/extractions", json={"url": _CANONICAL_URL}))
     await asyncio.sleep(0)
 
     assert transcriber.calls == 1
@@ -1128,7 +1128,7 @@ async def test_extraction_errors_map_to_contract(
     _install_pipeline(app, _RaisingPipeline(exception))
 
     response = await client.post(
-        "/api/extract",
+        "/api/extractions",
         json={"url": "https://www.youtube.com/watch?v=anything"},
     )
 
@@ -1143,7 +1143,7 @@ async def test_malformed_requests_keep_fastapi_422_contract(
 ) -> None:
     """Keep FastAPI validation responses for malformed request bodies."""
     _install_pipeline(app, _RaisingPipeline(RuntimeError("unused")))
-    response = await client.post("/api/extract", json=payload)
+    response = await client.post("/api/extractions", json=payload)
 
     assert response.status_code == 422
     assert "detail" in response.json()
@@ -1159,7 +1159,7 @@ async def test_unhandled_failures_do_not_leak_internals() -> None:
 
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/api/extract",
+            "/api/extractions",
             json={"url": "https://www.youtube.com/watch?v=anything"},
         )
 
@@ -1179,7 +1179,7 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
 
     assert response.status_code == 200
     document = response.json()
-    operation = document["paths"]["/api/extract"]["post"]
+    operation = document["paths"]["/api/extractions"]["post"]
     responses = operation["responses"]
     description = operation["description"]
     assert "offset zero and limit three" in description
@@ -1781,15 +1781,15 @@ async def test_extract_validates_forwards_and_exposes_the_effective_market(
     _install_pipeline(app, pipeline)
 
     explicit_response = await client.post(
-        "/api/extract",
+        "/api/extractions",
         json={"url": _CANONICAL_URL, "market": "JP"},
     )
     default_response = await client.post(
-        "/api/extract",
+        "/api/extractions",
         json={"url": _CANONICAL_URL},
     )
     invalid_response = await client.post(
-        "/api/extract",
+        "/api/extractions",
         json={"url": _CANONICAL_URL, "market": "jp"},
     )
 

@@ -38,9 +38,9 @@ COPY --from=builder --chown=reelio:reelio /app/.venv /app/.venv
 
 USER reelio
 
-EXPOSE 8000
+EXPOSE 8181
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8181/health', timeout=4)"
 
-CMD ["uvicorn", "reelio.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["uvicorn", "reelio.main:app", "--host", "0.0.0.0", "--port", "8181", "--workers", "1"]

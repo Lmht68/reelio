@@ -66,12 +66,12 @@ GET /health
 ### Extract mentions
 
 ```bash
-curl -X POST http://127.0.0.1:8000/api/extract \
+curl -X POST http://127.0.0.1:8000/api/extractions \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
 ```
 
-`POST /api/extract` accepts a public video `url`.
+`POST /api/extractions` accepts a public video `url`.
 It also accepts an optional two-letter Spotify `market`, such as `US` or `JP`.
 The market changes Spotify lookups only.
 
