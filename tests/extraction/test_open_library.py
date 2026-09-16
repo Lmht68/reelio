@@ -1180,6 +1180,317 @@ async def test_resolver_counts_subtitle_matches_by_canonical_work_id(
     await resolver.aclose()
 
 
+@pytest.mark.parametrize(
+    ("candidate_title", "expected_work_id"),
+    [
+        ("abcdefgxij: A deliberately long subtitle", "OL1W"),
+        ("abcdefxyij: A deliberately long subtitle", None),
+    ],
+)
+async def test_resolver_applies_strict_fuzzy_main_title_threshold(
+    candidate_title: str,
+    expected_work_id: str | None,
+) -> None:
+    """Resolve only main-title fuzzy scores strictly above the threshold."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(_candidate("OL1W", candidate_title)),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(_mentions(BookMention(title="abcdefghij", authors=[])))
+
+    result = results.books[0]
+    if expected_work_id is None:
+        assert result.status is ResultStatus.UNRESOLVED
+        assert result.book is None
+    else:
+        assert _resolved_work_id(results) == expected_work_id
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    ("mention_title", "candidate_title", "expected_work_id"),
+    [
+        ("abcdef", "abcdeg: A deliberately long subtitle", "OL1W"),
+        ("abcde", "abcdex: A deliberately long subtitle", None),
+    ],
+)
+async def test_resolver_requires_six_normalized_characters_for_fuzzy_main_titles(
+    mention_title: str,
+    candidate_title: str,
+    expected_work_id: str | None,
+) -> None:
+    """Require six normalized main-title code points before fuzzy scoring."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(_candidate("OL1W", candidate_title)),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(_mentions(BookMention(title=mention_title, authors=[])))
+
+    result = results.books[0]
+    if expected_work_id is None:
+        assert result.status is ResultStatus.UNRESOLVED
+        assert result.book is None
+    else:
+        assert _resolved_work_id(results) == expected_work_id
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    ("exact_candidate_titles", "expected_work_id"),
+    [
+        ((("OL1W", "abcdefghij: Exact subtitle"),), "OL1W"),
+        (
+            (
+                ("OL1W", "abcdefghij: Exact subtitle"),
+                ("OL3W", "abcdefghij - Second exact subtitle"),
+            ),
+            None,
+        ),
+    ],
+)
+async def test_resolver_applies_exact_main_title_precedence_before_fuzzy_main_titles(
+    exact_candidate_titles: tuple[tuple[str, str], ...],
+    expected_work_id: str | None,
+) -> None:
+    """Apply exact equivalence before fuzzy resolution without breaking ambiguity."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        exact_candidates = [
+            _candidate(work_id, candidate_title)
+            for work_id, candidate_title in exact_candidate_titles
+        ]
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                *exact_candidates,
+                _candidate("OL2W", "abcdefgxij: Approximate subtitle"),
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(_mentions(BookMention(title="abcdefghij", authors=[])))
+
+    result = results.books[0]
+    if expected_work_id is None:
+        assert result.status is ResultStatus.UNRESOLVED
+        assert result.book is None
+    else:
+        assert _resolved_work_id(results) == expected_work_id
+    await resolver.aclose()
+
+
+async def test_resolver_leaves_multiple_fuzzy_main_title_works_ambiguous() -> None:
+    """Do not rank distinct fuzzy main-title Candidates by score or source order."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate("OL1W", "abcdefgxij: First"),
+                _candidate("OL2W", "abcdefghix: Second"),
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(_mentions(BookMention(title="abcdefghij", authors=[])))
+
+    result = results.books[0]
+    assert result.status is ResultStatus.UNRESOLVED
+    assert result.book is None
+    await resolver.aclose()
+
+
+async def test_resolver_counts_one_work_once_across_fuzzy_candidate_titles() -> None:
+    """Count one canonical Work once when several of its titles are fuzzy matches."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate(
+                    "OL1W",
+                    "abcdefgxij: First",
+                    alternative_titles=["abcdefghix - Second"],
+                    edition_titles=["abcdefgzij – Third"],
+                )
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(_mentions(BookMention(title="abcdefghij", authors=[])))
+
+    assert _resolved_work_id(results) == "OL1W"
+    await resolver.aclose()
+
+
+async def test_resolver_excludes_author_mismatches_from_fuzzy_main_title_ambiguity() -> None:
+    """Exclude mismatched Authors before fuzzy main-title ambiguity evaluation."""
+
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate(
+                    "OL1W",
+                    "abcdefgxij: A deliberately long subtitle",
+                    ["OL1A"],
+                    ["Matching Author"],
+                ),
+                _candidate(
+                    "OL2W",
+                    "abcdefghix: Another deliberately long subtitle",
+                    ["OL2A"],
+                    ["Mismatched Author"],
+                ),
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(
+        _mentions(
+            BookMention(
+                title="abcdefghij",
+                authors=[AuthorCredit(name="Matching Author")],
+            )
+        )
+    )
+
+    assert _resolved_work_id(results) == "OL1W"
+    searches = [
+        request
+        for request in requests
+        if request.url.path == "/search.json" and "q" not in request.url.params
+    ]
+    assert [dict(request.url.params) for request in searches] == [
+        {
+            "title": "abcdefghij",
+            "author": "Matching Author",
+            "fields": _WORK_SEARCH_FIELDS,
+            "limit": "5",
+        }
+    ]
+    await resolver.aclose()
+
+
+async def test_resolver_falls_back_after_ambiguous_constrained_fuzzy_main_titles() -> None:
+    """Use the title-only window after constrained fuzzy main-title ambiguity."""
+
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        if "author" in request.url.params:
+            return httpx.Response(
+                200,
+                json=_work_search_response(
+                    _candidate(
+                        "OL1W",
+                        "abcdefgxij: First constrained subtitle",
+                        ["OL1A"],
+                        ["Matching Author"],
+                    ),
+                    _candidate(
+                        "OL2W",
+                        "abcdefghix: Second constrained subtitle",
+                        ["OL2A"],
+                        ["Matching Author"],
+                    ),
+                ),
+            )
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate(
+                    "OL3W",
+                    "abcdefgzij: A title-only fallback subtitle",
+                    ["OL3A"],
+                    ["Matching Author"],
+                )
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(
+        _mentions(
+            BookMention(
+                title="abcdefghij",
+                authors=[AuthorCredit(name="Matching Author")],
+            )
+        )
+    )
+
+    assert _resolved_work_id(results) == "OL3W"
+    searches = [
+        request
+        for request in requests
+        if request.url.path == "/search.json" and "q" not in request.url.params
+    ]
+    assert [dict(request.url.params) for request in searches] == [
+        {
+            "title": "abcdefghij",
+            "author": "Matching Author",
+            "fields": _WORK_SEARCH_FIELDS,
+            "limit": "5",
+        },
+        {
+            "title": "abcdefghij",
+            "fields": _WORK_SEARCH_FIELDS,
+            "limit": "5",
+        },
+    ]
+    await resolver.aclose()
+
+
+async def test_resolver_counts_fuzzy_main_title_redirect_aliases_once() -> None:
+    """Resolve multiple fuzzy redirect aliases as one canonical Work."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            work_id = request.url.path.removeprefix("/works/").removesuffix(".json")
+            if work_id in {"OL1W", "OL2W"}:
+                return httpx.Response(200, json=_redirect_record("OL3W"))
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate("OL1W", "abcdefgxij: First"),
+                _candidate("OL2W", "abcdefghix: Second"),
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(_mentions(BookMention(title="abcdefghij", authors=[])))
+
+    assert len(results.books) == 1
+    assert _resolved_work_id(results) == "OL3W"
+    await resolver.aclose()
+
+
 async def test_resolver_prefers_complete_title_exact_match_over_subtitle_equivalence() -> None:
     """Keep complete-title exact verification ahead of subtitle equivalence."""
 

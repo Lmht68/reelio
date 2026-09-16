@@ -41,6 +41,7 @@ _CACHE_MAX_ENTRIES = 100
 
 type _CatalogRequestKey = tuple[str, tuple[tuple[str, str], ...]]
 
+_FUZZY_MAIN_TITLE_MIN_LENGTH = 6
 _FUZZY_TITLE_SCORE_THRESHOLD = 80.0
 _WORK_SEARCH_FIELDS = (
     "key,title,alternative_title,author_key,author_name,"
@@ -868,27 +869,42 @@ def _select_authorless_candidate(
     ]
     if len(exact_candidates) == 1:
         return exact_candidates[0]
-    return _select_unique_exact_main_title_candidate(book_mention, candidates)
+    return _select_subtitle_equivalent_candidate(book_mention, candidates)
 
 
-def _select_unique_exact_main_title_candidate(
+def _select_subtitle_equivalent_candidate(
     book_mention: BookMention,
     candidates: list[_OpenLibraryCandidate],
 ) -> _OpenLibraryCandidate | None:
-    """Return the sole Candidate with an exact equivalent Book main title."""
+    """Return a unique Candidate with exact or bounded fuzzy main-title equivalence."""
 
     mention_title_parts = _book_title_parts(book_mention.title)
     normalized_mention_main_title = normalize_book_identity(mention_title_parts.main_title)
+    mention_has_subtitle = mention_title_parts.subtitle is not None
     exact_main_title_candidates = [
         candidate
         for candidate in candidates
         if _candidate_has_exact_main_title_equivalence(
             candidate,
             normalized_mention_main_title,
-            mention_title_parts.subtitle is not None,
+            mention_has_subtitle,
         )
     ]
-    return exact_main_title_candidates[0] if len(exact_main_title_candidates) == 1 else None
+    if len(exact_main_title_candidates) == 1:
+        return exact_main_title_candidates[0]
+    if exact_main_title_candidates:
+        return None
+
+    fuzzy_main_title_candidates = [
+        candidate
+        for candidate in candidates
+        if _candidate_has_fuzzy_main_title_equivalence(
+            candidate,
+            normalized_mention_main_title,
+            mention_has_subtitle,
+        )
+    ]
+    return fuzzy_main_title_candidates[0] if len(fuzzy_main_title_candidates) == 1 else None
 
 
 def _select_authorful_candidate(
@@ -917,7 +933,7 @@ def _select_authorful_candidate(
             selected_score = candidate_score
     if selected_candidate is not None:
         return selected_candidate
-    return _select_unique_exact_main_title_candidate(book_mention, eligible_candidates)
+    return _select_subtitle_equivalent_candidate(book_mention, eligible_candidates)
 
 
 def _candidate_has_exact_title(
@@ -948,7 +964,7 @@ def _candidate_has_exact_main_title_equivalence(
     normalized_mention_main_title: str,
     mention_has_subtitle: bool,
 ) -> bool:
-    """Return whether exactly one title has a matching Book main title."""
+    """Return whether a Candidate title has exact Book main-title equivalence."""
 
     return any(
         (candidate_title_parts.subtitle is not None) != mention_has_subtitle
@@ -956,6 +972,28 @@ def _candidate_has_exact_main_title_equivalence(
         == normalized_mention_main_title
         for candidate_title in candidate.candidate_titles
         for candidate_title_parts in (_book_title_parts(candidate_title),)
+    )
+
+
+def _candidate_has_fuzzy_main_title_equivalence(
+    candidate: _OpenLibraryCandidate,
+    normalized_mention_main_title: str,
+    mention_has_subtitle: bool,
+) -> bool:
+    """Return whether a Candidate title has bounded fuzzy main-title equivalence."""
+
+    if len(normalized_mention_main_title) < _FUZZY_MAIN_TITLE_MIN_LENGTH:
+        return False
+    return any(
+        fuzz.ratio(normalized_mention_main_title, normalized_candidate_main_title)
+        > _FUZZY_TITLE_SCORE_THRESHOLD
+        for candidate_title in candidate.candidate_titles
+        for candidate_title_parts in (_book_title_parts(candidate_title),)
+        if (candidate_title_parts.subtitle is not None) != mention_has_subtitle
+        for normalized_candidate_main_title in (
+            normalize_book_identity(candidate_title_parts.main_title),
+        )
+        if len(normalized_candidate_main_title) >= _FUZZY_MAIN_TITLE_MIN_LENGTH
     )
 
 
