@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from time import monotonic
 from typing import cast
@@ -330,6 +331,162 @@ async def test_extract_returns_resolved_and_unresolved_exact_book_works() -> Non
         {
             "status": "unresolved",
             "book_mention": {"title": "Unknown Book", "authors": []},
+            "book": None,
+        },
+    ]
+
+
+async def test_extract_resolves_long_ships_subtitle_equivalence_through_http() -> None:
+    """Resolve one subtitle-equivalent Work and retain an ambiguous main title."""
+
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if _is_preferred_edition_search(request):
+            assert request.url.params["q"] in {
+                "key:/works/OL1W AND language:eng",
+                "key:/works/OL1W",
+            }
+            return httpx.Response(200, json=_search_response())
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        if request.url.params["title"] == "The Long Ships":
+            assert request.url.params["author"] == "Frans G. Bengtsson"
+            return httpx.Response(
+                200,
+                json=_search_response(
+                    {
+                        "key": "/works/OL1W",
+                        "title": "The Long Ships: A Saga of the Viking Age",
+                        "author_key": ["OL1A"],
+                        "author_name": ["Frans G. Bengtsson"],
+                    }
+                ),
+            )
+        if request.url.params["title"] == "Shared Main":
+            assert "author" not in request.url.params
+            return httpx.Response(
+                200,
+                json=_search_response(
+                    {
+                        "key": "/works/OL2W",
+                        "title": "Shared Main: First",
+                    },
+                    {
+                        "key": "/works/OL3W",
+                        "title": "Shared Main - Second",
+                    },
+                ),
+            )
+        raise AssertionError(f"unexpected Open Library request: {request.url}")
+
+    response, interpretation_provider, http_client = await _post_extract(
+        _interpretation_response(
+            [
+                {
+                    "title": "The Long Ships",
+                    "authors": ["Frans G. Bengtsson"],
+                },
+                {"title": "Shared Main", "authors": []},
+            ]
+        ),
+        httpx.MockTransport(handle),
+        transcript_text=("The Long Ships by Frans G. Bengtsson appears before Shared Main."),
+        default_missing_preferred_edition=False,
+    )
+
+    assert response.status_code == 200
+    assert len(interpretation_provider.calls) == 1
+    assert http_client.is_closed is True
+    assert len(requests) == 7
+    work_searches = [
+        request
+        for request in requests
+        if request.url.path == "/search.json" and not _is_preferred_edition_search(request)
+    ]
+    assert Counter(
+        tuple(sorted(request.url.params.items())) for request in work_searches
+    ) == Counter(
+        {
+            (
+                ("author", "Frans G. Bengtsson"),
+                ("fields", _WORK_SEARCH_FIELDS),
+                ("limit", "5"),
+                ("title", "The Long Ships"),
+            ): 1,
+            (
+                ("fields", _WORK_SEARCH_FIELDS),
+                ("limit", "5"),
+                ("title", "Shared Main"),
+            ): 1,
+        }
+    )
+    assert Counter(
+        request.url.path for request in requests if request.url.path.startswith("/works/")
+    ) == Counter(
+        {
+            "/works/OL1W.json": 1,
+            "/works/OL2W.json": 1,
+            "/works/OL3W.json": 1,
+        }
+    )
+    preferred_edition_searches = [
+        request for request in requests if _is_preferred_edition_search(request)
+    ]
+    assert Counter(
+        tuple(sorted(request.url.params.items())) for request in preferred_edition_searches
+    ) == Counter(
+        {
+            (
+                ("fields", _EDITION_SEARCH_FIELDS),
+                ("limit", "1"),
+                ("q", "key:/works/OL1W AND language:eng"),
+            ): 1,
+            (
+                ("fields", _EDITION_SEARCH_FIELDS),
+                ("limit", "1"),
+                ("q", "key:/works/OL1W"),
+            ): 1,
+        }
+    )
+
+    payload = response.json()
+    assert payload["results"]["movies"] == []
+    assert payload["results"]["tv_series"] == []
+    assert payload["results"]["tracks"] == []
+    assert payload["results"]["music_releases"] == []
+    assert payload["statistics"]["books"] == {
+        "n_mentions": 2,
+        "n_resolved": 1,
+        "n_unresolved": 1,
+    }
+    assert payload["results"]["books"] == [
+        {
+            "status": "resolved",
+            "book_mention": {
+                "title": "The Long Ships",
+                "authors": ["Frans G. Bengtsson"],
+            },
+            "book": {
+                "title": "The Long Ships: A Saga of the Viking Age",
+                "authors": [
+                    {
+                        "open_library_author_id": "OL1A",
+                        "name": "Frans G. Bengtsson",
+                        "open_library_url": "https://openlibrary.org/authors/OL1A",
+                    }
+                ],
+                "open_library_work_id": "OL1W",
+                "open_library_url": "https://openlibrary.org/works/OL1W",
+                "edition": None,
+                "cover_url": None,
+                "cover_edition_id": None,
+            },
+        },
+        {
+            "status": "unresolved",
+            "book_mention": {"title": "Shared Main", "authors": []},
             "book": None,
         },
     ]

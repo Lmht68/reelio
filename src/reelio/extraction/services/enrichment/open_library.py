@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 _CATALOG_ERROR_MESSAGE = "Open Library catalog request failed."
 _TIMEOUT_ERROR_MESSAGE = "Open Library catalog request timed out."
 _STAGE = "book_work_resolution"
-_SEARCH_LIMIT = 5
+_SEARCH_LIMIT = 3
 _CACHE_TTL_SECONDS = 86_400.0
 _CACHE_MAX_ENTRIES = 100
 
@@ -58,6 +58,7 @@ _PUBLICATION_YEAR_PATTERN = re.compile(r"(?<!\d)\d{4}(?!\d)")
 _AUDIOBOOK_FORMAT_PATTERN = re.compile(
     r"(?<!\w)(?:audio|audiobook|audio book|sound recording|cassette|mp3)(?!\w)"
 )
+_BOOK_SUBTITLE_SEPARATOR_PATTERN = re.compile(r":|\s+-\s+|\s+\N{EN DASH}\s+")
 
 
 class _OpenLibraryModel(BaseModel):
@@ -173,6 +174,14 @@ class _OpenLibraryCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class _BookTitleParts:
+    """Contain the normalized main title and optional subtitle of a Book title."""
+
+    main_title: str
+    subtitle: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _OpenLibrarySelectedEdition:
     """Contain Search metadata for one relevance-selected Open Library Edition."""
 
@@ -198,7 +207,7 @@ class _OpenLibraryEditionRecord:
 
 
 class OpenLibraryBookResolver:
-    """Resolve Book Work Mentions with exact Open Library Search matches."""
+    """Resolve Book Work Mentions with complete-title and subtitle-aware matches."""
 
     def __init__(
         self,
@@ -297,7 +306,7 @@ class OpenLibraryBookResolver:
                 raw_to_canonical_work_ids,
                 seen_work_ids,
             )
-            candidate = _select_unique_exact_candidate(book_mention, candidates)
+            candidate = _select_authorless_candidate(book_mention, candidates)
 
         if candidate is None:
             return BookResult(
@@ -845,11 +854,11 @@ def _publication_year(numeric_year: int | None, publication_date: str | None) ->
     return publication_year if publication_year <= current_year else None
 
 
-def _select_unique_exact_candidate(
+def _select_authorless_candidate(
     book_mention: BookMention,
     candidates: list[_OpenLibraryCandidate],
 ) -> _OpenLibraryCandidate | None:
-    """Return the sole exact Candidate for an authorless Book Mention."""
+    """Return a uniquely verified Candidate for an authorless Book Mention."""
 
     normalized_title = normalize_book_identity(book_mention.title)
     exact_candidates = [
@@ -857,14 +866,36 @@ def _select_unique_exact_candidate(
         for candidate in candidates
         if _candidate_has_exact_title(candidate, normalized_title)
     ]
-    return exact_candidates[0] if len(exact_candidates) == 1 else None
+    if len(exact_candidates) == 1:
+        return exact_candidates[0]
+    return _select_unique_exact_main_title_candidate(book_mention, candidates)
+
+
+def _select_unique_exact_main_title_candidate(
+    book_mention: BookMention,
+    candidates: list[_OpenLibraryCandidate],
+) -> _OpenLibraryCandidate | None:
+    """Return the sole Candidate with an exact equivalent Book main title."""
+
+    mention_title_parts = _book_title_parts(book_mention.title)
+    normalized_mention_main_title = normalize_book_identity(mention_title_parts.main_title)
+    exact_main_title_candidates = [
+        candidate
+        for candidate in candidates
+        if _candidate_has_exact_main_title_equivalence(
+            candidate,
+            normalized_mention_main_title,
+            mention_title_parts.subtitle is not None,
+        )
+    ]
+    return exact_main_title_candidates[0] if len(exact_main_title_candidates) == 1 else None
 
 
 def _select_authorful_candidate(
     book_mention: BookMention,
     candidates: list[_OpenLibraryCandidate],
 ) -> _OpenLibraryCandidate | None:
-    """Return an exact-first, bounded fuzzy title match for an authorful Mention."""
+    """Return a complete-title or subtitle-aware match for an authorful Mention."""
 
     normalized_title = normalize_book_identity(book_mention.title)
     eligible_candidates = [
@@ -884,18 +915,47 @@ def _select_authorful_candidate(
         if candidate_score > selected_score:
             selected_candidate = candidate
             selected_score = candidate_score
-    return selected_candidate
+    if selected_candidate is not None:
+        return selected_candidate
+    return _select_unique_exact_main_title_candidate(book_mention, eligible_candidates)
 
 
 def _candidate_has_exact_title(
     candidate: _OpenLibraryCandidate,
     normalized_title: str,
 ) -> bool:
-    """Return whether a Candidate has an exact normalized Work title."""
+    """Return whether a Candidate has an exact normalized complete Work title."""
 
     return any(
         normalize_book_identity(candidate_title) == normalized_title
         for candidate_title in candidate.candidate_titles
+    )
+
+
+def _book_title_parts(title: str) -> _BookTitleParts:
+    """Split a Book title at its leftmost recognized nonblank subtitle boundary."""
+
+    for separator_match in _BOOK_SUBTITLE_SEPARATOR_PATTERN.finditer(title):
+        main_title = normalize_book_text(title[: separator_match.start()])
+        subtitle = normalize_book_text(title[separator_match.end() :])
+        if main_title and subtitle:
+            return _BookTitleParts(main_title=main_title, subtitle=subtitle)
+    return _BookTitleParts(main_title=normalize_book_text(title), subtitle=None)
+
+
+def _candidate_has_exact_main_title_equivalence(
+    candidate: _OpenLibraryCandidate,
+    normalized_mention_main_title: str,
+    mention_has_subtitle: bool,
+) -> bool:
+    """Return whether exactly one title has a matching Book main title."""
+
+    return any(
+        (candidate_title_parts.subtitle is not None) != mention_has_subtitle
+        and normalize_book_identity(candidate_title_parts.main_title)
+        == normalized_mention_main_title
+        for candidate_title in candidate.candidate_titles
+        for candidate_title_parts in (_book_title_parts(candidate_title),)
     )
 
 

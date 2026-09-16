@@ -873,6 +873,449 @@ async def test_resolver_collapses_resolved_results_by_canonical_work_id() -> Non
     await resolver.aclose()
 
 
+@pytest.mark.parametrize(
+    ("mention_title", "candidate_title"),
+    [
+        ("Main", "Main:Subtitle"),
+        ("Main", "Main :Subtitle"),
+        ("Main", "Main: Subtitle"),
+        ("Main", "Main : Subtitle"),
+        ("Main", "Main - Subtitle"),
+        ("Main", "Main – Subtitle"),
+        ("Main: Subtitle", "Main"),
+        ("  MAIN  ", " main : subtitle "),
+    ],
+)
+async def test_resolver_equates_unique_exact_main_titles_with_one_subtitle(
+    mention_title: str,
+    candidate_title: str,
+) -> None:
+    """Resolve equivalent main titles when exactly one title has a subtitle."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(_candidate("OL1W", candidate_title)),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    mention = BookMention(title=mention_title, authors=[])
+
+    results = await resolver.resolve(_mentions(mention))
+
+    result = results.books[0]
+    assert result.status is ResultStatus.RESOLVED
+    assert result.book_mention is mention
+    assert result.book is not None
+    assert result.book.title == candidate_title
+    assert result.book.open_library_work_id == "OL1W"
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    ("mention_title", "candidate_title"),
+    [
+        ("Main", "Main - First: Second"),
+        ("Main", "Main: First - Second"),
+        ("Catch-22", "Catch-22: Subtitle"),
+    ],
+)
+async def test_resolver_uses_leftmost_book_subtitle_separator(
+    mention_title: str,
+    candidate_title: str,
+) -> None:
+    """Resolve from the leftmost valid boundary while retaining intrinsic hyphens."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(_candidate("OL1W", candidate_title)),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(_mentions(BookMention(title=mention_title, authors=[])))
+
+    assert _resolved_work_id(results) == "OL1W"
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    ("mention_title", "candidate_title"),
+    [
+        ("Main", "Main-Subtitle"),
+        ("Main", "Main -Subtitle"),
+        ("Main", "Main- Subtitle"),
+        ("Main", "Main–Subtitle"),
+        ("Main", "Main –Subtitle"),
+        ("Main", "Main– Subtitle"),
+        ("Main", "Main:"),
+        ("Main", ": Subtitle"),
+        ("Main: Mention subtitle", "Main: Candidate subtitle"),
+    ],
+)
+async def test_resolver_rejects_non_equivalent_book_subtitle_boundaries(
+    mention_title: str,
+    candidate_title: str,
+) -> None:
+    """Reject malformed boundaries and pairs with subtitles on both titles."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(_candidate("OL1W", candidate_title)),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(_mentions(BookMention(title=mention_title, authors=[])))
+
+    result = results.books[0]
+    assert result.status is ResultStatus.UNRESOLVED
+    assert result.book is None
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected_title"),
+    [
+        (_candidate("OL1W", "Main: Subtitle"), "Main: Subtitle"),
+        (
+            _candidate(
+                "OL1W",
+                "Provider Primary Title",
+                alternative_titles=["Main: Subtitle"],
+            ),
+            "Provider Primary Title",
+        ),
+        (
+            _candidate(
+                "OL1W",
+                "Provider Primary Title",
+                edition_titles=["Main: Subtitle", "Ignored Edition Title"],
+            ),
+            "Provider Primary Title",
+        ),
+    ],
+)
+async def test_resolver_uses_all_candidate_title_sources_for_subtitle_equivalence(
+    candidate: dict[str, object],
+    expected_title: str,
+) -> None:
+    """Use Work, alternative Work, and selected Edition Candidate titles."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(200, json=_work_search_response(candidate))
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(_mentions(BookMention(title="Main", authors=[])))
+
+    result = results.books[0]
+    assert result.status is ResultStatus.RESOLVED
+    assert result.book is not None
+    assert result.book.title == expected_title
+    assert result.book.open_library_work_id == "OL1W"
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    ("mention_author", "provider_author", "author_alias"),
+    [
+        ("Provider Author", "Provider Author", None),
+        ("Provider Alias", "Provider Author", "Provider Alias"),
+    ],
+)
+async def test_resolver_requires_exact_provider_author_credit_for_subtitle_equivalence(
+    mention_author: str,
+    provider_author: str,
+    author_alias: str | None,
+) -> None:
+    """Require an exact provider name or alias before authorful equivalence."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate(
+                    "OL1W",
+                    "Main: Subtitle",
+                    ["OL1A"],
+                    [provider_author],
+                    author_aliases=[author_alias] if author_alias is not None else None,
+                )
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(
+        _mentions(
+            BookMention(
+                title="Main",
+                authors=[AuthorCredit(name=mention_author)],
+            )
+        )
+    )
+
+    assert _resolved_work_id(results) == "OL1W"
+    await resolver.aclose()
+
+
+async def test_resolver_excludes_mismatched_author_from_subtitle_equivalence() -> None:
+    """Resolve only the exact-author Candidate among shared-main-title Works."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate("OL1W", "Shared Main: First", ["OL1A"], ["Other Author"]),
+                _candidate("OL2W", "Shared Main - Second", ["OL2A"], ["Matching Author"]),
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(
+        _mentions(
+            BookMention(
+                title="Shared Main",
+                authors=[AuthorCredit(name="Matching Author")],
+            )
+        )
+    )
+
+    assert _resolved_work_id(results) == "OL2W"
+    await resolver.aclose()
+
+
+async def test_resolver_counts_one_work_once_across_matching_candidate_titles() -> None:
+    """Resolve one canonical Work even when several of its titles qualify."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate(
+                    "OL1W",
+                    "Shared Main: First",
+                    alternative_titles=["Shared Main - Second"],
+                    edition_titles=["Shared Main – Third"],
+                )
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(_mentions(BookMention(title="Shared Main", authors=[])))
+
+    assert _resolved_work_id(results) == "OL1W"
+    await resolver.aclose()
+
+
+async def test_resolver_leaves_distinct_exact_main_title_works_ambiguous() -> None:
+    """Leave an authorless Mention unresolved when two Works qualify."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate("OL1W", "Shared Main: First"),
+                _candidate("OL2W", "Shared Main - Second"),
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(_mentions(BookMention(title="Shared Main", authors=[])))
+
+    result = results.books[0]
+    assert result.status is ResultStatus.UNRESOLVED
+    assert result.book is None
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    ("canonicalize_together", "expected_work_id"),
+    [(True, "OL3W"), (False, None)],
+)
+async def test_resolver_counts_subtitle_matches_by_canonical_work_id(
+    canonicalize_together: bool,
+    expected_work_id: str | None,
+) -> None:
+    """Resolve redirect aliases once and keep distinct canonical Works ambiguous."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            work_id = request.url.path.removeprefix("/works/").removesuffix(".json")
+            if canonicalize_together and work_id in {"OL1W", "OL2W"}:
+                return httpx.Response(200, json=_redirect_record("OL3W"))
+            return httpx.Response(200, json=_work_record(work_id))
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate("OL1W", "Shared Main: First"),
+                _candidate("OL2W", "Shared Main - Second"),
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(_mentions(BookMention(title="Shared Main", authors=[])))
+
+    result = results.books[0]
+    if expected_work_id is None:
+        assert result.status is ResultStatus.UNRESOLVED
+        assert result.book is None
+    else:
+        assert _resolved_work_id(results) == expected_work_id
+    await resolver.aclose()
+
+
+async def test_resolver_prefers_complete_title_exact_match_over_subtitle_equivalence() -> None:
+    """Keep complete-title exact verification ahead of subtitle equivalence."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate("OL1W", "Main: Subtitle", ["OL1A"], ["Author"]),
+                _candidate("OL2W", "Main", ["OL2A"], ["Author"]),
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(
+        _mentions(BookMention(title="Main", authors=[AuthorCredit(name="Author")]))
+    )
+
+    assert _resolved_work_id(results) == "OL2W"
+    await resolver.aclose()
+
+
+async def test_resolver_prefers_complete_title_fuzzy_match_over_subtitle_equivalence() -> None:
+    """Keep complete-title fuzzy verification ahead of subtitle equivalence."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate("OL1W", "Main: Subtitle", ["OL1A"], ["Author"]),
+                _candidate("OL2W", "Mainx", ["OL2A"], ["Author"]),
+            ),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(
+        _mentions(BookMention(title="Main", authors=[AuthorCredit(name="Author")]))
+    )
+
+    assert _resolved_work_id(results) == "OL2W"
+    await resolver.aclose()
+
+
+async def test_resolver_stops_after_constrained_subtitle_equivalence() -> None:
+    """Avoid a title-only Search after the constrained subtitle stage resolves."""
+
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        return httpx.Response(
+            200,
+            json=_work_search_response(_candidate("OL1W", "Main: Subtitle", ["OL1A"], ["Author"])),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(
+        _mentions(BookMention(title="Main", authors=[AuthorCredit(name="Author")]))
+    )
+
+    assert _resolved_work_id(results) == "OL1W"
+    searches = [
+        request
+        for request in requests
+        if request.url.path == "/search.json" and "q" not in request.url.params
+    ]
+    assert [dict(request.url.params) for request in searches] == [
+        {
+            "title": "Main",
+            "author": "Author",
+            "fields": _WORK_SEARCH_FIELDS,
+            "limit": "5",
+        }
+    ]
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    "constrained_candidates",
+    [
+        [
+            _candidate("OL1W", "Main: First", ["OL1A"], ["Author"]),
+            _candidate("OL2W", "Main - Second", ["OL2A"], ["Author"]),
+        ],
+        [_candidate("OL1W", "Unrelated Work", ["OL1A"], ["Author"])],
+    ],
+)
+async def test_resolver_falls_back_after_failed_or_ambiguous_constrained_subtitle_stage(
+    constrained_candidates: list[dict[str, object]],
+) -> None:
+    """Issue one title-only Search after a constrained subtitle stage cannot resolve."""
+
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.startswith("/works/"):
+            return _terminal_work_response(request)
+        if "author" in request.url.params:
+            return httpx.Response(
+                200,
+                json=_work_search_response(*constrained_candidates),
+            )
+        return httpx.Response(
+            200,
+            json=_work_search_response(_candidate("OL3W", "Main: Fallback", ["OL3A"], ["Author"])),
+        )
+
+    resolver = _resolver(httpx.MockTransport(handle))
+    results = await resolver.resolve(
+        _mentions(BookMention(title="Main", authors=[AuthorCredit(name="Author")]))
+    )
+
+    assert _resolved_work_id(results) == "OL3W"
+    searches = [
+        request
+        for request in requests
+        if request.url.path == "/search.json" and "q" not in request.url.params
+    ]
+    assert [dict(request.url.params) for request in searches] == [
+        {
+            "title": "Main",
+            "author": "Author",
+            "fields": _WORK_SEARCH_FIELDS,
+            "limit": "5",
+        },
+        {"title": "Main", "fields": _WORK_SEARCH_FIELDS, "limit": "5"},
+    ]
+    await resolver.aclose()
+
+
 async def test_resolver_preserves_concurrent_mention_result_order() -> None:
     """Return ordered unresolved and resolved results after concurrent resolution."""
 
