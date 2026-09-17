@@ -412,12 +412,12 @@ async def test_extract_resolves_long_ships_subtitle_equivalence_through_http() -
             (
                 ("author", "Frans G. Bengtsson"),
                 ("fields", _WORK_SEARCH_FIELDS),
-                ("limit", "5"),
+                ("limit", "3"),
                 ("title", "The Long Ships"),
             ): 1,
             (
                 ("fields", _WORK_SEARCH_FIELDS),
-                ("limit", "5"),
+                ("limit", "3"),
                 ("title", "Shared Main"),
             ): 1,
         }
@@ -839,12 +839,12 @@ async def test_extract_exposes_provider_preferred_editions_independent_of_source
     assert {tuple(sorted(request.url.params.items())) for request in work_searches} == {
         (
             ("fields", _WORK_SEARCH_FIELDS),
-            ("limit", "5"),
+            ("limit", "3"),
             ("title", "Interpreted First Mention"),
         ),
         (
             ("fields", _WORK_SEARCH_FIELDS),
-            ("limit", "5"),
+            ("limit", "3"),
             ("title", "Interpreted Second Mention"),
         ),
     }

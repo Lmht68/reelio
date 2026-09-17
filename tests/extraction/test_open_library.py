@@ -296,7 +296,7 @@ async def test_resolver_uses_author_constrained_exact_search_without_fallback() 
         "title": "  Pride and Prejudice  ",
         "author": "JANE AUSTEN",
         "fields": _WORK_SEARCH_FIELDS,
-        "limit": "5",
+        "limit": "3",
     }
     assert [request.url.path for request in requests[1:]] == [
         "/works/OL1W.json",
@@ -346,9 +346,9 @@ async def test_resolver_falls_back_once_after_constrained_window_has_no_match() 
             "title": "Dune",
             "author": "Frank Herbert",
             "fields": _WORK_SEARCH_FIELDS,
-            "limit": "5",
+            "limit": "3",
         },
-        {"title": "Dune", "fields": _WORK_SEARCH_FIELDS, "limit": "5"},
+        {"title": "Dune", "fields": _WORK_SEARCH_FIELDS, "limit": "3"},
     ]
     assert _resolved_work_id(results) == "OL1W"
     await resolver.aclose()
@@ -389,13 +389,13 @@ async def test_resolver_does_not_fallback_when_constrained_fuzzy_match_passes() 
     await resolver.aclose()
 
 
-async def test_resolver_limits_each_search_window_to_five_candidates() -> None:
-    """Ignore a sixth Search Candidate even when it would otherwise resolve."""
+async def test_resolver_limits_each_search_window_to_three_candidates() -> None:
+    """Ignore a fourth Search Candidate even when it would otherwise resolve."""
     requests: list[httpx.Request] = []
     constrained_candidates = [
-        _candidate(f"OL{index}W", f"Other {index}", ["OL1A"], ["Author"]) for index in range(1, 6)
+        _candidate(f"OL{index}W", f"Other {index}", ["OL1A"], ["Author"]) for index in range(1, 4)
     ]
-    constrained_candidates.append(_candidate("OL6W", "Target", ["OL1A"], ["Author"]))
+    constrained_candidates.append(_candidate("OL4W", "Target", ["OL1A"], ["Author"]))
 
     async def handle(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -415,8 +415,6 @@ async def test_resolver_limits_each_search_window_to_five_candidates() -> None:
         "/works/OL1W.json",
         "/works/OL2W.json",
         "/works/OL3W.json",
-        "/works/OL4W.json",
-        "/works/OL5W.json",
     ]
     assert len([request for request in requests if request.url.path == "/search.json"]) == 2
     await resolver.aclose()
@@ -1389,7 +1387,7 @@ async def test_resolver_excludes_author_mismatches_from_fuzzy_main_title_ambigui
             "title": "abcdefghij",
             "author": "Matching Author",
             "fields": _WORK_SEARCH_FIELDS,
-            "limit": "5",
+            "limit": "3",
         }
     ]
     await resolver.aclose()
@@ -1455,12 +1453,12 @@ async def test_resolver_falls_back_after_ambiguous_constrained_fuzzy_main_titles
             "title": "abcdefghij",
             "author": "Matching Author",
             "fields": _WORK_SEARCH_FIELDS,
-            "limit": "5",
+            "limit": "3",
         },
         {
             "title": "abcdefghij",
             "fields": _WORK_SEARCH_FIELDS,
-            "limit": "5",
+            "limit": "3",
         },
     ]
     await resolver.aclose()
@@ -1567,7 +1565,7 @@ async def test_resolver_stops_after_constrained_subtitle_equivalence() -> None:
             "title": "Main",
             "author": "Author",
             "fields": _WORK_SEARCH_FIELDS,
-            "limit": "5",
+            "limit": "3",
         }
     ]
     await resolver.aclose()
@@ -1620,9 +1618,9 @@ async def test_resolver_falls_back_after_failed_or_ambiguous_constrained_subtitl
             "title": "Main",
             "author": "Author",
             "fields": _WORK_SEARCH_FIELDS,
-            "limit": "5",
+            "limit": "3",
         },
-        {"title": "Main", "fields": _WORK_SEARCH_FIELDS, "limit": "5"},
+        {"title": "Main", "fields": _WORK_SEARCH_FIELDS, "limit": "3"},
     ]
     await resolver.aclose()
 
