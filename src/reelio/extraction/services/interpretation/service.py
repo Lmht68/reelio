@@ -28,13 +28,12 @@ from reelio.extraction.types import (
     BookMention,
     BookMentions,
     ExtractionMentions,
+    InterpretationMaterial,
     MovieMention,
     MusicMentions,
     MusicReleaseMention,
     ScreenWorkMentions,
-    Source,
     TrackMention,
-    Transcript,
     TVSeriesMention,
     normalize_book_identity,
     normalize_music_identity,
@@ -102,14 +101,12 @@ class MentionInterpretationService:
 
     async def interpret(
         self,
-        source: Source,
-        transcript: Transcript,
+        material: InterpretationMaterial,
     ) -> ExtractionMentions:
-        """Interpret ordered, deduplicated mentions from a Transcript.
+        """Interpret ordered, deduplicated mentions from Interpretation Material.
 
         Args:
-            source: Canonical Source whose metadata supports interpretation.
-            transcript: Complete normalized Transcript to interpret.
+            material: Complete normalized source context and Transcript to interpret.
 
         Returns:
             ExtractionMentions: Canonical mentions grouped by service scope.
@@ -121,16 +118,16 @@ class MentionInterpretationService:
             MentionInterpretationError: If the provider request fails.
             PipelineTimeoutError: If the provider request times out.
         """
-        self._validate_input_limits(source, transcript)
+        self._validate_input_limits(material)
         messages = (
             LLMMessage(role="system", content=self._system_prompt),
             LLMMessage(
                 role="user",
                 content=build_interpretation_material(
-                    source.title,
-                    source.description,
-                    transcript.language,
-                    transcript.text,
+                    material.source_title,
+                    material.source_description,
+                    material.transcript.language,
+                    material.transcript.text,
                 ),
             ),
         )
@@ -184,22 +181,26 @@ class MentionInterpretationService:
         """Close the lifespan-owned interpretation provider."""
         await self._provider.aclose()
 
-    def _validate_input_limits(self, source: Source, transcript: Transcript) -> None:
+    def _validate_input_limits(self, material: InterpretationMaterial) -> None:
         limits = (
-            ("source_title_too_large", len(source.title), self._settings.max_source_title_chars),
+            (
+                "source_title_too_large",
+                len(material.source_title),
+                self._settings.max_source_title_chars,
+            ),
             (
                 "source_description_too_large",
-                len(source.description),
+                len(material.source_description),
                 self._settings.max_description_chars,
             ),
             (
                 "transcript_language_too_large",
-                len(transcript.language),
+                len(material.transcript.language),
                 self._settings.max_transcript_language_chars,
             ),
             (
                 "transcript_too_large",
-                len(transcript.text),
+                len(material.transcript.text),
                 self._settings.max_transcript_chars,
             ),
         )

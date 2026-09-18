@@ -25,7 +25,11 @@ from reelio.extraction.services.transcription.inspection import (
     _is_timeout_exception,
 )
 from reelio.extraction.services.transcription.util import extract_info_with_retries
-from reelio.extraction.types import Transcript, TranscriptMethod
+from reelio.extraction.types import (
+    Transcript,
+    TranscriptMethod,
+    normalize_transcript_segments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -460,7 +464,7 @@ class FasterWhisperTranscriber:
                         raise TypeError
                     yield text
 
-            text = _normalize_segments(segment_texts())
+            text = normalize_transcript_segments(segment_texts())
             language = info.language
             if not isinstance(language, str) or not language.strip() or not text:
                 logger.debug("invalid language type", extra={"stage": "transcription"})
@@ -562,15 +566,6 @@ def _rank_caption_tracks(
     return tuple(track for bucket in buckets for track in bucket)
 
 
-def _normalize_segments(segments: Iterable[str]) -> str:
-    tokens: list[str] = []
-    for segment in segments:
-        if not isinstance(segment, str):
-            raise TypeError
-        tokens.extend(segment.split())
-    return " ".join(tokens)
-
-
 def acquire_transcript(
     provider: CaptionProvider,
     video_id: str,
@@ -593,7 +588,7 @@ def acquire_transcript(
         try:
             segments = track.fetch_segments()
             segment_count = len(segments)
-            transcript_text = _normalize_segments(segments)
+            transcript_text = normalize_transcript_segments(segments)
             if not transcript_text:
                 continue
             language = track.language_code
@@ -753,7 +748,7 @@ def _transcribe_audio(
             "invalid_transcription_result",
         )
         raise _WhisperProviderFailure
-    transcript_text = _normalize_segments((result.text,))
+    transcript_text = normalize_transcript_segments((result.text,))
     if not transcript_text:
         _log_acquisition_error(
             "whisper provider error",

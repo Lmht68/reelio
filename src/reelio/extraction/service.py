@@ -8,9 +8,12 @@ from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
     ExtractionMentions,
     ExtractionResults,
+    InterpretationMaterial,
     PipelineResult,
     Source,
     Transcript,
+    TranscriptMethod,
+    TranscriptPipelineResult,
 )
 
 _DEFAULT_MARKET = SpotifyMarket("US")
@@ -32,6 +35,25 @@ class ExtractionPipelineProtocol(Protocol):
 
         Returns:
             PipelineResult: Canonical source, transcript, and grouped results.
+
+        Raises:
+            ExtractionError: If a pipeline stage fails with a domain error.
+        """
+        ...
+
+    async def run_transcript(
+        self,
+        transcript_text: str,
+        market: SpotifyMarket | None = None,
+    ) -> TranscriptPipelineResult:
+        """Extract structured mentions and results from submitted transcript text.
+
+        Args:
+            transcript_text: Normalized transcript text submitted by the API caller.
+            market: Optional validated Spotify market from the API caller.
+
+        Returns:
+            TranscriptPipelineResult: Transcript, effective market, and grouped results.
 
         Raises:
             ExtractionError: If a pipeline stage fails with a domain error.
@@ -65,12 +87,11 @@ class _TranscriptAcquirer(Protocol):
 
 
 class _MentionInterpreter(Protocol):
-    """Interpret grouped mentions from one Source and Transcript."""
+    """Interpret grouped mentions from complete Interpretation Material."""
 
     async def interpret(
         self,
-        source: Source,
-        transcript: Transcript,
+        material: InterpretationMaterial,
     ) -> ExtractionMentions:
         """Return canonical mentions grouped by service scope."""
         ...
@@ -149,18 +170,62 @@ class ExtractionPipeline:
         finally:
             inspected.cleanup()
 
-        interpreted = await self._interpretation_service.interpret(
-            inspected.source,
-            transcript,
+        material = InterpretationMaterial(
+            source_title=inspected.source.title,
+            source_description=inspected.source.description,
+            transcript=transcript,
         )
-        effective_market = self._default_market if market is None else market
-        results = await self._result_aggregator.aggregate(interpreted, effective_market)
+        results, effective_market = await self._interpret_and_aggregate(material, market)
         return PipelineResult(
             source=inspected.source,
             transcript=transcript,
             results=results,
             market=effective_market,
         )
+
+    async def run_transcript(
+        self,
+        transcript_text: str,
+        market: SpotifyMarket | None = None,
+    ) -> TranscriptPipelineResult:
+        """Produce resolved or unresolved results for submitted transcript text.
+
+        Args:
+            transcript_text: Normalized transcript text submitted by the API caller.
+            market: Optional validated Spotify market from the API caller.
+
+        Returns:
+            TranscriptPipelineResult: Transcript, effective market, and Results.
+
+        Raises:
+            ExtractionError: If any pipeline stage fails with a domain error.
+        """
+        transcript = Transcript(
+            text=transcript_text,
+            language="und",
+            method=TranscriptMethod.TEXT_SUBMISSION,
+        )
+        material = InterpretationMaterial(
+            source_title="",
+            source_description="",
+            transcript=transcript,
+        )
+        results, effective_market = await self._interpret_and_aggregate(material, market)
+        return TranscriptPipelineResult(
+            transcript=transcript,
+            results=results,
+            market=effective_market,
+        )
+
+    async def _interpret_and_aggregate(
+        self,
+        material: InterpretationMaterial,
+        market: SpotifyMarket | None,
+    ) -> tuple[ExtractionResults, SpotifyMarket]:
+        interpreted = await self._interpretation_service.interpret(material)
+        effective_market = self._default_market if market is None else market
+        results = await self._result_aggregator.aggregate(interpreted, effective_market)
+        return results, effective_market
 
     async def aclose(self) -> None:
         """Release lifespan-owned interpretation and aggregation resources."""

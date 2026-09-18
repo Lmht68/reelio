@@ -24,6 +24,7 @@ from reelio.extraction.types import (
     BookResults,
     ExtractionMentions,
     ExtractionResults,
+    InterpretationMaterial,
     MovieMention,
     MovieResult,
     MusicMentions,
@@ -35,6 +36,7 @@ from reelio.extraction.types import (
     Source,
     Transcript,
     TranscriptMethod,
+    TranscriptPipelineResult,
     TVSeriesMention,
     TVSeriesResult,
 )
@@ -155,6 +157,58 @@ async def test_pipeline_inspects_source_before_acquiring_transcript() -> None:
     assert call_order == ["source_inspection", "transcript_acquisition"]
 
 
+async def test_pipeline_runs_submitted_transcript_without_source_stages() -> None:
+    """Interpret and aggregate submitted Transcript text without source-side work."""
+    submitted_text = "Dune: Part One (2021) was excellent."
+    movie_mention = MovieMention(title="Dune: Part One", year=2021)
+    mentions = ExtractionMentions(
+        screen_works=ScreenWorkMentions(movies=[movie_mention], tv_series=[]),
+        music=MusicMentions(tracks=[], music_releases=[]),
+        books=BookMentions(books=[]),
+    )
+    results = ExtractionResults(
+        screen_works=ScreenWorkResults(
+            movies=[MovieResult(ResultStatus.UNRESOLVED, movie_mention, None)],
+            tv_series=[],
+        ),
+        music=MusicResults(tracks=[], music_releases=[]),
+        books=BookResults(books=[]),
+    )
+    metadata_service = _FakeSourceMetadataService(_source())
+    transcription_service = _FakeTranscriptionService(_transcript())
+    interpretation_service = _FakeInterpretationService(mentions)
+    result_aggregator = _FakeResultAggregator(results=results)
+    pipeline = _pipeline(
+        metadata_service,
+        transcription_service,
+        interpretation_service,
+        result_aggregator,
+    )
+
+    result = await pipeline.run_transcript(submitted_text)
+
+    expected_transcript = Transcript(
+        text=submitted_text,
+        language="und",
+        method=TranscriptMethod.TEXT_SUBMISSION,
+    )
+    assert isinstance(result, TranscriptPipelineResult)
+    assert result.transcript == expected_transcript
+    assert result.market == _DEFAULT_MARKET
+    assert result.results is results
+    assert metadata_service.calls == []
+    assert transcription_service.calls == []
+    assert interpretation_service.calls == [
+        InterpretationMaterial(
+            source_title="",
+            source_description="",
+            transcript=expected_transcript,
+        )
+    ]
+    assert result_aggregator.calls == [mentions]
+    assert result_aggregator.markets == [_DEFAULT_MARKET]
+
+
 async def test_pipeline_returns_empty_grouped_results_and_aggregates_once() -> None:
     """Pass empty generalized mentions to aggregation once and retain empty results."""
     source = _source()
@@ -182,7 +236,13 @@ async def test_pipeline_returns_empty_grouped_results_and_aggregates_once() -> N
     assert result.transcript is transcript
     assert metadata_service.calls == [_CANONICAL_URL]
     assert transcription_service.calls == [(source, _CANONICAL_URL)]
-    assert interpretation_service.calls == [(source, transcript)]
+    assert interpretation_service.calls == [
+        InterpretationMaterial(
+            source_title=source.title,
+            source_description=source.description,
+            transcript=transcript,
+        )
+    ]
     assert result_aggregator.calls == [extraction_mentions]
     assert result_aggregator.calls[0] is extraction_mentions
     assert result.results.screen_works.movies == []

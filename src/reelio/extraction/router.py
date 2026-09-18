@@ -18,6 +18,7 @@ from reelio.extraction.types import (
     EnrichedMusicRelease,
     EnrichedTrack,
     EnrichedTVSeries,
+    ExtractionResults,
     MovieMention,
     MovieResult,
     MusicReleaseMention,
@@ -26,6 +27,8 @@ from reelio.extraction.types import (
     ResultStatus,
     TrackMention,
     TrackResult,
+    Transcript,
+    TranscriptPipelineResult,
     TVSeriesMention,
     TVSeriesResult,
 )
@@ -233,7 +236,13 @@ _EXTRACT_RESPONSE_EXAMPLE = {
 }
 
 
+_TRANSCRIPT_EXTRACT_RESPONSE_EXAMPLE = {
+    key: value for key, value in _EXTRACT_RESPONSE_EXAMPLE.items() if key != "source"
+}
+
+
 router = APIRouter(prefix="/api", tags=["extraction"])
+internal_router = APIRouter(prefix="/api/internal", tags=["internal extraction"])
 
 
 def get_pipeline(request: Request) -> ExtractionPipelineProtocol:
@@ -479,6 +488,40 @@ def _to_result_counts_schema(
     )
 
 
+def _to_transcript_model(transcript: Transcript) -> extraction_schemas.TranscriptModel:
+    return extraction_schemas.TranscriptModel(
+        text=transcript.text,
+        language=transcript.language,
+        method=transcript.method,
+    )
+
+
+def _to_statistics_model(
+    results: ExtractionResults,
+) -> extraction_schemas.ExtractionStatisticsModel:
+    return extraction_schemas.ExtractionStatisticsModel(
+        movies=_to_result_counts_schema(results.screen_works.movies),
+        tv_series=_to_result_counts_schema(results.screen_works.tv_series),
+        tracks=_to_result_counts_schema(results.music.tracks),
+        music_releases=_to_result_counts_schema(results.music.music_releases),
+        books=_to_result_counts_schema(results.books.books),
+    )
+
+
+def _to_results_model(
+    results: ExtractionResults,
+) -> extraction_schemas.ExtractionResultsModel:
+    return extraction_schemas.ExtractionResultsModel(
+        movies=[_to_movie_result_schema(item) for item in results.screen_works.movies],
+        tv_series=[_to_tv_series_result_schema(item) for item in results.screen_works.tv_series],
+        tracks=[_to_track_result_schema(item) for item in results.music.tracks],
+        music_releases=[
+            _to_music_release_result_schema(item) for item in results.music.music_releases
+        ],
+        books=[_to_book_result_schema(item) for item in results.books.books],
+    )
+
+
 def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
     return extraction_schemas.ExtractResponse(
         market=result.market,
@@ -491,30 +534,20 @@ def _to_response(result: PipelineResult) -> extraction_schemas.ExtractResponse:
             channel=result.source.channel,
             duration_seconds=result.source.duration_seconds,
         ),
-        transcript=extraction_schemas.TranscriptModel(
-            text=result.transcript.text,
-            language=result.transcript.language,
-            method=result.transcript.method,
-        ),
-        statistics=extraction_schemas.ExtractionStatisticsModel(
-            movies=_to_result_counts_schema(result.results.screen_works.movies),
-            tv_series=_to_result_counts_schema(result.results.screen_works.tv_series),
-            tracks=_to_result_counts_schema(result.results.music.tracks),
-            music_releases=_to_result_counts_schema(result.results.music.music_releases),
-            books=_to_result_counts_schema(result.results.books.books),
-        ),
-        results=extraction_schemas.ExtractionResultsModel(
-            movies=[_to_movie_result_schema(item) for item in result.results.screen_works.movies],
-            tv_series=[
-                _to_tv_series_result_schema(item) for item in result.results.screen_works.tv_series
-            ],
-            tracks=[_to_track_result_schema(item) for item in result.results.music.tracks],
-            music_releases=[
-                _to_music_release_result_schema(item)
-                for item in result.results.music.music_releases
-            ],
-            books=[_to_book_result_schema(item) for item in result.results.books.books],
-        ),
+        transcript=_to_transcript_model(result.transcript),
+        statistics=_to_statistics_model(result.results),
+        results=_to_results_model(result.results),
+    )
+
+
+def _to_transcript_response(
+    result: TranscriptPipelineResult,
+) -> extraction_schemas.TranscriptExtractResponse:
+    return extraction_schemas.TranscriptExtractResponse(
+        market=result.market,
+        transcript=_to_transcript_model(result.transcript),
+        statistics=_to_statistics_model(result.results),
+        results=_to_results_model(result.results),
     )
 
 
@@ -663,3 +696,73 @@ async def extract(
     """
     result = await pipeline.run(payload.url, payload.market)
     return _to_response(result)
+
+
+@internal_router.post(
+    "/extractions",
+    status_code=status.HTTP_200_OK,
+    response_model=extraction_schemas.TranscriptExtractResponse,
+    summary="Extract mentioned works from submitted Transcript text",
+    description=(
+        "Accept Transcript text supplied directly for internal testing and return the "
+        "normalized Transcript, the effective Spotify market, category-specific result "
+        "statistics, and grouped Movie, TV Series, Track, Music Release, and Book Work "
+        "results. This endpoint has no Source and skips Source inspection and Transcript "
+        "acquisition. The optional market must use uppercase ISO 3166-1 alpha-2 syntax; "
+        "an omitted market uses configured US."
+    ),
+    response_description=(
+        "Effective market, normalized Transcript, category-specific result statistics, "
+        "and grouped Movie, TV Series, Track, Music Release, and Book Work results."
+    ),
+    responses={
+        200: {
+            "description": (
+                "Result statistics and grouped Movie, TV Series, Track, Music Release, "
+                "and Book Work results."
+            ),
+            "content": {
+                "application/json": {
+                    "example": _TRANSCRIPT_EXTRACT_RESPONSE_EXAMPLE,
+                }
+            },
+        },
+        413: {
+            "model": extraction_schemas.ErrorResponse,
+            "description": "Interpretation Material exceeds its configured limit.",
+        },
+        500: {
+            "model": extraction_schemas.ErrorResponse,
+            "description": "Unexpected internal failure.",
+        },
+        502: {
+            "model": extraction_schemas.ErrorResponse,
+            "description": (
+                "LLM, TMDB, Spotify, or Open Library provider failure. Any TMDB, "
+                "Spotify, or Open Library provider failure fails the complete request."
+            ),
+        },
+        504: {
+            "model": extraction_schemas.ErrorResponse,
+            "description": "External provider timeout.",
+        },
+    },
+)
+async def extract_transcript(
+    payload: extraction_schemas.TranscriptExtractRequest,
+    pipeline: Annotated[ExtractionPipelineProtocol, Depends(get_pipeline)],
+) -> extraction_schemas.TranscriptExtractResponse:
+    """Extract structured mentions from submitted Transcript text.
+
+    Args:
+        payload: Validated Transcript and optional market for internal extraction.
+        pipeline: Extraction pipeline supplied by FastAPI dependency injection.
+
+    Returns:
+        TranscriptExtractResponse: Effective market, Transcript, and grouped results.
+
+    Raises:
+        ExtractionError: If the pipeline raises an extraction domain error.
+    """
+    result = await pipeline.run_transcript(payload.transcript, payload.market)
+    return _to_transcript_response(result)

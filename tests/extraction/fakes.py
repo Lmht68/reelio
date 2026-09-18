@@ -7,6 +7,7 @@ from reelio.extraction.types import (
     BookResults,
     ExtractionMentions,
     ExtractionResults,
+    InterpretationMaterial,
     MovieResult,
     MusicMentions,
     MusicReleaseResult,
@@ -14,9 +15,7 @@ from reelio.extraction.types import (
     ResultStatus,
     ScreenWorkMentions,
     ScreenWorkResults,
-    Source,
     TrackResult,
-    Transcript,
     TVSeriesResult,
 )
 
@@ -45,19 +44,14 @@ class FakeInterpretationService:
             )
         )
         self.error = error
-        self.calls: list[tuple[Source, Transcript]] = []
+        self.calls: list[InterpretationMaterial] = []
         self.closed = False
 
-    async def interpret(
-        self,
-        source: Source,
-        transcript: Transcript,
-    ) -> ExtractionMentions:
+    async def interpret(self, material: InterpretationMaterial) -> ExtractionMentions:
         """Record Interpretation Material and return configured mentions.
 
         Args:
-            source: Source supplied by the extraction pipeline.
-            transcript: Transcript supplied by the extraction pipeline.
+            material: Source context and Transcript supplied by the pipeline.
 
         Returns:
             ExtractionMentions: Configured mentions grouped by service scope.
@@ -65,7 +59,7 @@ class FakeInterpretationService:
         Raises:
             Exception: Configured error when one was provided.
         """
-        self.calls.append((source, transcript))
+        self.calls.append(material)
         if self.error is not None:
             raise self.error
         return self.mentions

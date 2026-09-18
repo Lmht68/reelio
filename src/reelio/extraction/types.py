@@ -1,6 +1,7 @@
 """Domain types for extraction and identity primitives."""
 
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
@@ -104,6 +105,26 @@ def normalize_book_identity(text: str) -> str:
     return normalize_book_text(text).casefold()
 
 
+def normalize_transcript_segments(segments: Iterable[str]) -> str:
+    """Normalize Transcript segments into one whitespace-collapsed string.
+
+    Args:
+        segments: Transcript text segments in their original order.
+
+    Returns:
+        str: Segments joined with a single space between non-whitespace tokens.
+
+    Raises:
+        TypeError: If a segment is not text.
+    """
+    tokens: list[str] = []
+    for segment in segments:
+        if not isinstance(segment, str):
+            raise TypeError
+        tokens.extend(segment.split())
+    return " ".join(tokens)
+
+
 AlbumType = Literal["album", "single", "compilation"]
 
 
@@ -118,10 +139,11 @@ class Platform(StrEnum):
 
 
 class TranscriptMethod(StrEnum):
-    """Methods used to acquire a normalized transcript."""
+    """Methods used to produce a normalized transcript."""
 
     YOUTUBE_CAPTIONS = "youtube_captions"
     WHISPER = "whisper"
+    TEXT_SUBMISSION = "text_submission"
 
 
 class ResultStatus(StrEnum):
@@ -180,6 +202,21 @@ class Transcript:
     text: str
     language: str
     method: TranscriptMethod
+
+
+@dataclass(frozen=True, slots=True)
+class InterpretationMaterial:
+    """Contain source context and Transcript supplied to mention interpretation.
+
+    Attributes:
+        source_title: Source title supplied as LLM context.
+        source_description: Source description supplied as LLM context.
+        transcript: Normalized Transcript supplied for interpretation.
+    """
+
+    source_title: str
+    source_description: str
+    transcript: Transcript
 
 
 @dataclass
@@ -632,6 +669,21 @@ class PipelineResult:
     """
 
     source: Source
+    transcript: Transcript
+    results: ExtractionResults
+    market: SpotifyMarket
+
+
+@dataclass
+class TranscriptPipelineResult:
+    """Contain the output of a transcript-submission extraction pipeline.
+
+    Attributes:
+        transcript: Submitted normalized Transcript used for interpretation.
+        results: Resolved results grouped by service scope.
+        market: Effective Spotify market used for catalog resolution.
+    """
+
     transcript: Transcript
     results: ExtractionResults
     market: SpotifyMarket

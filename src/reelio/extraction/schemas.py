@@ -1,9 +1,15 @@
 """Pydantic models for the extraction HTTP contract."""
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from reelio.extraction.market import SpotifyMarket
-from reelio.extraction.types import AlbumType, Platform, ResultStatus, TranscriptMethod
+from reelio.extraction.types import (
+    AlbumType,
+    Platform,
+    ResultStatus,
+    TranscriptMethod,
+    normalize_transcript_segments,
+)
 
 
 class ExtractRequest(BaseModel):
@@ -26,6 +32,38 @@ class ExtractRequest(BaseModel):
         description="Optional ISO 3166-1 alpha-2 Spotify market.",
         examples=["US", "JP"],
     )
+
+
+class TranscriptExtractRequest(BaseModel):
+    """Request extraction from normalized submitted Transcript text."""
+
+    transcript: str = Field(
+        examples=["Dune: Part One (2021) was excellent."],
+    )
+    market: SpotifyMarket | None = Field(
+        default=None,
+        description="Optional ISO 3166-1 alpha-2 Spotify market.",
+        examples=["US", "JP"],
+    )
+
+    @field_validator("transcript")
+    @classmethod
+    def normalize_transcript(cls, value: str) -> str:
+        """Normalize submitted Transcript text and reject blank content.
+
+        Args:
+            value: Submitted Transcript text.
+
+        Returns:
+            str: Whitespace-normalized Transcript text.
+
+        Raises:
+            ValueError: If the submitted text has no non-whitespace content.
+        """
+        transcript = normalize_transcript_segments((value,))
+        if not transcript:
+            raise ValueError("Transcript must contain non-whitespace characters.")
+        return transcript
 
 
 class SourceModel(BaseModel):
@@ -297,6 +335,17 @@ class ExtractResponse(BaseModel):
         description="Effective ISO 3166-1 alpha-2 Spotify market.",
     )
     source: SourceModel
+    transcript: TranscriptModel
+    statistics: ExtractionStatisticsModel
+    results: ExtractionResultsModel
+
+
+class TranscriptExtractResponse(BaseModel):
+    """Successful transcript extraction response without a Source."""
+
+    market: SpotifyMarket = Field(
+        description="Effective ISO 3166-1 alpha-2 Spotify market.",
+    )
     transcript: TranscriptModel
     statistics: ExtractionStatisticsModel
     results: ExtractionResultsModel

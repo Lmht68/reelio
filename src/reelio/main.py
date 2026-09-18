@@ -15,6 +15,7 @@ from reelio.extraction.exceptions import (
     unhandled_error_handler,
 )
 from reelio.extraction.market import SpotifyMarket
+from reelio.extraction.router import internal_router
 from reelio.extraction.router import router as extraction_router
 from reelio.extraction.service import ExtractionPipeline, ExtractionPipelineProtocol
 from reelio.extraction.services.catalog.config import SpotifyConfig
@@ -58,6 +59,7 @@ from reelio.logging import configure_logging
 from reelio.ops import router as ops_router
 
 _DOCS_ENVIRONMENTS = {Environment.LOCAL, Environment.STAGING}
+_INTERNAL_API_ENVIRONMENTS = {Environment.LOCAL, Environment.STAGING}
 _PipelineFactory = Callable[[], Awaitable[ExtractionPipelineProtocol]]
 _SpotifyCatalogFactory = Callable[
     [SpotifyConfig],
@@ -244,6 +246,8 @@ def create_app(
     )
     application.include_router(ops_router)
     application.include_router(extraction_router)
+    if app_settings.environment in _INTERNAL_API_ENVIRONMENTS:
+        application.include_router(internal_router)
     application.add_exception_handler(ExtractionError, extraction_error_handler)
     application.add_exception_handler(Exception, unhandled_error_handler)
 

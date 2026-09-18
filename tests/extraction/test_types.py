@@ -46,6 +46,7 @@ from reelio.extraction.types import (
     normalize_music_text,
     normalize_music_title_identity,
     normalize_screen_work_title,
+    normalize_transcript_segments,
 )
 
 
@@ -67,6 +68,14 @@ def test_normalize_music_title_identity_unifies_apostrophes_and_slash_spacing() 
     """Normalize Music title apostrophes and whitespace adjacent to slashes."""
     assert normalize_music_identity("  D’Angelo / The Band  ") == "d’angelo / the band"
     assert normalize_music_title_identity("  ‘TIL\tI CAN’T  /  STOP  ") == "'til i can't/stop"
+
+
+def test_normalize_transcript_segments_collapses_unicode_whitespace() -> None:
+    """Preserve token order while normalizing Transcript segment whitespace."""
+    assert (
+        normalize_transcript_segments(("  Hello\tworld  ", "\n", "Ça va?  déjà."))
+        == "Hello world Ça va? déjà."
+    )
 
 
 def test_book_work_types_preserve_identity_and_provider_author_order() -> None:

@@ -1,6 +1,7 @@
 """HTTP contract tests for the extraction endpoint."""
 
 import asyncio
+import json
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -27,8 +28,16 @@ from reelio.extraction.exceptions import (
 )
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.router import get_pipeline
-from reelio.extraction.schemas import ExtractResponse
+from reelio.extraction.schemas import ExtractResponse, TranscriptExtractResponse
 from reelio.extraction.service import ExtractionPipeline, ExtractionPipelineProtocol
+from reelio.extraction.services.interpretation.config import (
+    InterpretationConfig,
+    LLMProvider,
+)
+from reelio.extraction.services.interpretation.service import (
+    MentionInterpretationService,
+)
+from reelio.extraction.services.interpretation.types import LLMMessage
 from reelio.extraction.services.transcription.acquisition import (
     WhisperResult,
     _WhisperProviderFailure,
@@ -71,6 +80,7 @@ from reelio.extraction.types import (
     TrackResult,
     Transcript,
     TranscriptMethod,
+    TranscriptPipelineResult,
     TVSeriesMention,
     TVSeriesResult,
 )
@@ -100,6 +110,13 @@ class _RaisingPipeline:
     ) -> PipelineResult:
         raise self._exception
 
+    async def run_transcript(
+        self,
+        transcript_text: str,
+        market: SpotifyMarket | None = None,
+    ) -> TranscriptPipelineResult:
+        raise self._exception
+
     async def aclose(self) -> None:
         return None
 
@@ -107,6 +124,45 @@ class _RaisingPipeline:
 _VIDEO_ID = "dQw4w9WgXcQ"
 _CANONICAL_URL = f"https://www.youtube.com/watch?v={_VIDEO_ID}"
 _DEFAULT_MARKET = SpotifyMarket("US")
+
+
+class _RecordingSourceMetadataService:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def inspect(self, submitted_url: str) -> NoReturn:
+        self.calls.append(submitted_url)
+        raise AssertionError("submitted transcripts must not inspect a Source")
+
+
+class _RecordingTranscriptionService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Source, str]] = []
+
+    async def acquire(
+        self,
+        source: Source,
+        submitted_url: str,
+        prepared_audio: object | None = None,
+    ) -> NoReturn:
+        self.calls.append((source, submitted_url))
+        raise AssertionError("submitted transcripts must not acquire media")
+
+
+class _RecordingLLMProvider:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.calls: list[tuple[LLMMessage, ...]] = []
+        self.closed = False
+        self.provider_name = LLMProvider.DEEPSEEK
+        self.model_name = "recording-model"
+
+    async def complete(self, messages: Sequence[LLMMessage]) -> str:
+        self.calls.append(tuple(messages))
+        return self.response
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class _MetadataExtractor:
@@ -142,6 +198,11 @@ class _SocialMetadataExtractor:
 def _settings() -> TranscriptionConfig:
     settings_type = cast(Callable[..., TranscriptionConfig], TranscriptionConfig)
     return settings_type(_env_file=None)
+
+
+def _interpretation_settings(**values: object) -> InterpretationConfig:
+    settings_type = cast(Callable[..., InterpretationConfig], InterpretationConfig)
+    return settings_type(_env_file=None, **values)
 
 
 class _CaptionTrack:
@@ -425,6 +486,78 @@ def _pipeline(
 
 def _install_pipeline(application: FastAPI, pipeline: ExtractionPipelineProtocol) -> None:
     application.dependency_overrides[get_pipeline] = lambda: pipeline
+
+
+async def test_extract_transcript_interprets_normalized_text_without_source(
+    client: AsyncClient,
+) -> None:
+    """Interpret submitted text, enrich its Mention, and omit a fabricated Source."""
+    submitted_text = "Dune: Part One (2021) was excellent."
+    source_metadata_service = _RecordingSourceMetadataService()
+    transcription_service = _RecordingTranscriptionService()
+    llm_provider = _RecordingLLMProvider(
+        json.dumps(
+            {
+                "movies": [{"title": "Dune: Part One", "year": 2021}],
+                "tv_series": [],
+                "tracks": [],
+                "music_releases": [],
+                "books": [],
+            }
+        )
+    )
+    pipeline = ExtractionPipeline(
+        source_metadata_service,
+        transcription_service,
+        MentionInterpretationService(llm_provider, _interpretation_settings()),
+        _FakeResultAggregator(),
+    )
+    _install_pipeline(app, pipeline)
+
+    response = await client.post(
+        "/api/internal/extractions",
+        json={"transcript": f"  {submitted_text}\t", "market": "JP"},
+    )
+
+    assert response.status_code == 200
+    raw_response = response.json()
+    payload = TranscriptExtractResponse.model_validate(raw_response)
+    assert raw_response["transcript"] == {
+        "text": submitted_text,
+        "language": "und",
+        "method": "text_submission",
+    }
+    assert raw_response["market"] == "JP"
+    assert "source" not in raw_response
+    assert set(raw_response["results"]) == {
+        "movies",
+        "tv_series",
+        "tracks",
+        "music_releases",
+        "books",
+    }
+    assert payload.statistics.movies.n_mentions == 1
+    assert payload.statistics.movies.n_resolved == 0
+    assert payload.statistics.movies.n_unresolved == 1
+    assert len(payload.results.movies) == 1
+    movie_result = payload.results.movies[0]
+    assert movie_result.status is ResultStatus.UNRESOLVED
+    assert movie_result.movie_mention.title == "Dune: Part One"
+    assert movie_result.movie_mention.year == 2021
+    assert movie_result.movie is None
+    assert payload.results.tv_series == []
+    assert payload.results.tracks == []
+    assert payload.results.music_releases == []
+    assert payload.results.books == []
+    assert source_metadata_service.calls == []
+    assert transcription_service.calls == []
+    assert len(llm_provider.calls) == 1
+    assert json.loads(llm_provider.calls[0][1].content) == {
+        "source_title": "",
+        "source_description": "",
+        "transcript_language": "und",
+        "transcript": submitted_text,
+    }
 
 
 async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_results(
@@ -1149,6 +1282,70 @@ async def test_malformed_requests_keep_fastapi_422_contract(
     assert "detail" in response.json()
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"transcript": 123}, {"transcript": ""}, {"transcript": " \t\n"}],
+)
+async def test_malformed_transcript_requests_skip_the_pipeline(
+    client: AsyncClient,
+    payload: dict[str, object],
+) -> None:
+    """Reject invalid submitted Transcript payloads before pipeline invocation."""
+    pipeline = _MarketPipeline()
+    _install_pipeline(app, pipeline)
+
+    response = await client.post("/api/internal/extractions", json=payload)
+
+    assert response.status_code == 422
+    assert "detail" in response.json()
+    assert pipeline.transcript_calls == []
+
+
+async def test_oversized_submitted_transcript_returns_existing_413_contract(
+    client: AsyncClient,
+) -> None:
+    """Keep Interpretation Material size enforcement in the interpretation service."""
+    source_metadata_service = _RecordingSourceMetadataService()
+    transcription_service = _RecordingTranscriptionService()
+    llm_provider = _RecordingLLMProvider(
+        json.dumps(
+            {
+                "movies": [],
+                "tv_series": [],
+                "tracks": [],
+                "music_releases": [],
+                "books": [],
+            }
+        )
+    )
+    pipeline = ExtractionPipeline(
+        source_metadata_service,
+        transcription_service,
+        MentionInterpretationService(
+            llm_provider,
+            _interpretation_settings(max_transcript_chars=5),
+        ),
+        _FakeResultAggregator(),
+    )
+    _install_pipeline(app, pipeline)
+
+    response = await client.post(
+        "/api/internal/extractions",
+        json={"transcript": "123456"},
+    )
+
+    assert response.status_code == 413
+    assert response.json() == {
+        "error": {
+            "code": "interpretation_input_too_large",
+            "message": "Interpretation Material exceeds the configured limit.",
+        }
+    }
+    assert source_metadata_service.calls == []
+    assert transcription_service.calls == []
+    assert llm_provider.calls == []
+
+
 async def test_unhandled_failures_do_not_leak_internals() -> None:
     """Return a generic 500 response when the pipeline raises unexpectedly."""
     _install_pipeline(
@@ -1731,6 +1928,32 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "Any TMDB, Spotify, or Open Library provider failure fails the complete request."
         in responses["502"]["description"]
     )
+    internal_operation = document["paths"]["/api/internal/extractions"]["post"]
+    internal_responses = internal_operation["responses"]
+    assert set(internal_responses) == {"200", "413", "422", "500", "502", "504"}
+    for status_code in ("413", "500", "502", "504"):
+        schema = internal_responses[status_code]["content"]["application/json"]["schema"]
+        assert schema == {"$ref": "#/components/schemas/ErrorResponse"}
+    internal_request_schema = internal_operation["requestBody"]["content"]["application/json"][
+        "schema"
+    ]
+    assert internal_request_schema == {"$ref": "#/components/schemas/TranscriptExtractRequest"}
+    transcript_extract_request = schemas["TranscriptExtractRequest"]
+    assert transcript_extract_request["required"] == ["transcript"]
+    transcript_market = transcript_extract_request["properties"]["market"]
+    assert transcript_market["examples"] == ["US", "JP"]
+    assert transcript_market["anyOf"][0]["pattern"] == "^[A-Z]{2}$"
+    internal_response_schema = internal_responses["200"]["content"]["application/json"]["schema"]
+    assert internal_response_schema == {"$ref": "#/components/schemas/TranscriptExtractResponse"}
+    transcript_extract_response = schemas["TranscriptExtractResponse"]
+    assert transcript_extract_response["required"] == [
+        "market",
+        "transcript",
+        "statistics",
+        "results",
+    ]
+    assert "source" not in transcript_extract_response["properties"]
+    assert "source" not in internal_responses["200"]["content"]["application/json"]["example"]
 
 
 class _MarketPipeline:
@@ -1738,6 +1961,7 @@ class _MarketPipeline:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, SpotifyMarket | None]] = []
+        self.transcript_calls: list[tuple[str, SpotifyMarket | None]] = []
 
     async def run(
         self,
@@ -1760,6 +1984,27 @@ class _MarketPipeline:
                 text="",
                 language="en",
                 method=TranscriptMethod.YOUTUBE_CAPTIONS,
+            ),
+            results=ExtractionResults(
+                screen_works=ScreenWorkResults(movies=[], tv_series=[]),
+                music=MusicResults(tracks=[], music_releases=[]),
+                books=BookResults(books=[]),
+            ),
+            market=market or _DEFAULT_MARKET,
+        )
+
+    async def run_transcript(
+        self,
+        transcript_text: str,
+        market: SpotifyMarket | None = None,
+    ) -> TranscriptPipelineResult:
+        """Record submitted transcript input and return an empty extraction result."""
+        self.transcript_calls.append((transcript_text, market))
+        return TranscriptPipelineResult(
+            transcript=Transcript(
+                text=transcript_text,
+                language="und",
+                method=TranscriptMethod.TEXT_SUBMISSION,
             ),
             results=ExtractionResults(
                 screen_works=ScreenWorkResults(movies=[], tv_series=[]),

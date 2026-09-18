@@ -38,6 +38,7 @@ from reelio.extraction.types import (
     AuthorCredit,
     BookMention,
     ExtractionMentions,
+    InterpretationMaterial,
     MovieMention,
     MusicReleaseMention,
     Platform,
@@ -148,6 +149,17 @@ def _transcript(
     )
 
 
+def _material(
+    source: Source,
+    transcript: Transcript,
+) -> InterpretationMaterial:
+    return InterpretationMaterial(
+        source_title=source.title,
+        source_description=source.description,
+        transcript=transcript,
+    )
+
+
 def _response(
     *movies: tuple[str, int],
     tv_series: Sequence[tuple[str, int]] = (),
@@ -187,7 +199,7 @@ async def _interpret(
 ) -> tuple[ExtractionMentions, _FakeProvider]:
     provider = _FakeProvider([response])
     service = MentionInterpretationService(provider, _settings())
-    mentions = await service.interpret(_source(), _transcript(transcript_text))
+    mentions = await service.interpret(_material(_source(), _transcript(transcript_text)))
     return mentions, provider
 
 
@@ -703,7 +715,7 @@ async def test_malformed_json_immediately_raises_invalid_response() -> None:
     service = MentionInterpretationService(provider, _settings())
 
     with pytest.raises(InvalidLLMResponseError):
-        await service.interpret(_source(), _transcript("Dune."))
+        await service.interpret(_material(_source(), _transcript("Dune.")))
 
     assert len(provider.calls) == 1
 
@@ -714,7 +726,7 @@ async def test_second_queued_response_is_not_used_for_repair() -> None:
     service = MentionInterpretationService(provider, _settings())
 
     with pytest.raises(InvalidLLMResponseError):
-        await service.interpret(_source(), _transcript("Dune."))
+        await service.interpret(_material(_source(), _transcript("Dune.")))
 
     assert len(provider.calls) == 1
     assert list(provider.responses) == [_response(("Dune: Part One", 2021))]
@@ -727,7 +739,7 @@ async def test_provider_failure_preserves_interpretation_exception_policy() -> N
     service = MentionInterpretationService(provider, _settings())
 
     with pytest.raises(MentionInterpretationError) as error:
-        await service.interpret(_source(), _transcript("Dune."))
+        await service.interpret(_material(_source(), _transcript("Dune.")))
 
     assert error.value is provider_error
     assert len(provider.calls) == 1
@@ -761,7 +773,7 @@ async def test_oversized_interpretation_material_is_rejected_without_provider_ca
     service = MentionInterpretationService(provider, _settings(**setting_overrides))
 
     with pytest.raises(InterpretationInputTooLargeError):
-        await service.interpret(source, transcript)
+        await service.interpret(_material(source, transcript))
 
     assert provider.calls == []
 
@@ -777,7 +789,7 @@ async def test_prompt_injection_remains_json_content_without_channel() -> None:
     provider = _FakeProvider([_response()])
     service = MentionInterpretationService(provider, _settings())
 
-    await service.interpret(source, _transcript(injection))
+    await service.interpret(_material(source, _transcript(injection)))
 
     system_message, user_message = provider.calls[0]
     payload = json.loads(user_message.content)
@@ -1018,7 +1030,7 @@ async def test_strict_response_schema_rejects_invalid_fields(
     service = MentionInterpretationService(provider, _settings())
 
     with pytest.raises(InvalidLLMResponseError):
-        await service.interpret(_source(), _transcript("Dune."))
+        await service.interpret(_material(_source(), _transcript("Dune.")))
 
     assert len(provider.calls) == 1
 
@@ -1029,7 +1041,7 @@ async def test_response_accepts_more_than_two_hundred_mentions() -> None:
     provider = _FakeProvider([response])
     service = MentionInterpretationService(provider, _settings())
 
-    mentions = await service.interpret(_source(), _transcript("Many movies."))
+    mentions = await service.interpret(_material(_source(), _transcript("Many movies.")))
 
     assert len(mentions.screen_works.movies) == 201
     assert mentions.screen_works.tv_series == []
@@ -1051,7 +1063,7 @@ async def test_logs_never_include_transcript_or_raw_invalid_response(
         ),
         pytest.raises(InvalidLLMResponseError),
     ):
-        await service.interpret(_source(), _transcript(transcript_secret))
+        await service.interpret(_material(_source(), _transcript(transcript_secret)))
 
     log_text = caplog.text
     assert transcript_secret not in log_text
