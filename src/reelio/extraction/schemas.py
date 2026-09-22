@@ -216,7 +216,7 @@ class TrackModel(BaseModel):
     artists: list[ArtistCreditModel]
     spotify_track_id: str
     spotify_url: str
-    preferred_music_release: MusicReleaseModel = Field(
+    music_release: MusicReleaseModel = Field(
         description="Album attached to the accepted Spotify Track Candidate."
     )
     cover_url: str | None = Field(

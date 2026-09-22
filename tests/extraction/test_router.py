@@ -335,7 +335,7 @@ def _enriched_tv_series(tv_series_mention: TVSeriesMention) -> EnrichedTVSeries:
 
 
 def _enriched_track(track_mention: TrackMention) -> EnrichedTrack:
-    preferred_music_release = EnrichedMusicRelease(
+    music_release = EnrichedMusicRelease(
         release_title="Discovery",
         artists=[
             ArtistCredit(
@@ -359,8 +359,8 @@ def _enriched_track(track_mention: TrackMention) -> EnrichedTrack:
         ],
         spotify_track_id="0DiWol3AO6WpXZgp0goxAV",
         spotify_url="https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV",
-        preferred_music_release=preferred_music_release,
-        cover_url=preferred_music_release.cover_url,
+        music_release=music_release,
+        cover_url=music_release.cover_url,
     )
 
 
@@ -747,10 +747,10 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
         "artists",
         "spotify_track_id",
         "spotify_url",
-        "preferred_music_release",
+        "music_release",
         "cover_url",
     }
-    assert set(raw_results["tracks"][0]["track"]["preferred_music_release"]) == {
+    assert set(raw_results["tracks"][0]["track"]["music_release"]) == {
         "release_title",
         "artists",
         "release_date",
@@ -852,12 +852,12 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
     assert (
         resolved_track.track.spotify_url == "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV"
     )
-    assert resolved_track.track.preferred_music_release.spotify_album_id == "track-album"
+    assert resolved_track.track.music_release.spotify_album_id == "track-album"
     assert (
-        resolved_track.track.preferred_music_release.cover_url
+        resolved_track.track.music_release.cover_url
         == "https://i.scdn.co/image/track-cover"
     )
-    assert resolved_track.track.cover_url == resolved_track.track.preferred_music_release.cover_url
+    assert resolved_track.track.cover_url == resolved_track.track.music_release.cover_url
     assert payload.results.tracks[1].track is None
     resolved_music_release = payload.results.music_releases[0]
     assert resolved_music_release.status is ResultStatus.RESOLVED
@@ -1488,10 +1488,10 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "artists",
         "spotify_track_id",
         "spotify_url",
-        "preferred_music_release",
+        "music_release",
         "cover_url",
     }
-    assert set(resolved_track_example["track"]["preferred_music_release"]) == {
+    assert set(resolved_track_example["track"]["music_release"]) == {
         "release_title",
         "artists",
         "release_date",
@@ -1500,16 +1500,16 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "spotify_url",
         "cover_url",
     }
-    assert resolved_track_example["track"]["preferred_music_release"]["release_title"] == (
+    assert resolved_track_example["track"]["music_release"]["release_title"] == (
         "Discovery (Deluxe Edition)"
     )
     assert (
-        resolved_track_example["track"]["preferred_music_release"]["release_title"]
+        resolved_track_example["track"]["music_release"]["release_title"]
         != resolved_track_example["track_mention"]["release_title"]
     )
     assert (
         resolved_track_example["track"]["cover_url"]
-        == resolved_track_example["track"]["preferred_music_release"]["cover_url"]
+        == resolved_track_example["track"]["music_release"]["cover_url"]
     )
     unresolved_track_example = example["results"]["tracks"][1]
     assert unresolved_track_example["status"] == "unresolved"
@@ -1785,7 +1785,7 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         "artists",
         "spotify_track_id",
         "spotify_url",
-        "preferred_music_release",
+        "music_release",
         "cover_url",
     ]
     assert track_schema["properties"]["artists"] == {
@@ -1797,10 +1797,10 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert music_release_cover["anyOf"] == [{"type": "string"}, {"type": "null"}]
     track_cover = track_schema["properties"]["cover_url"]
     assert track_cover["anyOf"] == [{"type": "string"}, {"type": "null"}]
-    preferred_music_release = track_schema["properties"]["preferred_music_release"]
-    assert preferred_music_release.get(
+    music_release = track_schema["properties"]["music_release"]
+    assert music_release.get(
         "$ref"
-    ) == "#/components/schemas/MusicReleaseModel" or preferred_music_release.get("allOf") == [
+    ) == "#/components/schemas/MusicReleaseModel" or music_release.get("allOf") == [
         {"$ref": "#/components/schemas/MusicReleaseModel"}
     ]
     artist_credit_schema = schemas["ArtistCreditModel"]
@@ -1901,7 +1901,7 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
         in operation["description"]
     )
     assert "provider-reported release date" in operation["description"]
-    assert "preferred_music_release is the Spotify Album attached" in operation["description"]
+    assert "music_release is the Spotify Album attached" in operation["description"]
     assert "first provider-ordered Spotify-hosted Album image URL" in operation["description"]
     assert "artwork link-back" in operation["description"]
     assert "worldwide-edition" in operation["description"]

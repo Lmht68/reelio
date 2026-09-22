@@ -130,7 +130,7 @@ _EXTRACT_RESPONSE_EXAMPLE = {
                     ],
                     "spotify_track_id": "0DiWol3AO6WpXZgp0goxAV",
                     "spotify_url": "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV",
-                    "preferred_music_release": {
+                    "music_release": {
                         "release_title": "Discovery (Deluxe Edition)",
                         "artists": [
                             {
@@ -348,7 +348,7 @@ def _to_track_schema(track: EnrichedTrack) -> extraction_schemas.TrackModel:
         artists=[_to_artist_credit_schema(artist) for artist in track.artists],
         spotify_track_id=track.spotify_track_id,
         spotify_url=track.spotify_url,
-        preferred_music_release=_to_music_release_schema(track.preferred_music_release),
+        music_release=_to_music_release_schema(track.music_release),
         cover_url=track.cover_url,
     )
 
@@ -573,7 +573,7 @@ def _to_transcript_response(
         "Results retain their interpreted Track Mention and expose Spotify's "
         "canonical Track title, ordered artist credits, playable Track ID, and "
         "direct URL after a verified match. A resolved Track's "
-        "preferred_music_release is the Spotify Album attached to its accepted "
+        "music_release is the Spotify Album attached to its accepted "
         "Track Candidate. Mention release context constrains Track Candidate "
         "matching, while the preferred Music Release always comes from that "
         "accepted attached Album. Track and Music Release cover_url values are "

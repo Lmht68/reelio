@@ -270,7 +270,7 @@ def _resolve_track_mention(
             track_mention=track_mention,
             track=None,
         )
-    preferred_music_release = _to_enriched_music_release(candidate.album)
+    music_release = _to_enriched_music_release(candidate.album)
 
     return TrackResult(
         status=ResultStatus.RESOLVED,
@@ -280,8 +280,8 @@ def _resolve_track_mention(
             artists=list(candidate.artists),
             spotify_track_id=candidate.spotify_track_id,
             spotify_url=candidate.spotify_url,
-            preferred_music_release=preferred_music_release,
-            cover_url=preferred_music_release.cover_url,
+            music_release=music_release,
+            cover_url=music_release.cover_url,
         ),
     )
 

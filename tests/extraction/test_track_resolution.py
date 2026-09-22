@@ -226,7 +226,7 @@ async def test_resolver_ignores_album_context_when_the_mention_omits_it() -> Non
 
     assert results[0].status is ResultStatus.RESOLVED
     assert results[0].track is not None
-    assert results[0].track.preferred_music_release.release_title == "Unrelated Release"
+    assert results[0].track.music_release.release_title == "Unrelated Release"
     assert catalog.album_calls == []
 
 
@@ -447,20 +447,20 @@ async def test_resolver_uses_provider_corrected_track_and_attached_album_values(
     assert resolved_track.artists == [ArtistCredit(spotify_artist_id="artist-0", name="Queen")]
     assert resolved_track.spotify_track_id == "playable-id"
     assert resolved_track.spotify_url == "https://open.spotify.com/track/playable-id"
-    assert resolved_track.preferred_music_release.release_title == "A Night at the Opera"
-    assert resolved_track.preferred_music_release.artists == [
+    assert resolved_track.music_release.release_title == "A Night at the Opera"
+    assert resolved_track.music_release.artists == [
         ArtistCredit(spotify_artist_id="album-artist-0", name="Queen"),
         ArtistCredit(spotify_artist_id="album-artist-1", name="Opera Singers"),
     ]
-    assert resolved_track.preferred_music_release.release_date == "1975"
-    assert resolved_track.preferred_music_release.album_type == "album"
-    assert resolved_track.preferred_music_release.spotify_album_id == "album-identity"
+    assert resolved_track.music_release.release_date == "1975"
+    assert resolved_track.music_release.album_type == "album"
+    assert resolved_track.music_release.spotify_album_id == "album-identity"
     assert (
-        resolved_track.preferred_music_release.spotify_url
+        resolved_track.music_release.spotify_url
         == "https://open.spotify.com/album/album-identity"
     )
-    assert resolved_track.preferred_music_release.cover_url == "https://i.scdn.co/image/primary"
-    assert resolved_track.cover_url == resolved_track.preferred_music_release.cover_url
+    assert resolved_track.music_release.cover_url == "https://i.scdn.co/image/primary"
+    assert resolved_track.cover_url == resolved_track.music_release.cover_url
     assert music_results.music_releases == []
     assert catalog.album_calls == []
 
@@ -474,7 +474,7 @@ async def test_resolver_keeps_track_resolved_without_attached_album_images() -> 
     resolved_track = results[0].track
     assert results[0].status is ResultStatus.RESOLVED
     assert resolved_track is not None
-    assert resolved_track.preferred_music_release.cover_url is None
+    assert resolved_track.music_release.cover_url is None
     assert resolved_track.cover_url is None
     assert catalog.album_calls == []
 

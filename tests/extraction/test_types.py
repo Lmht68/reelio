@@ -226,7 +226,7 @@ def test_extraction_domain_types_preserve_nested_service_scope_identity() -> Non
         artists=[ArtistCredit(spotify_artist_id="spotify-artist", name="Daft Punk")],
         spotify_track_id="spotify-track",
         spotify_url="https://open.spotify.com/track/spotify-track",
-        preferred_music_release=enriched_music_release,
+        music_release=enriched_music_release,
         cover_url=enriched_music_release.cover_url,
     )
     track_result = TrackResult(
@@ -280,7 +280,7 @@ def test_extraction_domain_types_preserve_nested_service_scope_identity() -> Non
     resolved_music_release = pipeline_result.results.music.music_releases[0].music_release
     assert resolved_track is enriched_track
     assert resolved_music_release is enriched_music_release
-    assert resolved_track.preferred_music_release is enriched_music_release
+    assert resolved_track.music_release is enriched_music_release
     assert resolved_track.cover_url == enriched_music_release.cover_url
     assert resolved_music_release.cover_url == enriched_music_release.cover_url
     assert mentions.screen_works is screen_work_mentions

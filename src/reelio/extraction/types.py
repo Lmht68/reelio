@@ -452,7 +452,7 @@ class EnrichedTrack:
         artists: Ordered Spotify Track artist credits.
         spotify_track_id: Playable Spotify Track identifier for the effective market.
         spotify_url: Direct Spotify URL for the playable Track.
-        preferred_music_release: Album attached to the accepted Track Candidate.
+        music_release: Album attached to the accepted Track Candidate.
         cover_url: First provider-ordered Spotify Album image URL when available.
     """
 
@@ -460,7 +460,7 @@ class EnrichedTrack:
     artists: list[ArtistCredit]
     spotify_track_id: str
     spotify_url: str
-    preferred_music_release: EnrichedMusicRelease
+    music_release: EnrichedMusicRelease
     cover_url: str | None
 
 

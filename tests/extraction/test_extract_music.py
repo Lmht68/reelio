@@ -412,7 +412,7 @@ async def test_extract_resolves_music_through_mocked_spotify_catalog(
         ],
         "spotify_track_id": "playable-track",
         "spotify_url": "https://open.spotify.com/track/playable-track",
-        "preferred_music_release": {
+        "music_release": {
             "release_title": "Discovery (Deluxe Edition)",
             "artists": [
                 {"spotify_artist_id": "artist-0", "name": "DAFT PUNK"},
@@ -1050,7 +1050,7 @@ async def test_extract_resolves_louis_prima_controlled_composite_medley() -> Non
             "artists": [{"spotify_artist_id": "artist-0", "name": "Louis Prima"}],
             "spotify_track_id": "louis-prima-medley",
             "spotify_url": "https://open.spotify.com/track/louis-prima-medley",
-            "preferred_music_release": {
+            "music_release": {
                 "release_title": "The Wildest!",
                 "artists": [
                     {"spotify_artist_id": "artist-0", "name": "Louis Prima"},
@@ -1295,8 +1295,8 @@ async def test_extract_ignores_attached_release_without_release_context() -> Non
 
     assert result["status"] == "resolved"
     track = cast(dict[str, object], result["track"])
-    preferred_music_release = cast(dict[str, object], track["preferred_music_release"])
-    assert preferred_music_release["release_title"] == "Unrelated Release"
+    music_release = cast(dict[str, object], track["music_release"])
+    assert music_release["release_title"] == "Unrelated Release"
 
 
 async def test_extract_checks_exact_track_titles_before_versions() -> None:
@@ -1769,7 +1769,7 @@ async def test_extract_resolves_fuzzy_track_with_music_identity_normalization() 
             "artists": [{"spotify_artist_id": "artist-0", "name": "DAFT PUNK"}],
             "spotify_track_id": "normalized-fuzzy-track",
             "spotify_url": "https://open.spotify.com/track/normalized-fuzzy-track",
-            "preferred_music_release": {
+            "music_release": {
                 "release_title": "Unrelated Release",
                 "artists": [
                     {"spotify_artist_id": "artist-0", "name": "Provider Artist"},
@@ -1823,7 +1823,7 @@ async def test_extract_prefers_title_normalized_extended_track_context_to_earlie
             "artists": [{"spotify_artist_id": "artist-0", "name": "Daft Punk"}],
             "spotify_track_id": "normalized-extended",
             "spotify_url": "https://open.spotify.com/track/normalized-extended",
-            "preferred_music_release": {
+            "music_release": {
                 "release_title": "Artist's Choice/Volume 1 (Extended Version)",
                 "artists": [{"spotify_artist_id": "artist-0", "name": "Daft Punk"}],
                 "release_date": "2025-02-26",
@@ -1969,7 +1969,7 @@ async def test_extract_resolves_father_and_son_with_candidate_artist_alias() -> 
             ],
             "spotify_track_id": "father-and-son",
             "spotify_url": "https://open.spotify.com/track/father-and-son",
-            "preferred_music_release": {
+            "music_release": {
                 "release_title": "Tea for the Tillerman",
                 "artists": [
                     {"spotify_artist_id": "artist-0", "name": "Yusuf / Cat Stevens"},
@@ -2159,8 +2159,8 @@ async def test_extract_requires_every_explicit_track_context_title_to_pass_fuzzy
         assert result["track"] is None
         return
     track = cast(dict[str, object], result["track"])
-    preferred_music_release = cast(dict[str, object], track["preferred_music_release"])
-    assert preferred_music_release["release_date"] == "2025-02-26"
+    music_release = cast(dict[str, object], track["music_release"])
+    assert music_release["release_date"] == "2025-02-26"
 
 
 @pytest.mark.parametrize(
