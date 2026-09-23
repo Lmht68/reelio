@@ -10,6 +10,7 @@ from typing import cast
 import httpx
 import pytest
 
+from reelio.cache import DisabledCache
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.router import get_pipeline
 from reelio.extraction.service import ExtractionPipeline
@@ -206,6 +207,7 @@ async def _post_extract(
     book_resolver = OpenLibraryBookResolver(
         http_client,
         _open_library_settings(),
+        DisabledCache(),
         clock=clock or monotonic,
         sleep=clock.sleep if clock is not None else asyncio.sleep,
     )

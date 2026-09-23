@@ -1,5 +1,7 @@
 """Resolve exact Book Work Mentions through Open Library Search."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import math
@@ -8,13 +10,21 @@ from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import date
 from time import monotonic
-from typing import NoReturn, cast
+from typing import Annotated, Literal, NoReturn, cast
 
 import httpx
-from cachetools import TTLCache
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+)
 from rapidfuzz import fuzz
 
+from reelio.cache import AsyncCache, CacheCodec, CacheCodecError, CacheEntry
+from reelio.cache.interface import JsonObject
 from reelio.extraction.exceptions import CatalogProviderError, PipelineTimeoutError
 from reelio.extraction.services.enrichment.config import OpenLibraryConfig
 from reelio.extraction.types import (
@@ -36,8 +46,9 @@ _CATALOG_ERROR_MESSAGE = "Open Library catalog request failed."
 _TIMEOUT_ERROR_MESSAGE = "Open Library catalog request timed out."
 _STAGE = "book_work_resolution"
 _SEARCH_LIMIT = 3
-_CACHE_TTL_SECONDS = 86_400.0
-_CACHE_MAX_ENTRIES = 100
+_EMPTY_SEARCH_TTL_SECONDS = 900
+_POSITIVE_SEARCH_TTL_SECONDS = 21_600
+_DETAIL_TTL_SECONDS = 86_400
 
 type _CatalogRequestKey = tuple[str, tuple[tuple[str, str], ...]]
 
@@ -66,6 +77,293 @@ class _OpenLibraryModel(BaseModel):
     """Ignore unknown Open Library fields at the resolver boundary."""
 
     model_config = ConfigDict(extra="ignore", strict=True)
+
+
+class _OpenLibraryCacheModel(BaseModel):
+    """Forbid unrecognized or coercible values in an Open Library cache payload."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+def _validate_cached_nonblank_text(value: str) -> str:
+    """Reject whitespace-only cached values excluded by provider parsing."""
+    if not value.strip():
+        raise ValueError("Cached text must not be blank")
+    return value
+
+
+type _CachedNonBlankText = Annotated[
+    str,
+    Field(min_length=1),
+    AfterValidator(_validate_cached_nonblank_text),
+]
+type _CachedWorkId = Annotated[str, Field(pattern=r"^OL[0-9]+W$")]
+type _CachedAuthorId = Annotated[str, Field(pattern=r"^OL[0-9]+A$")]
+type _CachedEditionId = Annotated[str, Field(pattern=r"^OL[0-9]+M$")]
+type _CachedCoverUrl = Annotated[
+    str,
+    Field(pattern=r"^https://covers\.openlibrary\.org/b/id/[1-9][0-9]*-L\.jpg$"),
+]
+
+
+class _CachedAuthorCredit(_OpenLibraryCacheModel):
+    """Contain one normalized Open Library Author value for a cached Candidate."""
+
+    open_library_author_id: _CachedAuthorId
+    name: _CachedNonBlankText
+
+
+class _CachedCandidate(_OpenLibraryCacheModel):
+    """Contain one normalized Candidate value for a cached Work Search."""
+
+    title: _CachedNonBlankText
+    authors: list[_CachedAuthorCredit]
+    open_library_work_id: _CachedWorkId
+    candidate_titles: list[_CachedNonBlankText] = Field(min_length=1)
+    author_aliases: list[_CachedNonBlankText]
+    cover_url: _CachedCoverUrl | None
+    cover_edition_id: _CachedEditionId | None
+
+
+class _CachedSearchCandidates(_OpenLibraryCacheModel):
+    """Contain the bounded normalized Candidate list for one Work Search."""
+
+    candidates: list[_CachedCandidate]
+
+
+class _SearchCandidatesCacheCodec:
+    """Encode normalized Work Search results independent of provider response shape."""
+
+    version = "work-search-v1"
+
+    def encode(self, value: tuple[_OpenLibraryCandidate, ...]) -> JsonObject:
+        """Encode normalized Candidates after provider validation."""
+        return cast(
+            JsonObject,
+            {
+                "candidates": [
+                    {
+                        "title": candidate.title,
+                        "authors": [
+                            {
+                                "open_library_author_id": author.open_library_author_id,
+                                "name": author.name,
+                            }
+                            for author in candidate.authors
+                        ],
+                        "open_library_work_id": candidate.open_library_work_id,
+                        "candidate_titles": list(candidate.candidate_titles),
+                        "author_aliases": list(candidate.author_aliases),
+                        "cover_url": candidate.cover_url,
+                        "cover_edition_id": candidate.cover_edition_id,
+                    }
+                    for candidate in value
+                ]
+            },
+        )
+
+    def decode(self, payload: JsonObject) -> tuple[_OpenLibraryCandidate, ...]:
+        """Decode one strict normalized Candidate payload.
+
+        Raises:
+            CacheCodecError: If the payload is malformed or incompatible.
+        """
+        try:
+            cached_value = _CachedSearchCandidates.model_validate(payload)
+        except ValidationError as exc:
+            raise CacheCodecError("Invalid cached Open Library Work Search value") from exc
+        return tuple(
+            _OpenLibraryCandidate(
+                title=candidate.title,
+                authors=tuple(
+                    EnrichedAuthorCredit(
+                        open_library_author_id=author.open_library_author_id,
+                        name=author.name,
+                        open_library_url=(
+                            f"https://openlibrary.org/authors/{author.open_library_author_id}"
+                        ),
+                    )
+                    for author in candidate.authors
+                ),
+                open_library_work_id=candidate.open_library_work_id,
+                candidate_titles=tuple(candidate.candidate_titles),
+                author_aliases=tuple(candidate.author_aliases),
+                cover_url=candidate.cover_url,
+                cover_edition_id=candidate.cover_edition_id,
+            )
+            for candidate in cached_value.candidates
+        )
+
+
+class _CachedSelectedEdition(_OpenLibraryCacheModel):
+    """Contain one normalized preferred Edition selection."""
+
+    open_library_edition_id: _CachedEditionId
+    title: _CachedNonBlankText | None
+    formats: list[str]
+    publication_year: int | None
+    cover_id: int | None
+
+
+class _CachedSelectedEditionSearch(_OpenLibraryCacheModel):
+    """Contain nullable normalized preferred Edition Search output."""
+
+    selected_edition: _CachedSelectedEdition | None
+
+
+class _SelectedEditionSearchCacheCodec:
+    """Encode normalized preferred Edition Search results."""
+
+    version = "preferred-edition-search-v1"
+
+    def encode(self, value: _OpenLibrarySelectedEdition | None) -> JsonObject:
+        """Encode a normalized preferred Edition selection after provider validation."""
+        if value is None:
+            return {"selected_edition": None}
+        return cast(
+            JsonObject,
+            {
+                "selected_edition": {
+                    "open_library_edition_id": value.open_library_edition_id,
+                    "title": value.title,
+                    "formats": list(value.formats),
+                    "publication_year": value.publication_year,
+                    "cover_id": value.cover_id,
+                }
+            },
+        )
+
+    def decode(self, payload: JsonObject) -> _OpenLibrarySelectedEdition | None:
+        """Decode one strict nullable preferred Edition selection.
+
+        Raises:
+            CacheCodecError: If the payload is malformed or incompatible.
+        """
+        try:
+            cached_value = _CachedSelectedEditionSearch.model_validate(payload)
+        except ValidationError as exc:
+            raise CacheCodecError(
+                "Invalid cached Open Library preferred Edition Search value"
+            ) from exc
+        selected_edition = cached_value.selected_edition
+        if selected_edition is None:
+            return None
+        return _OpenLibrarySelectedEdition(
+            open_library_edition_id=selected_edition.open_library_edition_id,
+            title=selected_edition.title,
+            formats=tuple(selected_edition.formats),
+            publication_year=selected_edition.publication_year,
+            cover_id=selected_edition.cover_id,
+        )
+
+
+class _CachedTerminalWorkTarget(_OpenLibraryCacheModel):
+    """Contain a cached terminal Work identity target."""
+
+    kind: Literal["terminal"]
+    work_id: _CachedWorkId
+
+
+class _CachedRedirectWorkTarget(_OpenLibraryCacheModel):
+    """Contain a cached Work redirect target."""
+
+    kind: Literal["redirect"]
+    work_id: _CachedWorkId
+
+
+type _CachedWorkTarget = Annotated[
+    _CachedTerminalWorkTarget | _CachedRedirectWorkTarget,
+    Field(discriminator="kind"),
+]
+_CACHED_WORK_TARGET_ADAPTER: TypeAdapter[_CachedWorkTarget] = TypeAdapter(_CachedWorkTarget)
+
+
+class _WorkTargetCacheCodec:
+    """Encode normalized terminal Work and redirect operations."""
+
+    version = "work-detail-v1"
+
+    def encode(self, value: _OpenLibraryWorkTarget) -> JsonObject:
+        """Encode a normalized Work target after provider validation."""
+        if isinstance(value, _TerminalWorkTarget):
+            return {"kind": "terminal", "work_id": value.work_id}
+        return {"kind": "redirect", "work_id": value.work_id}
+
+    def decode(self, payload: JsonObject) -> _OpenLibraryWorkTarget:
+        """Decode one discriminated strict Work target.
+
+        Raises:
+            CacheCodecError: If the payload is malformed or incompatible.
+        """
+        try:
+            cached_value = _CACHED_WORK_TARGET_ADAPTER.validate_python(payload)
+        except ValidationError as exc:
+            raise CacheCodecError("Invalid cached Open Library Work detail value") from exc
+        if isinstance(cached_value, _CachedTerminalWorkTarget):
+            return _TerminalWorkTarget(cached_value.work_id)
+        return _RedirectWorkTarget(cached_value.work_id)
+
+
+class _CachedEditionRecord(_OpenLibraryCacheModel):
+    """Contain one normalized Open Library Edition detail record."""
+
+    open_library_edition_id: _CachedEditionId
+    title: str | None
+    publishers: list[str]
+    isbn_10: list[str]
+    isbn_13: list[str]
+    publish_date: str | None
+    physical_format: str | None
+    covers: list[int]
+
+
+class _EditionRecordCacheCodec:
+    """Encode normalized Open Library Edition detail records."""
+
+    version = "edition-detail-v1"
+
+    def encode(self, value: _OpenLibraryEditionRecord) -> JsonObject:
+        """Encode a normalized Edition record after provider validation."""
+        return cast(
+            JsonObject,
+            {
+                "open_library_edition_id": value.open_library_edition_id,
+                "title": value.title,
+                "publishers": list(value.publishers),
+                "isbn_10": list(value.isbn_10),
+                "isbn_13": list(value.isbn_13),
+                "publish_date": value.publish_date,
+                "physical_format": value.physical_format,
+                "covers": list(value.covers),
+            },
+        )
+
+    def decode(self, payload: JsonObject) -> _OpenLibraryEditionRecord:
+        """Decode one strict normalized Edition detail record.
+
+        Raises:
+            CacheCodecError: If the payload is malformed or incompatible.
+        """
+        try:
+            cached_value = _CachedEditionRecord.model_validate(payload)
+        except ValidationError as exc:
+            raise CacheCodecError("Invalid cached Open Library Edition detail value") from exc
+        return _OpenLibraryEditionRecord(
+            open_library_edition_id=cached_value.open_library_edition_id,
+            title=cached_value.title,
+            publishers=tuple(cached_value.publishers),
+            isbn_10=tuple(cached_value.isbn_10),
+            isbn_13=tuple(cached_value.isbn_13),
+            publish_date=cached_value.publish_date,
+            physical_format=cached_value.physical_format,
+            covers=tuple(cached_value.covers),
+        )
+
+
+_SEARCH_CANDIDATES_CACHE_CODEC = _SearchCandidatesCacheCodec()
+_SELECTED_EDITION_SEARCH_CACHE_CODEC = _SelectedEditionSearchCacheCodec()
+_WORK_TARGET_CACHE_CODEC = _WorkTargetCacheCodec()
+_EDITION_RECORD_CACHE_CODEC = _EditionRecordCacheCodec()
 
 
 class _OpenLibrarySearchEditionModel(_OpenLibraryModel):
@@ -214,28 +512,26 @@ class OpenLibraryBookResolver:
         self,
         client: httpx.AsyncClient,
         settings: OpenLibraryConfig,
+        cache: AsyncCache,
         *,
         clock: Callable[[], float] = monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
-        """Initialize a resolver with injectable HTTP and monotonic timing boundaries.
+        """Initialize a resolver with injectable HTTP, cache, and timing boundaries.
 
         Args:
             client: Reusable Open Library HTTP client owned by this resolver.
             settings: Validated Open Library lookup timeout and dispatch rate.
-            clock: Monotonic clock used to schedule requests and cache entries.
+            cache: Shared cache borrowed from the application lifespan.
+            clock: Monotonic clock used to schedule requests and lookup deadlines.
             sleep: Awaitable delay used to enforce dispatch and retry waits.
         """
         self._client = client
         self._request_timeout_seconds = settings.request_timeout_seconds
         self._request_interval_seconds = 1 / settings.requests_per_second
+        self._cache = cache
         self._clock = clock
         self._sleep = sleep
-        self._cache: TTLCache[_CatalogRequestKey, object] = TTLCache(
-            maxsize=_CACHE_MAX_ENTRIES,
-            ttl=_CACHE_TTL_SECONDS,
-            timer=clock,
-        )
         self._lookup_lock = asyncio.Lock()
         self._in_flight_lookups: dict[_CatalogRequestKey, asyncio.Task[object]] = {}
         self._closed = False
@@ -277,7 +573,6 @@ class OpenLibraryBookResolver:
             await asyncio.gather(*pending_lookups, return_exceptions=True)
 
         async with self._lookup_lock:
-            self._cache.clear()
             self._in_flight_lookups.clear()
         await self._client.aclose()
 
@@ -356,6 +651,12 @@ class OpenLibraryBookResolver:
         candidates = await self._get_catalog_value(
             "/search.json",
             _to_search_candidates,
+            _catalog_cache_entry(
+                "/search.json",
+                params,
+                _SEARCH_CANDIDATES_CACHE_CODEC,
+                _search_candidates_ttl_seconds,
+            ),
             params,
         )
         return list(candidates)
@@ -398,21 +699,39 @@ class OpenLibraryBookResolver:
         query = f"key:/works/{work_id}"
         if require_english:
             query = f"{query} AND language:eng"
+        params: dict[str, str | int] = {
+            "q": query,
+            "fields": _EDITION_SEARCH_FIELDS,
+            "limit": 1,
+        }
         return await self._get_catalog_value(
             "/search.json",
             lambda value: _to_selected_edition(value, work_id),
-            {"q": query, "fields": _EDITION_SEARCH_FIELDS, "limit": 1},
+            _catalog_cache_entry(
+                "/search.json",
+                params,
+                _SELECTED_EDITION_SEARCH_CACHE_CODEC,
+                _selected_edition_ttl_seconds,
+            ),
+            params,
         )
 
     async def _load_selected_edition(
         self,
         selected_edition: _OpenLibrarySelectedEdition,
     ) -> BookEdition | None:
+        path = f"/books/{selected_edition.open_library_edition_id}.json"
         record = await self._get_catalog_value(
-            f"/books/{selected_edition.open_library_edition_id}.json",
+            path,
             lambda value: _to_edition_record(
                 value,
                 selected_edition.open_library_edition_id,
+            ),
+            _catalog_cache_entry(
+                path,
+                None,
+                _EDITION_RECORD_CACHE_CODEC,
+                _detail_ttl_seconds,
             ),
         )
         formats = (*selected_edition.formats,)
@@ -445,32 +764,51 @@ class OpenLibraryBookResolver:
         self,
         path: str,
         parser: Callable[[object], ValueT],
+        cache_entry: CacheEntry[ValueT],
         params: dict[str, str | int] | None = None,
     ) -> ValueT:
         request_key = _catalog_request_key(path, params)
         async with self._lookup_lock:
             if self._closed:
                 raise RuntimeError("Open Library resolver is closed.")
-            try:
-                cached_value = self._cache[request_key]
-            except KeyError:
-                lookup = self._in_flight_lookups.get(request_key)
-                if lookup is None:
-                    lookup = cast(
-                        asyncio.Task[object],
-                        asyncio.create_task(
-                            self._load_catalog_value(request_key, path, parser, params)
-                        ),
-                    )
-                    lookup.add_done_callback(_retrieve_task_exception)
-                    self._in_flight_lookups[request_key] = lookup
-            else:
-                return cast(ValueT, cached_value)
+            lookup = self._in_flight_lookups.get(request_key)
+            if lookup is None:
+                lookup = cast(
+                    asyncio.Task[object],
+                    asyncio.create_task(
+                        self._load_catalog_value(
+                            request_key,
+                            path,
+                            parser,
+                            cache_entry,
+                            params,
+                        )
+                    ),
+                )
+                lookup.add_done_callback(_retrieve_task_exception)
+                self._in_flight_lookups[request_key] = lookup
         return cast(ValueT, await asyncio.shield(lookup))
 
     async def _load_catalog_value[ValueT](
         self,
         request_key: _CatalogRequestKey,
+        path: str,
+        parser: Callable[[object], ValueT],
+        cache_entry: CacheEntry[ValueT],
+        params: dict[str, str | int] | None,
+    ) -> ValueT:
+        async def load_provider_value() -> ValueT:
+            """Load and parse a provider value without cache ownership."""
+            return await self._load_provider_value(path, parser, params)
+
+        try:
+            return await self._cache.get_or_load(cache_entry, load_provider_value)
+        finally:
+            async with self._lookup_lock:
+                self._in_flight_lookups.pop(request_key, None)
+
+    async def _load_provider_value[ValueT](
+        self,
         path: str,
         parser: Callable[[object], ValueT],
         params: dict[str, str | int] | None,
@@ -479,11 +817,7 @@ class OpenLibraryBookResolver:
             deadline = self._clock() + self._request_timeout_seconds
             async with asyncio.timeout(self._request_timeout_seconds):
                 response = await self._get_catalog_response(path, params, deadline)
-                parsed_value = parser(cast(object, response.json()))
-            async with self._lookup_lock:
-                if not self._closed:
-                    self._cache[request_key] = parsed_value
-            return parsed_value
+                return parser(cast(object, response.json()))
         except (TimeoutError, httpx.TimeoutException) as exc:
             logger.error(
                 "Open Library catalog request timed out",
@@ -496,9 +830,6 @@ class OpenLibraryBookResolver:
                 extra={"stage": _STAGE, "reason": "invalid_provider_response"},
             )
             raise CatalogProviderError(_CATALOG_ERROR_MESSAGE) from exc
-        finally:
-            async with self._lookup_lock:
-                self._in_flight_lookups.pop(request_key, None)
 
     async def _get_catalog_response(
         self,
@@ -561,9 +892,16 @@ class OpenLibraryBookResolver:
         current_work_id = work_id
         while current_work_id not in seen_redirect_ids:
             seen_redirect_ids.add(current_work_id)
+            path = f"/works/{current_work_id}.json"
             target = await self._get_catalog_value(
-                f"/works/{current_work_id}.json",
+                path,
                 _to_work_target,
+                _catalog_cache_entry(
+                    path,
+                    None,
+                    _WORK_TARGET_CACHE_CODEC,
+                    _detail_ttl_seconds,
+                ),
             )
             if isinstance(target, _TerminalWorkTarget):
                 return target.work_id
@@ -605,11 +943,13 @@ class OpenLibraryBookResolver:
 
 def create_open_library_book_resolver(
     settings: OpenLibraryConfig,
+    cache: AsyncCache,
 ) -> OpenLibraryBookResolver:
     """Create a reusable Open Library Book Work resolver.
 
     Args:
         settings: Validated Open Library contact, endpoint, timeout, and request rate.
+        cache: Shared cache borrowed from the application lifespan.
 
     Returns:
         OpenLibraryBookResolver: Resolver owning one asynchronous HTTP client.
@@ -619,7 +959,7 @@ def create_open_library_book_resolver(
         headers={"User-Agent": f"Reelio ({settings.contact_email})"},
         timeout=settings.request_timeout_seconds,
     )
-    return OpenLibraryBookResolver(client, settings)
+    return OpenLibraryBookResolver(client, settings, cache)
 
 
 def _catalog_request_key(
@@ -630,6 +970,41 @@ def _catalog_request_key(
         path,
         tuple(sorted((key, str(value)) for key, value in (params or {}).items())),
     )
+
+
+def _catalog_cache_entry[ValueT](
+    path: str,
+    params: dict[str, str | int] | None,
+    codec: CacheCodec[ValueT],
+    ttl_seconds: Callable[[ValueT], int],
+) -> CacheEntry[ValueT]:
+    """Describe one normalized Open Library operation for shared caching."""
+    identity_parameters: JsonObject = {
+        name: str(value) for name, value in sorted((params or {}).items())
+    }
+    return CacheEntry(
+        layer="provider:open-library",
+        key_version="v1",
+        identity={"path": path, "params": identity_parameters},
+        codec=codec,
+        ttl_seconds=ttl_seconds,
+    )
+
+
+def _search_candidates_ttl_seconds(value: tuple[_OpenLibraryCandidate, ...]) -> int:
+    """Return the positive or negative Work Search freshness contract."""
+    return _POSITIVE_SEARCH_TTL_SECONDS if value else _EMPTY_SEARCH_TTL_SECONDS
+
+
+def _selected_edition_ttl_seconds(value: _OpenLibrarySelectedEdition | None) -> int:
+    """Return the positive or negative preferred Edition Search freshness contract."""
+    return _POSITIVE_SEARCH_TTL_SECONDS if value is not None else _EMPTY_SEARCH_TTL_SECONDS
+
+
+def _detail_ttl_seconds(value: object) -> int:
+    """Return the fixed Work and Edition detail freshness contract."""
+    del value
+    return _DETAIL_TTL_SECONDS
 
 
 def _retrieve_task_exception(task: asyncio.Task[object]) -> None:

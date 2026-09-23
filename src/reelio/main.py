@@ -8,6 +8,7 @@ from typing import cast
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from reelio.cache import AsyncCache, CacheConfig, create_cache
 from reelio.config import Environment, app_settings
 from reelio.extraction.exceptions import (
     ExtractionError,
@@ -70,12 +71,14 @@ _SpotifyCatalogFactory = Callable[
 async def _create_production_pipeline(
     default_market: SpotifyMarket,
     spotify_catalog: SpotifyCatalog,
+    cache: AsyncCache,
 ) -> ExtractionPipelineProtocol:
     """Load production dependencies and compose one extraction pipeline.
 
     Args:
         default_market: Validated Spotify market used when an API request omits it.
         spotify_catalog: Lifespan-owned Spotify catalog used without transferring ownership.
+        cache: Lifespan-owned shared cache borrowed by Open Library resolution.
     """
     interpretation_settings = InterpretationConfig()
     llm_provider_selection = LLMProviderSelectionConfig()  # type: ignore[call-arg]
@@ -106,7 +109,7 @@ async def _create_production_pipeline(
         )
         screen_work_resolver = create_tmdb_screen_work_resolver(_tmdb_settings)
         open_library_settings = OpenLibraryConfig()  # type: ignore[call-arg]
-        book_resolver = create_open_library_book_resolver(open_library_settings)
+        book_resolver = create_open_library_book_resolver(open_library_settings, cache)
         cleanup.push_async_callback(book_resolver.aclose)
         cleanup.push_async_callback(screen_work_resolver.aclose)
         music_resolver = SpotifyMusicResolver(spotify_catalog)
@@ -170,23 +173,29 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
     Yields:
         None: While the application is running.
     """
-    spotify_settings = SpotifyConfig()  # type: ignore[call-arg]
+    cache_settings = CacheConfig(environment=app_settings.environment)
+    cache = create_cache(cache_settings)
+    try:
+        spotify_settings = SpotifyConfig()  # type: ignore[call-arg]
 
-    async def create_pipeline() -> ExtractionPipelineProtocol:
-        """Compose the pipeline with the lifespan's validated default market."""
-        spotify_catalog = cast(SpotifyCatalog, application.state.spotify_catalog)
-        return await _create_production_pipeline(
-            spotify_settings.default_market,
-            spotify_catalog,
-        )
+        async def create_pipeline() -> ExtractionPipelineProtocol:
+            """Compose the pipeline with the lifespan's validated default market."""
+            spotify_catalog = cast(SpotifyCatalog, application.state.spotify_catalog)
+            return await _create_production_pipeline(
+                spotify_settings.default_market,
+                spotify_catalog,
+                cache,
+            )
 
-    async with _managed_spotify_lifespan(
-        application,
-        create_pipeline,
-        spotify_settings,
-        create_spotify_catalog,
-    ):
-        yield
+        async with _managed_spotify_lifespan(
+            application,
+            create_pipeline,
+            spotify_settings,
+            create_spotify_catalog,
+        ):
+            yield
+    finally:
+        await cache.aclose()
 
 
 def _lifespan_for(

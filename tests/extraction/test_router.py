@@ -853,10 +853,7 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
         resolved_track.track.spotify_url == "https://open.spotify.com/track/0DiWol3AO6WpXZgp0goxAV"
     )
     assert resolved_track.track.music_release.spotify_album_id == "track-album"
-    assert (
-        resolved_track.track.music_release.cover_url
-        == "https://i.scdn.co/image/track-cover"
-    )
+    assert resolved_track.track.music_release.cover_url == "https://i.scdn.co/image/track-cover"
     assert resolved_track.track.cover_url == resolved_track.track.music_release.cover_url
     assert payload.results.tracks[1].track is None
     resolved_music_release = payload.results.music_releases[0]

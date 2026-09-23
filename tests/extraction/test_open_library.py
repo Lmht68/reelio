@@ -8,6 +8,7 @@ from typing import cast
 import httpx
 import pytest
 
+from reelio.cache import AsyncCache, DisabledCache, RedisCache
 from reelio.extraction.exceptions import CatalogProviderError, PipelineTimeoutError
 from reelio.extraction.services.enrichment.config import OpenLibraryConfig
 from reelio.extraction.services.enrichment.open_library import (
@@ -21,6 +22,7 @@ from reelio.extraction.types import (
     BookResults,
     ResultStatus,
 )
+from tests.cache.fakes import FakeRedis
 
 _WORK_SEARCH_FIELDS = (
     "key,title,alternative_title,author_key,author_name,"
@@ -235,6 +237,7 @@ def _resolver(
     clock: _FakeClock | None = None,
     *,
     settings: OpenLibraryConfig | None = None,
+    cache: AsyncCache | None = None,
     default_missing_preferred_edition: bool = True,
 ) -> OpenLibraryBookResolver:
     fake_clock = clock or _FakeClock()
@@ -244,9 +247,15 @@ def _resolver(
     return OpenLibraryBookResolver(
         _client(transport),
         settings or _settings(),
+        DisabledCache() if cache is None else cache,
         clock=fake_clock,
         sleep=fake_clock.sleep,
     )
+
+
+def _shared_cache(clock: _FakeClock) -> RedisCache:
+    """Create one deterministic shared cache using the resolver's monotonic clock."""
+    return RedisCache(FakeRedis(clock), "reelio:local", b"open-library-test-key")
 
 
 def _resolved_work_id(results: BookResults) -> str:
@@ -811,6 +820,7 @@ async def test_resolver_canonicalizes_redirects_before_candidate_deduplication()
         "/works/OL1W.json",
         "/works/OL3W.json",
         "/works/OL2W.json",
+        "/works/OL3W.json",
     ]
     await resolver.aclose()
 
@@ -2498,20 +2508,21 @@ async def test_resolver_maps_malformed_json_and_transport_errors_to_catalog_fail
     await resolver.aclose()
 
 
-async def test_resolver_caches_empty_search_until_ttl_expiry() -> None:
-    """Reuse a valid empty Search until its fixed 24-hour cache entry expires."""
+async def test_resolver_caches_empty_search_until_900_second_ttl_expiry() -> None:
+    """Reuse a valid empty Search until its 900-second cache entry expires."""
     clock = _FakeClock()
+    cache = _shared_cache(clock)
     dispatch_times: list[float] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
         dispatch_times.append(clock())
         return httpx.Response(200, json=_work_search_response())
 
-    resolver = _resolver(httpx.MockTransport(handle), clock)
+    resolver = _resolver(httpx.MockTransport(handle), clock, cache=cache)
     mentions = _mentions(BookMention(title="No Match", authors=[]))
 
     initial_results = await resolver.resolve(mentions)
-    clock.advance(86_399.999)
+    clock.advance(899.999)
     cached_results = await resolver.resolve(mentions)
     clock.advance(0.001)
     expired_results = await resolver.resolve(mentions)
@@ -2520,33 +2531,9 @@ async def test_resolver_caches_empty_search_until_ttl_expiry() -> None:
         results.books[0].status is ResultStatus.UNRESOLVED
         for results in (initial_results, cached_results, expired_results)
     )
-    assert dispatch_times == pytest.approx([0.0, 86_400.0])
+    assert dispatch_times == pytest.approx([0.0, 900.0])
     await resolver.aclose()
-
-
-async def test_resolver_keeps_recent_search_cache_entries_when_capacity_is_reached() -> None:
-    """Evict the least-recently-used successful Search cache entry at capacity."""
-    requests: list[httpx.Request] = []
-
-    async def handle(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(200, json=_work_search_response())
-
-    resolver = _resolver(httpx.MockTransport(handle))
-
-    for index in range(100):
-        results = await resolver.resolve(_mentions(BookMention(title=f"Title {index}", authors=[])))
-        assert results.books[0].status is ResultStatus.UNRESOLVED
-    await resolver.resolve(_mentions(BookMention(title="Title 0", authors=[])))
-    await resolver.resolve(_mentions(BookMention(title="Title 100", authors=[])))
-    await resolver.resolve(_mentions(BookMention(title="Title 1", authors=[])))
-
-    assert len(requests) == 102
-    assert [request.url.params["title"] for request in requests[-2:]] == [
-        "Title 100",
-        "Title 1",
-    ]
-    await resolver.aclose()
+    await cache.aclose()
 
 
 @pytest.mark.parametrize("status_code", [500, 502, 503, 504])
@@ -2803,8 +2790,12 @@ async def test_resolver_coalesces_provider_rich_identical_lookups() -> None:
             ),
         )
 
+    clock = _FakeClock()
+    cache = _shared_cache(clock)
     resolver = _resolver(
         httpx.MockTransport(handle),
+        clock,
+        cache=cache,
         default_missing_preferred_edition=False,
     )
     mentions = _mentions(
@@ -2858,6 +2849,278 @@ async def test_resolver_coalesces_provider_rich_identical_lookups() -> None:
     assert cached_book.edition.publishers is not first_book.edition.publishers
     assert len(requests) == 4
     await resolver.aclose()
+    await cache.aclose()
+
+
+async def test_shared_cache_reuses_normalized_operations_across_resolvers() -> None:
+    """Reuse normalized values without provider traffic or mutable result aliasing."""
+    cache_clock = _FakeClock()
+    cache = _shared_cache(cache_clock)
+    first_requests: list[httpx.Request] = []
+
+    async def load_first(request: httpx.Request) -> httpx.Response:
+        first_requests.append(request)
+        if request.url.path == "/works/OL1W.json":
+            return httpx.Response(200, json=_work_record("OL1W"))
+        if request.url.path == "/books/OL101M.json":
+            return httpx.Response(
+                200,
+                json=_edition_record(
+                    "OL101M",
+                    title="Provider Edition",
+                    publishers=["Publisher"],
+                    isbn_10=["0123456789"],
+                    isbn_13=["9780123456786"],
+                    covers=[101],
+                ),
+            )
+        if _is_preferred_edition_search(request):
+            return httpx.Response(
+                200,
+                json=_preferred_edition_search_response(
+                    "OL1W",
+                    _selected_edition("OL101M", title="Provider Edition", cover_id=101),
+                ),
+            )
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate(
+                    "OL1W",
+                    "Provider Work",
+                    ["OL1A"],
+                    ["Provider Author"],
+                    cover_id=802,
+                    cover_edition_key="/books/OL802M",
+                )
+            ),
+        )
+
+    mentions = _mentions(
+        BookMention(title="Provider Work", authors=[AuthorCredit(name="Provider Author")])
+    )
+    first_resolver = _resolver(
+        httpx.MockTransport(load_first),
+        _FakeClock(),
+        cache=cache,
+        default_missing_preferred_edition=False,
+    )
+    first_results = await first_resolver.resolve(mentions)
+    first_book = first_results.books[0].book
+    assert first_book is not None
+    assert first_book.edition is not None
+    expected_authors = list(first_book.authors)
+    expected_publishers = list(first_book.edition.publishers)
+    expected_isbn_10 = list(first_book.edition.isbn_10)
+    expected_isbn_13 = list(first_book.edition.isbn_13)
+    first_book.authors.clear()
+    first_book.edition.publishers.clear()
+    first_book.edition.isbn_10.clear()
+    first_book.edition.isbn_13.clear()
+    await first_resolver.aclose()
+
+    second_requests: list[httpx.Request] = []
+
+    async def fail_if_called(request: httpx.Request) -> httpx.Response:
+        second_requests.append(request)
+        raise AssertionError("Shared cache hit must not call the Open Library provider")
+
+    second_resolver = _resolver(
+        httpx.MockTransport(fail_if_called),
+        _FakeClock(),
+        cache=cache,
+        default_missing_preferred_edition=False,
+    )
+    second_results = await second_resolver.resolve(mentions)
+    second_book = second_results.books[0].book
+
+    assert second_book is not None
+    assert second_book.authors == expected_authors
+    assert second_book.edition is not None
+    assert second_book.edition.publishers == expected_publishers
+    assert second_book.edition.isbn_10 == expected_isbn_10
+    assert second_book.edition.isbn_13 == expected_isbn_13
+    assert second_book.authors is not first_book.authors
+    assert second_book.edition.publishers is not first_book.edition.publishers
+    assert second_book.edition.isbn_10 is not first_book.edition.isbn_10
+    assert second_book.edition.isbn_13 is not first_book.edition.isbn_13
+    assert len(first_requests) == 4
+    assert second_requests == []
+    await second_resolver.aclose()
+    await cache.aclose()
+
+
+async def test_resolver_caches_positive_search_for_21600_seconds() -> None:
+    """Reuse a positive Work Search at 21,599.999 seconds and reload at 21,600."""
+    cache_clock = _FakeClock()
+    cache = _shared_cache(cache_clock)
+    resolver_clock = _FakeClock()
+    title_searches: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/works/OL1W.json":
+            return httpx.Response(200, json=_work_record("OL1W"))
+        if request.url.path == "/search.json" and "title" in request.url.params:
+            title_searches.append(request)
+            return httpx.Response(
+                200,
+                json=_work_search_response(_candidate("OL1W", "Target", ["OL1A"], ["Author"])),
+            )
+        raise AssertionError(f"Unexpected provider request: {request.url}")
+
+    resolver = _resolver(httpx.MockTransport(handle), resolver_clock, cache=cache)
+    mentions = _mentions(BookMention(title="Target", authors=[AuthorCredit(name="Author")]))
+
+    assert (await resolver.resolve(mentions)).books[0].status is ResultStatus.RESOLVED
+    cache_clock.advance(21_599.999)
+    assert (await resolver.resolve(mentions)).books[0].status is ResultStatus.RESOLVED
+    cache_clock.advance(0.001)
+    assert (await resolver.resolve(mentions)).books[0].status is ResultStatus.RESOLVED
+
+    assert len(title_searches) == 2
+    await resolver.aclose()
+    await cache.aclose()
+
+
+async def test_resolver_caches_work_and_edition_details_for_86400_seconds() -> None:
+    """Reuse detail values at 86,399.999 seconds and reload both at 86,400."""
+    cache_clock = _FakeClock()
+    cache = _shared_cache(cache_clock)
+    resolver_clock = _FakeClock()
+    work_requests: list[httpx.Request] = []
+    edition_requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/works/OL1W.json":
+            work_requests.append(request)
+            return httpx.Response(200, json=_work_record("OL1W"))
+        if request.url.path == "/books/OL101M.json":
+            edition_requests.append(request)
+            return httpx.Response(
+                200,
+                json=_edition_record(
+                    "OL101M",
+                    title="Provider Edition",
+                    publishers=["Publisher"],
+                    isbn_10=["0123456789"],
+                    isbn_13=["9780123456786"],
+                    covers=[101],
+                ),
+            )
+        if _is_preferred_edition_search(request):
+            return httpx.Response(
+                200,
+                json=_preferred_edition_search_response(
+                    "OL1W",
+                    _selected_edition("OL101M", title="Provider Edition", cover_id=101),
+                ),
+            )
+        return httpx.Response(
+            200,
+            json=_work_search_response(
+                _candidate("OL1W", "Provider Work", ["OL1A"], ["Provider Author"])
+            ),
+        )
+
+    resolver = _resolver(
+        httpx.MockTransport(handle),
+        resolver_clock,
+        cache=cache,
+        default_missing_preferred_edition=False,
+    )
+    mentions = _mentions(
+        BookMention(title="Provider Work", authors=[AuthorCredit(name="Provider Author")])
+    )
+
+    assert (await resolver.resolve(mentions)).books[0].status is ResultStatus.RESOLVED
+    cache_clock.advance(86_399.999)
+    assert (await resolver.resolve(mentions)).books[0].status is ResultStatus.RESOLVED
+    cache_clock.advance(0.001)
+    assert (await resolver.resolve(mentions)).books[0].status is ResultStatus.RESOLVED
+
+    assert len(work_requests) == 2
+    assert len(edition_requests) == 2
+    await resolver.aclose()
+    await cache.aclose()
+
+
+async def test_resolver_cache_read_and_write_failures_preserve_success_values() -> None:
+    """Continue normal provider loading when shared-cache commands fail."""
+    cache_clock = _FakeClock()
+    redis = FakeRedis(cache_clock)
+    cache = RedisCache(redis, "reelio:local", b"open-library-test-key")
+    provider_requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        provider_requests.append(request)
+        return httpx.Response(200, json=_work_search_response())
+
+    resolver = _resolver(httpx.MockTransport(handle), _FakeClock(), cache=cache)
+
+    redis.fail_reads = True
+    first_results = await resolver.resolve(_mentions(BookMention(title="First", authors=[])))
+    redis.fail_reads = False
+    redis.fail_writes = True
+    second_results = await resolver.resolve(_mentions(BookMention(title="Second", authors=[])))
+
+    assert first_results.books[0].status is ResultStatus.UNRESOLVED
+    assert second_results.books[0].status is ResultStatus.UNRESOLVED
+    assert len(provider_requests) == 2
+    await resolver.aclose()
+    await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "error_type"),
+    [
+        ("429", CatalogProviderError),
+        ("5xx", CatalogProviderError),
+        ("timeout", PipelineTimeoutError),
+        ("malformed_json", CatalogProviderError),
+        ("validation", CatalogProviderError),
+    ],
+)
+async def test_resolver_cache_read_failure_preserves_provider_errors_and_retries_later(
+    failure_kind: str,
+    error_type: type[Exception],
+) -> None:
+    """Never cache typed provider failures when a cache read also fails."""
+    cache_clock = _FakeClock()
+    redis = FakeRedis(cache_clock)
+    cache = RedisCache(redis, "reelio:local", b"open-library-test-key")
+    resolver_clock = _FakeClock()
+    provider_requests: list[httpx.Request] = []
+    should_fail = True
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        provider_requests.append(request)
+        if not should_fail:
+            return httpx.Response(200, json=_work_search_response())
+        if failure_kind == "429":
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        if failure_kind == "5xx":
+            return httpx.Response(500)
+        if failure_kind == "timeout":
+            raise httpx.ReadTimeout("timed out", request=request)
+        if failure_kind == "malformed_json":
+            return httpx.Response(200, content=b"{not-json")
+        return httpx.Response(200, json={"docs": [{"title": "Missing Work ID"}]})
+
+    resolver = _resolver(httpx.MockTransport(handle), resolver_clock, cache=cache)
+    mentions = _mentions(BookMention(title="Target", authors=[]))
+
+    redis.fail_reads = True
+    with pytest.raises(error_type):
+        await resolver.resolve(mentions)
+    failed_request_count = len(provider_requests)
+    should_fail = False
+    redis.fail_reads = False
+    later_results = await resolver.resolve(mentions)
+
+    assert later_results.books[0].status is ResultStatus.UNRESOLVED
+    assert len(provider_requests) > failed_request_count
+    await resolver.aclose()
+    await cache.aclose()
 
 
 async def test_resolver_shares_coalesced_timeout_and_retries_later() -> None:
@@ -2936,6 +3199,7 @@ async def test_factory_configures_identifying_contact_and_owned_client() -> None
 
     resolver = create_open_library_book_resolver(
         _settings(base_url="https://catalog.example", request_timeout_seconds=4.5),
+        DisabledCache(),
     )
 
     assert str(resolver._client.base_url) == "https://catalog.example/"

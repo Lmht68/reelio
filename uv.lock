@@ -166,15 +166,6 @@ wheels = [
 ]
 
 [[package]]
-name = "cachetools"
-version = "7.1.6"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/55/af/861ebc2e318a5c3300e3eb63bc4d30f3d70a46d13b360093728ac0705eed/cachetools-7.1.6.tar.gz", hash = "sha256:c7a79e7f30ba9943c1cefd08cc36f006aaae086e017af9166f1d59d6170c47e1", size = 40572, upload-time = "2026-07-23T22:47:53.737Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/9f/f2/2086ba18a925a73586c4d4e61d25f4a6058e56fd00d77ce8f1d361ab4c9b/cachetools-7.1.6-py3-none-any.whl", hash = "sha256:2c12e255780330af28b91bb7fb96cce4c766f04e38396b9a24510190a5827096", size = 16954, upload-time = "2026-07-23T22:47:52.397Z" },
-]
-
-[[package]]
 name = "certifi"
 version = "2026.7.22"
 source = { registry = "https://pypi.org/simple" }
@@ -1548,18 +1539,27 @@ wheels = [
 ]
 
 [[package]]
+name = "redis"
+version = "8.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a8/99/604f0b666d4c616d891cf77ebb9db6bb21601344c051aebf1b72b9ff915f/redis-8.1.0.tar.gz", hash = "sha256:6e1a19beef9225c83efd689c7e6b7da2d5215b1f42cd13b7fc3714d0a09c7b25", size = 5254356, upload-time = "2026-07-30T08:51:00.269Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/66/9d/c5731f6e3608663d4d3656fd8d3aecee8b509c3082818f5a13eae925baea/redis-8.1.0-py3-none-any.whl", hash = "sha256:a4fe1aac3d3b3cc791d4b3d5931c5a956045dc951ee74d1c913ee3ac4d2ee9fb", size = 560618, upload-time = "2026-07-30T08:50:58.497Z" },
+]
+
+[[package]]
 name = "reelio"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "av" },
-    { name = "cachetools" },
     { name = "fastapi", extra = ["standard"] },
     { name = "faster-whisper" },
     { name = "httpx" },
     { name = "openai" },
     { name = "pydantic-settings" },
     { name = "rapidfuzz" },
+    { name = "redis" },
     { name = "youtube-transcript-api" },
     { name = "yt-dlp", extra = ["default"] },
 ]
@@ -1576,13 +1576,13 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "av", specifier = ">=18.1.0" },
-    { name = "cachetools", specifier = ">=7.1.6" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.139.2" },
     { name = "faster-whisper", specifier = ">=1.2.1" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "openai", specifier = ">=2.50.0" },
     { name = "pydantic-settings", specifier = ">=2.14.2" },
     { name = "rapidfuzz", specifier = ">=3.14.6" },
+    { name = "redis", specifier = ">=8.1.0" },
     { name = "youtube-transcript-api", specifier = ">=1.2.4" },
     { name = "yt-dlp", extras = ["default"], specifier = ">=2026.7.4" },
 ]

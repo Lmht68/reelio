@@ -8,9 +8,11 @@ import ctranslate2
 import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
+from redis.asyncio import Redis
 
 import reelio.extraction.services.transcription.acquisition as transcription_service
 import reelio.main as main_module
+from reelio.cache import CacheConfig, DisabledCache
 from reelio.config import Environment, app_settings
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.services.catalog.config import SpotifyConfig
@@ -95,6 +97,21 @@ class _FakeBookResolver:
 
     async def aclose(self) -> None:
         self.close_calls += 1
+
+
+class _FakeCache:
+    """Record one shared-cache lifecycle owned outside the extraction pipeline."""
+
+    def __init__(self, events: list[str] | None = None) -> None:
+        """Initialize the cache close counter and optional lifecycle trace."""
+        self.close_calls = 0
+        self._events = events
+
+    async def aclose(self) -> None:
+        """Record cache closure."""
+        self.close_calls += 1
+        if self._events is not None:
+            self._events.append("cache")
 
 
 def _transcription_settings(device: str) -> TranscriptionConfig:
@@ -291,7 +308,7 @@ async def test_production_lifespan_closes_one_selected_provider(
         resolver_factory_calls += 1
         return resolver
 
-    def create_book_resolver(settings: object) -> _FakeBookResolver:
+    def create_book_resolver(settings: object, cache: object) -> _FakeBookResolver:
         nonlocal book_resolver_factory_calls
         book_resolver_factory_calls += 1
         return book_resolver
@@ -381,7 +398,7 @@ async def test_production_lifespan_closes_resolver_after_aggregation_setup_failu
     monkeypatch.setattr(
         main_module,
         "create_open_library_book_resolver",
-        lambda settings: book_resolver,
+        lambda settings, cache: book_resolver,
     )
     monkeypatch.setattr(
         main_module,
@@ -454,3 +471,168 @@ async def test_injected_lifespan_owns_one_spotify_catalog() -> None:
     assert catalog.close_calls == 1
     assert pipeline.close_calls == 1
     assert not hasattr(application.state, "spotify_catalog")
+
+
+async def test_disabled_production_lifespan_never_constructs_a_redis_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabled production composition uses no Redis client factory."""
+    monkeypatch.setenv("REELIO_CACHE_ENABLED", "false")
+    monkeypatch.delenv("REELIO_CACHE_REDIS_URL", raising=False)
+    monkeypatch.delenv("REELIO_CACHE_KEY_SECRET", raising=False)
+    redis_factory_calls = 0
+    pipeline = _FakePipeline()
+
+    class _FakeSpotifySettings:
+        default_market = SpotifyMarket("US")
+
+    @asynccontextmanager
+    async def spotify_catalog_factory(
+        settings: object,
+    ) -> AsyncGenerator[_FakeSpotifyCatalog]:
+        del settings
+        yield _FakeSpotifyCatalog()
+
+    def fail_redis_factory(*args: object, **kwargs: object) -> NoReturn:
+        nonlocal redis_factory_calls
+        del args, kwargs
+        redis_factory_calls += 1
+        raise AssertionError("Disabled cache must not construct a Redis client")
+
+    async def create_pipeline(
+        default_market: SpotifyMarket,
+        spotify_catalog: object,
+        cache: object,
+    ) -> _FakePipeline:
+        del default_market, spotify_catalog
+        assert isinstance(cache, DisabledCache)
+        return pipeline
+
+    monkeypatch.setattr(main_module, "SpotifyConfig", _FakeSpotifySettings)
+    monkeypatch.setattr(main_module, "create_spotify_catalog", spotify_catalog_factory)
+    monkeypatch.setattr(main_module, "_create_production_pipeline", create_pipeline)
+    monkeypatch.setattr(Redis, "from_url", fail_redis_factory)
+    application = create_app()
+
+    async with application.router.lifespan_context(application):
+        assert pipeline.close_calls == 0
+
+    assert redis_factory_calls == 0
+    assert pipeline.close_calls == 1
+
+
+async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pass one enabled cache into Open Library and close it after pipeline teardown."""
+    monkeypatch.setenv("REELIO_CACHE_ENABLED", "true")
+    monkeypatch.setenv("REELIO_CACHE_REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("REELIO_CACHE_KEY_SECRET", "cache-key")
+    monkeypatch.setenv("REELIO_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("REELIO_OPEN_LIBRARY_CONTACT_EMAIL", "test@example.invalid")
+    events: list[str] = []
+    cache = _FakeCache(events)
+    provider = _FakeProvider()
+    screen_work_resolver = _FakeScreenWorkResolver()
+
+    class _RecordingBookResolver(_FakeBookResolver):
+        async def aclose(self) -> None:
+            """Record resolver closure before the outer cache closes."""
+            await super().aclose()
+            events.append("book")
+
+    class _FakeSpotifySettings:
+        default_market = SpotifyMarket("US")
+
+    book_resolver = _RecordingBookResolver()
+    received_caches: list[object] = []
+
+    @asynccontextmanager
+    async def spotify_catalog_factory(
+        settings: object,
+    ) -> AsyncGenerator[_FakeSpotifyCatalog]:
+        del settings
+        yield _FakeSpotifyCatalog()
+
+    def create_configured_cache(settings: CacheConfig) -> _FakeCache:
+        assert settings.enabled is True
+        return cache
+
+    def create_book_resolver(settings: object, configured_cache: object) -> _FakeBookResolver:
+        del settings
+        received_caches.append(configured_cache)
+        return book_resolver
+
+    monkeypatch.setattr(main_module, "SpotifyConfig", _FakeSpotifySettings)
+    monkeypatch.setattr(main_module, "create_spotify_catalog", spotify_catalog_factory)
+    monkeypatch.setattr(main_module, "create_cache", create_configured_cache)
+    monkeypatch.setattr(
+        main_module,
+        "create_mention_interpretation_provider",
+        lambda selection: provider,
+    )
+    monkeypatch.setattr(main_module, "load_whisper_transcriber", lambda settings: object())
+    monkeypatch.setattr(
+        main_module,
+        "create_tmdb_screen_work_resolver",
+        lambda settings: screen_work_resolver,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "create_open_library_book_resolver",
+        create_book_resolver,
+    )
+    application = create_app()
+
+    async with application.router.lifespan_context(application):
+        assert received_caches == [cache]
+        assert cache.close_calls == 0
+
+    assert book_resolver.close_calls == 1
+    assert cache.close_calls == 1
+    assert events == ["book", "cache"]
+
+
+async def test_enabled_cache_closes_once_after_partial_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Close one enabled cache when pipeline composition fails before application startup."""
+    monkeypatch.setenv("REELIO_CACHE_ENABLED", "true")
+    monkeypatch.setenv("REELIO_CACHE_REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("REELIO_CACHE_KEY_SECRET", "cache-key")
+    cache = _FakeCache()
+
+    class _FakeSpotifySettings:
+        default_market = SpotifyMarket("US")
+
+    @asynccontextmanager
+    async def spotify_catalog_factory(
+        settings: object,
+    ) -> AsyncGenerator[_FakeSpotifyCatalog]:
+        del settings
+        yield _FakeSpotifyCatalog()
+
+    def create_configured_cache(settings: CacheConfig) -> _FakeCache:
+        assert settings.enabled is True
+        return cache
+
+    async def fail_pipeline(
+        default_market: SpotifyMarket,
+        spotify_catalog: object,
+        configured_cache: object,
+    ) -> NoReturn:
+        del default_market, spotify_catalog
+        assert configured_cache is cache
+        raise RuntimeError("pipeline composition failed")
+
+    monkeypatch.setattr(main_module, "SpotifyConfig", _FakeSpotifySettings)
+    monkeypatch.setattr(main_module, "create_spotify_catalog", spotify_catalog_factory)
+    monkeypatch.setattr(main_module, "create_cache", create_configured_cache)
+    monkeypatch.setattr(main_module, "_create_production_pipeline", fail_pipeline)
+    application = create_app()
+    context = application.router.lifespan_context(application)
+
+    with pytest.raises(RuntimeError, match="pipeline composition failed"):
+        await context.__aenter__()
+
+    assert cache.close_calls == 1

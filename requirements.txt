@@ -23,8 +23,6 @@ brotli==1.2.0 ; implementation_name == 'cpython' and sys_platform != 'ios'
     # via yt-dlp
 brotlicffi==1.2.0.1 ; implementation_name != 'cpython'
     # via yt-dlp
-cachetools==7.1.6
-    # via reelio
 certifi==2026.7.22
     # via
     #   httpcore
@@ -185,6 +183,8 @@ pyyaml==6.0.3
     #   huggingface-hub
     #   uvicorn
 rapidfuzz==3.14.6
+    # via reelio
+redis==8.1.0
     # via reelio
 requests==2.34.2
     # via

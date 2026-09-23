@@ -456,8 +456,7 @@ async def test_resolver_uses_provider_corrected_track_and_attached_album_values(
     assert resolved_track.music_release.album_type == "album"
     assert resolved_track.music_release.spotify_album_id == "album-identity"
     assert (
-        resolved_track.music_release.spotify_url
-        == "https://open.spotify.com/album/album-identity"
+        resolved_track.music_release.spotify_url == "https://open.spotify.com/album/album-identity"
     )
     assert resolved_track.music_release.cover_url == "https://i.scdn.co/image/primary"
     assert resolved_track.cover_url == resolved_track.music_release.cover_url

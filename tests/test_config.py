@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 from pydantic_settings import BaseSettings
 
+from reelio.cache import CacheConfig
 from reelio.config import AppConfig, Environment
 from reelio.extraction.services.enrichment.config import OpenLibraryConfig, TMDBConfig
 from reelio.extraction.services.interpretation.config import (
@@ -376,3 +377,117 @@ def test_invalid_log_level_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(ValidationError):
         _without_dotenv(AppConfig)
+
+
+def test_cache_configuration_defaults_to_disabled_without_redis_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ignore absent Redis settings while shared caching is disabled."""
+    for variable in (
+        "REELIO_CACHE_ENABLED",
+        "REELIO_CACHE_REDIS_URL",
+        "REELIO_CACHE_KEY_SECRET",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    settings = _without_dotenv(CacheConfig)
+
+    assert settings.enabled is False
+    assert settings.redis_url is None
+    assert settings.key_secret is None
+    assert settings.namespace == "reelio:local"
+
+
+@pytest.mark.parametrize(
+    ("redis_url", "key_secret"),
+    [
+        (None, "cache-key"),
+        ("", "cache-key"),
+        ("redis://localhost", None),
+        ("redis://localhost", "   "),
+    ],
+)
+def test_enabled_cache_requires_nonblank_endpoint_and_key_secret(
+    redis_url: str | None,
+    key_secret: str | None,
+) -> None:
+    """Reject missing or blank enabled-cache credentials."""
+    with pytest.raises(ValidationError, match="must not be blank"):
+        _without_dotenv(
+            CacheConfig,
+            enabled=True,
+            redis_url=redis_url,
+            key_secret=key_secret,
+        )
+
+
+@pytest.mark.parametrize(
+    "redis_url",
+    [
+        "https://cache.example",
+        "redis://",
+        "rediss://cache.example#fragment",
+        "rediss://cache.example:0",
+        "rediss://cache.example:99999",
+    ],
+)
+def test_enabled_cache_rejects_invalid_redis_endpoint_syntax(redis_url: str) -> None:
+    """Allow only absolute Redis URLs with valid host, port, and no fragment."""
+    with pytest.raises(ValidationError):
+        _without_dotenv(
+            CacheConfig,
+            enabled=True,
+            redis_url=redis_url,
+            key_secret="cache-key",
+        )
+
+
+def test_enabled_cache_allows_local_loopback_plaintext_redis() -> None:
+    """Permit explicit local development cache over a loopback plaintext endpoint."""
+    settings = _without_dotenv(
+        CacheConfig,
+        enabled=True,
+        environment=Environment.LOCAL,
+        redis_url="redis://:password@[::1]:6379/0",
+        key_secret="cache-key",
+    )
+
+    assert settings.namespace == "reelio:local"
+
+
+@pytest.mark.parametrize(
+    ("environment", "redis_url"),
+    [
+        (Environment.LOCAL, "redis://cache.example:6379"),
+        (Environment.STAGING, "redis://localhost:6379"),
+        (Environment.PRODUCTION, "redis://127.0.0.1:6379"),
+        (Environment.STAGING, "rediss://cache.example?ssl_cert_reqs=none"),
+        (Environment.PRODUCTION, "rediss://cache.example?ssl_check_hostname=false"),
+    ],
+)
+def test_enabled_cache_requires_secure_transport_outside_local_loopback(
+    environment: Environment,
+    redis_url: str,
+) -> None:
+    """Reject remote plaintext and TLS query options that weaken secure defaults."""
+    with pytest.raises(ValidationError):
+        _without_dotenv(
+            CacheConfig,
+            enabled=True,
+            environment=environment,
+            redis_url=redis_url,
+            key_secret="cache-key",
+        )
+
+
+def test_enabled_cache_accepts_secure_managed_endpoint_options() -> None:
+    """Retain secure TLS defaults while allowing managed endpoint CA configuration."""
+    settings = _without_dotenv(
+        CacheConfig,
+        enabled=True,
+        environment=Environment.PRODUCTION,
+        redis_url=("rediss://:password@cache.example:6380/0?ssl_ca_path=%2Fetc%2Fssl%2Fcerts"),
+        key_secret="cache-key",
+    )
+
+    assert settings.namespace == "reelio:production"
