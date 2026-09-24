@@ -8,6 +8,7 @@ from typing import Literal, cast
 import httpx
 import pytest
 
+from reelio.cache import DisabledCache
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.router import get_pipeline
 from reelio.extraction.service import ExtractionPipeline
@@ -233,7 +234,7 @@ async def _post_extract(
         base_url="https://api.spotify.test/v1/",
         transport=spotify_transport,
     )
-    catalog = SpotifyCatalog(http_client, _spotify_settings())
+    catalog = SpotifyCatalog(http_client, _spotify_settings(), DisabledCache())
     interpretation_provider = _InterpretationProvider(interpretation_response)
     pipeline = ExtractionPipeline(
         _MetadataService(),

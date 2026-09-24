@@ -106,6 +106,7 @@ class FakeRedis:
         """
         self._clock = clock
         self._values: dict[str, _StoredValue] = {}
+        self._pttl_overrides: dict[str, int] = {}
         self.fail_operations: set[str] = set()
         self.command_calls: list[str] = []
         self._blocks: dict[str, asyncio.Event] = {}
@@ -195,7 +196,7 @@ class FakeRedis:
     def register_script(
         self,
         script: str,
-    ) -> Callable[..., Awaitable[int]]:
+    ) -> Callable[..., Awaitable[object]]:
         """Return a lazy script callable with the matching Redis operation semantics.
 
         Args:
@@ -206,9 +207,9 @@ class FakeRedis:
         """
         operation = _script_operation(script)
 
-        async def execute(*, keys: list[str], args: list[_ScriptArgument]) -> int:
+        async def execute(*, keys: list[str], args: list[_ScriptArgument]) -> object:
             await self._before(operation)
-            self._discard_expired()
+            self._discard_expired(expire_at_boundary=operation != "read")
             return self._execute_script(operation, keys, args)
 
         return execute
@@ -217,18 +218,19 @@ class FakeRedis:
         """Record one client closure."""
         self.close_calls += 1
 
-    async def put_raw(self, name: str, value: bytes, ex: int = 60) -> None:
+    async def put_raw(self, name: str, value: bytes, ex: int | None = 60) -> None:
         """Seed raw bytes for envelope compatibility tests.
 
         Args:
             name: Redis key to seed.
             value: Raw bytes to seed.
-            ex: Positive expiry in seconds.
+            ex: Optional positive expiry in seconds.
 
         Raises:
-            ValueError: If expiry is not positive.
+            ValueError: If expiry is invalid.
         """
         self._values[name] = _StoredValue(value, self._expiry_from_arguments(ex=ex, px=None))
+        self._pttl_overrides.pop(name, None)
 
     def raw_value(self, name: str) -> bytes | None:
         """Return raw bytes directly without recording a Redis command.
@@ -240,6 +242,20 @@ class FakeRedis:
             Stored raw bytes, or None when absent or expired.
         """
         return self._get_raw(name)
+
+    def set_pttl_override(self, name: str, pttl_milliseconds: int) -> None:
+        """Force one atomic-read PTTL result without changing the stored raw payload.
+
+        Args:
+            name: Existing data key whose reported PTTL should be replaced.
+            pttl_milliseconds: Exact millisecond result returned by atomic reads.
+
+        Raises:
+            KeyError: If no unexpired raw value is stored for the key.
+        """
+        if self._get_raw(name) is None:
+            raise KeyError(name)
+        self._pttl_overrides[name] = pttl_milliseconds
 
     def block(self, operation: str) -> None:
         """Make an operation wait until unblock is called.
@@ -286,7 +302,9 @@ class FakeRedis:
         operation: str,
         keys: list[str],
         args: list[_ScriptArgument],
-    ) -> int:
+    ) -> object:
+        if operation == "read":
+            return self._atomic_read(keys[0])
         if operation == "lease_renew":
             return self._renew_lease(keys[0], _as_bytes(args[0]), int(args[1]))
         if operation == "lease_release":
@@ -298,6 +316,12 @@ class FakeRedis:
                 token=_as_bytes(args[0]),
                 payload=_as_bytes(args[1]),
                 ttl_seconds=int(args[2]),
+            )
+        if operation == "ownership_discard":
+            return self._discard_if_owned(
+                data_key=keys[0],
+                lease_key=keys[1],
+                token=_as_bytes(args[0]),
             )
         if operation == "corrupt_delete":
             return self._delete_if_raw_matches(keys[0], _as_bytes(args[0]))
@@ -319,6 +343,7 @@ class FakeRedis:
         if self._get_raw(lease_key) != token:
             return 0
         del self._values[lease_key]
+        self._pttl_overrides.pop(lease_key, None)
         return 1
 
     def _fill_if_owned(
@@ -335,14 +360,41 @@ class FakeRedis:
         if ttl_seconds <= 0:
             raise ValueError("Data TTL must be positive")
         self._values[data_key] = _StoredValue(payload, self._clock() + ttl_seconds)
+        self._pttl_overrides.pop(data_key, None)
         del self._values[lease_key]
+        self._pttl_overrides.pop(lease_key, None)
+        return 1
+
+    def _discard_if_owned(self, *, data_key: str, lease_key: str, token: bytes) -> int:
+        if self._get_raw(lease_key) != token:
+            return 0
+        self._values.pop(data_key, None)
+        self._pttl_overrides.pop(data_key, None)
+        del self._values[lease_key]
+        self._pttl_overrides.pop(lease_key, None)
         return 1
 
     def _delete_if_raw_matches(self, key: str, raw_payload: bytes) -> int:
         if self._get_raw(key) != raw_payload:
             return 0
         del self._values[key]
+        self._pttl_overrides.pop(key, None)
         return 1
+
+    def _atomic_read(self, name: str) -> list[bytes | int]:
+        stored_value = self._values.get(name)
+        if stored_value is None:
+            return [0, -2]
+        return [1, stored_value.value, self._pttl_milliseconds(name, stored_value)]
+
+    def _pttl_milliseconds(self, name: str, stored_value: _StoredValue) -> int:
+        override = self._pttl_overrides.get(name)
+        if override is not None:
+            return override
+        if stored_value.expires_at is None:
+            return -1
+        remaining_seconds = max(0.0, stored_value.expires_at - self._clock())
+        return int(round(remaining_seconds * 1_000))
 
     def _expiry_from_arguments(self, *, ex: int | None, px: int | None) -> float | None:
         if ex is not None and px is not None:
@@ -362,14 +414,20 @@ class FakeRedis:
         stored_value = self._values.get(name)
         return None if stored_value is None else stored_value.value
 
-    def _discard_expired(self) -> None:
+    def _discard_expired(self, *, expire_at_boundary: bool = True) -> None:
         expired_keys = [
             key
             for key, stored_value in self._values.items()
-            if stored_value.expires_at is not None and self._clock() >= stored_value.expires_at
+            if stored_value.expires_at is not None
+            and (
+                stored_value.expires_at <= self._clock()
+                if expire_at_boundary
+                else stored_value.expires_at < self._clock()
+            )
         ]
         for key in expired_keys:
             del self._values[key]
+            self._pttl_overrides.pop(key, None)
 
     def _set_legacy_failure(self, operation: str, enabled: bool) -> None:
         if enabled:
@@ -387,12 +445,16 @@ def _as_bytes(value: _ScriptArgument) -> bytes:
 
 def _script_operation(script: str) -> str:
     """Identify one cache script from its stable Redis command vocabulary."""
+    if "PTTL" in script:
+        return "read"
+    if "OWNED_DISCARD" in script:
+        return "ownership_discard"
     if "PEXPIRE" in script:
         return "lease_renew"
-    if "UNLINK" in script:
-        return "corrupt_delete"
     if '"EX"' in script:
         return "ownership_write"
+    if "UNLINK" in script:
+        return "corrupt_delete"
     if '"DEL"' in script:
         return "lease_release"
     raise ValueError("Unsupported Redis script")

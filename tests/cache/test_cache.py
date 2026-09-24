@@ -10,8 +10,16 @@ from typing import cast
 
 import pytest
 
-from reelio.cache import CacheCodecError, CacheEntry, DisabledCache, RedisCache
-from reelio.cache.interface import JsonObject
+from reelio.cache import (
+    CacheCodecError,
+    CacheEntry,
+    CacheSkip,
+    CacheWrite,
+    DisabledCache,
+    RedisCache,
+    RevalidatingCacheEntry,
+)
+from reelio.cache.interface import JsonObject, RetainedCacheValue
 from reelio.cache.redis import _CachePolicy, _CacheRuntime
 from tests.cache.fakes import FakeRedis, ManualClock, ManualSleeper
 
@@ -47,6 +55,23 @@ class _OptionalTextCodec:
         value = payload.get("text")
         if set(payload) != {"text"} or value is not None and not isinstance(value, str):
             raise CacheCodecError("Expected nullable text payload")
+        return value
+
+
+class _TextCodec:
+    """Strict codec for non-null text values."""
+
+    version = "text-v1"
+
+    def encode(self, value: str) -> JsonObject:
+        """Encode text into a strict payload."""
+        return {"text": value}
+
+    def decode(self, payload: JsonObject) -> str:
+        """Decode text only from an exact strict payload."""
+        value = payload.get("text")
+        if set(payload) != {"text"} or not isinstance(value, str):
+            raise CacheCodecError("Expected text payload")
         return value
 
 
@@ -114,6 +139,21 @@ def _text_entry(
     )
 
 
+def _revalidating_text_entry(
+    identity: JsonObject,
+    *,
+    wait_timeout_seconds: float = 1.0,
+) -> RevalidatingCacheEntry[str]:
+    """Create one deterministic revalidating text-cache operation."""
+    return RevalidatingCacheEntry(
+        layer="provider:spotify",
+        key_version="v1",
+        identity=identity,
+        codec=_TextCodec(),
+        wait_timeout_seconds=wait_timeout_seconds,
+    )
+
+
 def _cache_runtime(clock: ManualClock, sleeper: ManualSleeper, prefix: str) -> _CacheRuntime:
     """Create deterministic time and unique lease tokens for one cache instance."""
     tokens = count()
@@ -173,11 +213,336 @@ async def test_disabled_cache_loads_once_without_persisting_nullable_value() -> 
     await cache.aclose()
 
 
+async def test_disabled_cache_revalidates_without_retaining() -> None:
+    """Disabled caching supplies no retained value and unwraps either loader result."""
+    cache = DisabledCache()
+    entry = _revalidating_text_entry({"operation": "search"})
+    retained_values: list[RetainedCacheValue[str] | None] = []
+
+    async def load(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        retained_values.append(retained_value)
+        return CacheWrite("loaded", freshness_seconds=0, retention_seconds=1)
+
+    assert await cache.get_or_load_revalidating(entry, load) == "loaded"
+    assert retained_values == [None]
+    await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    ("freshness_seconds", "retention_seconds"),
+    [
+        (-1, 1),
+        (True, 1),
+        (0, 0),
+        (0, True),
+        (2, 1),
+    ],
+)
+def test_cache_write_rejects_invalid_exact_durations(
+    freshness_seconds: int,
+    retention_seconds: int,
+) -> None:
+    """Serving freshness must be integral, nonnegative, and within retention."""
+    with pytest.raises(ValueError):
+        CacheWrite(
+            "value",
+            freshness_seconds=freshness_seconds,
+            retention_seconds=retention_seconds,
+        )
+
+
 @pytest.mark.parametrize("wait_timeout_seconds", [0.0, -0.1, nan, inf, -inf])
 def test_cache_entry_rejects_unbounded_wait_policy(wait_timeout_seconds: float) -> None:
     """Every cache layer requires a finite positive coordination deadline."""
     with pytest.raises(ValueError, match="finite and positive"):
         _text_entry({"path": "/search.json"}, wait_timeout_seconds=wait_timeout_seconds)
+
+
+@pytest.mark.parametrize("wait_timeout_seconds", [0.0, -0.1, nan, inf, -inf])
+def test_revalidating_cache_entry_rejects_unbounded_wait_policy(
+    wait_timeout_seconds: float,
+) -> None:
+    """Revalidating operations keep the ordinary bounded coordination invariant."""
+    with pytest.raises(ValueError, match="finite and positive"):
+        _revalidating_text_entry(
+            {"operation": "search"},
+            wait_timeout_seconds=wait_timeout_seconds,
+        )
+
+
+async def test_revalidating_cache_classifies_fresh_and_retained_at_exact_boundary() -> None:
+    """Freshness ends at the PTTL boundary and exposes retained data only to loaders."""
+    clock = ManualClock()
+    cache, _, _ = _redis_cache(clock)
+    entry = _revalidating_text_entry({"operation": "search"})
+    retained_values: list[RetainedCacheValue[str] | None] = []
+
+    async def first_load(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        retained_values.append(retained_value)
+        return CacheWrite("first", freshness_seconds=5, retention_seconds=10)
+
+    async def second_load(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        retained_values.append(retained_value)
+        return CacheWrite("second", freshness_seconds=5, retention_seconds=10)
+
+    assert await cache.get_or_load_revalidating(entry, first_load) == "first"
+    clock.advance(4.999)
+    assert await cache.get_or_load_revalidating(entry, second_load) == "first"
+    clock.advance(0.001)
+    assert await cache.get_or_load_revalidating(entry, second_load) == "second"
+    assert retained_values == [None, RetainedCacheValue("first")]
+
+
+async def test_revalidating_cache_treats_zero_pttl_as_retained() -> None:
+    """An atomic PTTL of zero remains eligible for one conditional revalidation."""
+    clock = ManualClock()
+    cache, redis, _ = _redis_cache(clock)
+    entry = _revalidating_text_entry({"operation": "search"})
+
+    async def write_first(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        assert retained_value is None
+        return CacheWrite("first", freshness_seconds=5, retention_seconds=10)
+
+    assert await cache.get_or_load_revalidating(entry, write_first) == "first"
+    key = cache._cache_key(entry)
+    redis.set_pttl_override(key, 0)
+    retained_values: list[RetainedCacheValue[str] | None] = []
+
+    async def skip_retained(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        retained_values.append(retained_value)
+        return CacheSkip("revalidated")
+
+    assert await cache.get_or_load_revalidating(entry, skip_retained) == "revalidated"
+    assert retained_values == [RetainedCacheValue("first")]
+    assert redis.raw_value(key) is None
+
+
+@pytest.mark.parametrize("pttl_milliseconds", [-1, -2, -3, 10_001])
+async def test_revalidating_cache_heals_invalid_atomic_pttl_before_loading(
+    pttl_milliseconds: int,
+) -> None:
+    """Impossible physical-retention states cannot reach loaders as retained values."""
+    clock = ManualClock()
+    cache, redis, _ = _redis_cache(clock)
+    entry = _revalidating_text_entry({"operation": "search"})
+
+    async def write_first(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        assert retained_value is None
+        return CacheWrite("first", freshness_seconds=5, retention_seconds=10)
+
+    assert await cache.get_or_load_revalidating(entry, write_first) == "first"
+    key = cache._cache_key(entry)
+    redis.set_pttl_override(key, pttl_milliseconds)
+    retained_values: list[RetainedCacheValue[str] | None] = []
+
+    async def skip_corrupt(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        retained_values.append(retained_value)
+        return CacheSkip("loaded")
+
+    assert await cache.get_or_load_revalidating(entry, skip_corrupt) == "loaded"
+    assert retained_values == [None]
+    assert redis.command_counts["corrupt_delete"] == 1
+    assert redis.raw_value(key) is None
+
+
+async def test_revalidating_cache_expires_physical_retention_after_zero_boundary() -> None:
+    """Values expire physically after their retained PTTL reaches zero and advances."""
+    clock = ManualClock()
+    cache, _, _ = _redis_cache(clock)
+    entry = _revalidating_text_entry({"operation": "search"})
+
+    async def write_first(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        assert retained_value is None
+        return CacheWrite("first", freshness_seconds=5, retention_seconds=10)
+
+    assert await cache.get_or_load_revalidating(entry, write_first) == "first"
+    clock.advance(10.001)
+    retained_values: list[RetainedCacheValue[str] | None] = []
+
+    async def skip_expired(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        retained_values.append(retained_value)
+        return CacheSkip("cold")
+
+    assert await cache.get_or_load_revalidating(entry, skip_expired) == "cold"
+    assert retained_values == [None]
+
+
+async def test_revalidating_cache_read_failure_loads_without_retention_or_write() -> None:
+    """A failed atomic read supplies no retained data and makes that invocation read-only."""
+    clock = ManualClock()
+    cache, redis, _ = _redis_cache(clock)
+    entry = _revalidating_text_entry({"operation": "search"})
+    redis.fail_operations.add("read")
+    retained_values: list[RetainedCacheValue[str] | None] = []
+
+    async def load(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        retained_values.append(retained_value)
+        return CacheWrite("loaded", freshness_seconds=5, retention_seconds=10)
+
+    assert await cache.get_or_load_revalidating(entry, load) == "loaded"
+    assert retained_values == [None]
+    assert redis.raw_value(cache._cache_key(entry)) is None
+
+
+async def test_invalid_ordinary_ttl_returns_value_without_caching() -> None:
+    """Ordinary TTL validation stays on the guarded write path and remains fail-open."""
+    clock = ManualClock()
+    cache, redis, _ = _redis_cache(clock)
+    entry = _text_entry({"path": "/invalid-ttl"}, ttl_seconds=0)
+
+    assert await cache.get_or_load(entry, lambda: _completed("provider-value")) == "provider-value"
+    assert redis.raw_value(cache._cache_key(entry)) is None
+
+
+async def test_revalidating_cache_persists_the_exact_v2_freshness_envelope() -> None:
+    """Persist only the V2 envelope fields required for cross-worker revalidation."""
+    clock = ManualClock()
+    cache, redis, _ = _redis_cache(clock)
+    entry = _revalidating_text_entry({"operation": "search"})
+
+    async def load(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        assert retained_value is None
+        return CacheWrite("cached", freshness_seconds=5, retention_seconds=10)
+
+    assert await cache.get_or_load_revalidating(entry, load) == "cached"
+
+    raw_payload = redis.raw_value(cache._cache_key(entry))
+    assert raw_payload is not None
+    assert json.loads(raw_payload) == {
+        "envelope_version": 2,
+        "value_version": "text-v1",
+        "value": {"text": "cached"},
+        "freshness_seconds": 5,
+        "retention_seconds": 10,
+    }
+
+
+async def test_retained_loader_error_preserves_value_for_a_later_revalidation() -> None:
+    """A provider error releases ownership without deleting retained data or serving it."""
+    clock = ManualClock()
+    cache, _, _ = _redis_cache(clock)
+    entry = _revalidating_text_entry({"operation": "search"})
+
+    async def first_load(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        assert retained_value is None
+        return CacheWrite("first", freshness_seconds=0, retention_seconds=10)
+
+    assert await cache.get_or_load_revalidating(entry, first_load) == "first"
+
+    async def fail_load(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        assert retained_value == RetainedCacheValue("first")
+        raise RuntimeError("provider failed")
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        await cache.get_or_load_revalidating(entry, fail_load)
+
+    retained_values: list[RetainedCacheValue[str] | None] = []
+
+    async def recover_load(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        retained_values.append(retained_value)
+        return CacheSkip("recovered")
+
+    assert await cache.get_or_load_revalidating(entry, recover_load) == "recovered"
+    assert retained_values == [RetainedCacheValue("first")]
+
+
+async def test_owner_rereads_newer_fill_before_calling_its_loader() -> None:
+    """A lease owner must not reload when another worker fills before its ownership read."""
+    clock = ManualClock()
+    cache, redis, _ = _redis_cache(clock)
+    entry = _revalidating_text_entry({"operation": "search"})
+    key = cache._cache_key(entry)
+    redis.block("lease_acquire")
+    loader_calls = 0
+
+    async def load(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        nonlocal loader_calls
+        loader_calls += 1
+        return CacheWrite("unexpected", freshness_seconds=5, retention_seconds=10)
+
+    task = asyncio.create_task(cache.get_or_load_revalidating(entry, load))
+    await redis.started("lease_acquire").wait()
+    await redis.put_raw(
+        key,
+        json.dumps(
+            {
+                "envelope_version": 2,
+                "value_version": "text-v1",
+                "value": {"text": "newer"},
+                "freshness_seconds": 5,
+                "retention_seconds": 10,
+            }
+        ).encode(),
+        ex=10,
+    )
+    redis.unblock("lease_acquire")
+
+    assert await task == "newer"
+    assert loader_calls == 0
+
+
+async def test_cache_skip_does_not_discard_after_lease_ownership_is_lost() -> None:
+    """A stale CacheSkip token cannot delete retained data after another owner takes over."""
+    clock = ManualClock()
+    cache, redis, _ = _redis_cache(clock)
+    entry = _revalidating_text_entry({"operation": "search"})
+
+    async def seed(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        assert retained_value is None
+        return CacheWrite("retained", freshness_seconds=0, retention_seconds=10)
+
+    assert await cache.get_or_load_revalidating(entry, seed) == "retained"
+    loader_started = asyncio.Event()
+    release_loader = asyncio.Event()
+
+    async def skip(
+        retained_value: RetainedCacheValue[str] | None,
+    ) -> CacheWrite[str] | CacheSkip[str]:
+        assert retained_value == RetainedCacheValue("retained")
+        loader_started.set()
+        await release_loader.wait()
+        return CacheSkip("provider-result")
+
+    task = asyncio.create_task(cache.get_or_load_revalidating(entry, skip))
+    await loader_started.wait()
+    lease_key = cache._lease_key(cache._cache_key(entry))
+    await redis.set(lease_key, "replacement-owner", px=30_000)
+    release_loader.set()
+
+    assert await task == "provider-result"
+    assert redis.raw_value(cache._cache_key(entry)) is not None
 
 
 async def test_redis_cache_reuses_fresh_nullable_values_without_loader_calls() -> None:

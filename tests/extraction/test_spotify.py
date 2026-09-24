@@ -7,10 +7,12 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+from reelio.cache import DisabledCache, RedisCache
 from reelio.extraction.exceptions import CatalogProviderError, PipelineTimeoutError
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.services.catalog.config import SpotifyConfig
 from reelio.extraction.services.catalog.spotify import SpotifyCatalog
+from tests.cache.fakes import FakeRedis, ManualClock
 
 _MARKET = SpotifyMarket("JP")
 
@@ -67,6 +69,12 @@ def _track_payload(track_id: str) -> dict[str, object]:
     }
 
 
+def _shared_cache(clock: ManualClock) -> tuple[RedisCache, FakeRedis]:
+    """Create one deterministic shared Redis cache for catalog contract coverage."""
+    redis = FakeRedis(clock)
+    return RedisCache(redis, "reelio:test", b"spotify-cache-test-key"), redis
+
+
 async def test_catalog_reuses_token_and_returns_playable_track_candidate() -> None:
     """Translate a relinked market Track without exposing provider DTO fields."""
     requests: list[httpx.Request] = []
@@ -98,7 +106,7 @@ async def test_catalog_reuses_token_and_returns_playable_track_candidate() -> No
         )
 
     client = _client(httpx.MockTransport(handle))
-    catalog = SpotifyCatalog(client, _settings())
+    catalog = SpotifyCatalog(client, _settings(), DisabledCache())
 
     first_candidates = await catalog.search_tracks("Kiki's Delivery Service Yumi Arai", _MARKET)
     second_candidates = await catalog.search_tracks("Kiki's Delivery Service Yumi Arai", _MARKET)
@@ -126,6 +134,381 @@ async def test_catalog_reuses_token_and_returns_playable_track_candidate() -> No
     assert client.is_closed is True
 
 
+async def test_catalog_reuses_fresh_normalized_track_candidates_without_provider_access() -> None:
+    """Serve a provider-fresh normalized Track result without requesting another token."""
+    requests: list[httpx.Request] = []
+    clock = ManualClock()
+    cache = RedisCache(FakeRedis(clock), "reelio:test", b"spotify-cache-test-key")
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token", "expires_in": 3600},
+            )
+        return httpx.Response(
+            200,
+            headers={"Cache-Control": "max-age=60"},
+            json={"tracks": {"items": [_track_payload("playable-track")]}},
+        )
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
+
+    first_candidates = await catalog.search_tracks("Kiki", _MARKET)
+    second_candidates = await catalog.search_tracks("Kiki", _MARKET)
+
+    assert second_candidates == first_candidates
+    assert [request.method for request in requests] == ["POST", "GET"]
+    await catalog.aclose()
+    await cache.aclose()
+
+
+async def test_catalog_isolates_exact_search_identity_and_stores_only_normalized_values() -> None:
+    """Separate query, type, and market while excluding Spotify-only response fields."""
+    clock = ManualClock()
+    cache, redis = _shared_cache(clock)
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token-sentinel", "expires_in": 3600},
+            )
+        item_type = request.url.params["type"]
+        market = request.url.params["market"]
+        if item_type == "track":
+            payload = _track_payload(f"{market}-track")
+            payload["linked_from"] = {"id": "linked-from-sentinel"}
+            payload["ignored_sentinel"] = "raw-body-sentinel"
+            body = {"tracks": {"items": [payload]}}
+        else:
+            album = _track_payload(f"{market}-track")["album"]
+            assert isinstance(album, dict)
+            album["ignored_sentinel"] = "raw-body-sentinel"
+            body = {"albums": {"items": [album]}}
+        return httpx.Response(200, headers={"Cache-Control": "max-age=120"}, json=body)
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
+
+    assert (await catalog.search_tracks("Kiki", SpotifyMarket("JP")))[
+        0
+    ].spotify_track_id == "JP-track"
+    assert (await catalog.search_tracks("Kiki", SpotifyMarket("JP")))[
+        0
+    ].spotify_track_id == "JP-track"
+    assert (await catalog.search_tracks("Kiki ", SpotifyMarket("JP")))[
+        0
+    ].spotify_track_id == "JP-track"
+    assert (await catalog.search_tracks("Kiki", SpotifyMarket("US")))[
+        0
+    ].spotify_track_id == "US-track"
+    assert (await catalog.search_albums("Kiki", SpotifyMarket("JP")))[
+        0
+    ].spotify_album_id == "album-1"
+    assert (await catalog.search_albums("Kiki", SpotifyMarket("JP")))[
+        0
+    ].spotify_album_id == "album-1"
+
+    search_requests = [request for request in requests if request.method == "GET"]
+    assert [
+        (request.url.params["q"], request.url.params["type"], request.url.params["market"])
+        for request in search_requests
+    ] == [
+        ("Kiki", "track", "JP"),
+        ("Kiki ", "track", "JP"),
+        ("Kiki", "track", "US"),
+        ("Kiki", "album", "JP"),
+    ]
+    cache_bytes = b"".join(
+        raw_payload for key in redis.keys if (raw_payload := redis.raw_value(key)) is not None
+    )
+    assert b"linked-from-sentinel" not in cache_bytes
+    assert b"raw-body-sentinel" not in cache_bytes
+    assert b"access-token-sentinel" not in cache_bytes
+    await catalog.aclose()
+    await cache.aclose()
+
+
+async def test_catalog_conditionally_revalidates_retained_etag_and_renews_on_304() -> None:
+    """Use the retained validator, preserve normalized Candidates, and restart freshness."""
+    clock = ManualClock()
+    cache, _ = _shared_cache(clock)
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token", "expires_in": 3600},
+            )
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"Cache-Control": "max-age=10", "ETag": '"track-v1"'},
+                json={"tracks": {"items": [_track_payload("first-track")]}},
+            )
+        assert request.headers["if-none-match"] == '"track-v1"'
+        return httpx.Response(
+            304,
+            headers={"Cache-Control": "max-age=20", "ETag": '"track-v1"'},
+        )
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
+
+    first_candidates = await catalog.search_tracks("Kiki", _MARKET)
+    clock.advance(10.001)
+    revalidated_candidates = await catalog.search_tracks("Kiki", _MARKET)
+    fresh_candidates = await catalog.search_tracks("Kiki", _MARKET)
+
+    assert revalidated_candidates == first_candidates
+    assert fresh_candidates == first_candidates
+    assert len(requests) == 2
+    await catalog.aclose()
+    await cache.aclose()
+
+
+async def test_catalog_replaces_retained_etag_value_after_conditional_success() -> None:
+    """A conditional 200 replaces both the normalized Candidates and validator metadata."""
+    clock = ManualClock()
+    cache, _ = _shared_cache(clock)
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token", "expires_in": 3600},
+            )
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"Cache-Control": "max-age=10", "ETag": '"track-v1"'},
+                json={"tracks": {"items": [_track_payload("first-track")]}},
+            )
+        assert request.headers["if-none-match"] == '"track-v1"'
+        return httpx.Response(
+            200,
+            headers={"Cache-Control": "max-age=10", "ETag": '"track-v2"'},
+            json={"tracks": {"items": [_track_payload("replacement-track")]}},
+        )
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
+
+    assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "first-track"
+    clock.advance(10.001)
+    assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "replacement-track"
+    assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "replacement-track"
+    assert len(requests) == 2
+    await catalog.aclose()
+    await cache.aclose()
+
+
+async def test_catalog_unconditionally_reloads_when_no_etag_reaches_physical_expiry() -> None:
+    """A value without a validator expires at serving freshness and cannot be revalidated."""
+    clock = ManualClock()
+    cache, _ = _shared_cache(clock)
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token", "expires_in": 3600},
+            )
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"Cache-Control": "max-age=10"},
+            json={"tracks": {"items": [_track_payload(f"track-{len(requests)}")]}},
+        )
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
+
+    assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "track-1"
+    clock.advance(10.001)
+    assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "track-2"
+    assert "if-none-match" not in requests[1].headers
+    await catalog.aclose()
+    await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    ("headers", "search_request_count"),
+    [
+        ([("Cache-Control", "max-age=60")], 1),
+        ([("Cache-Control", "s-maxage=60, max-age=1")], 1),
+        ([("Cache-Control", "max-age=60"), ("Age", "10")], 1),
+        ([("Cache-Control", "max-age=60"), ("Age", "60")], 2),
+        ([], 2),
+        ([("Cache-Control", "no-store, max-age=60")], 2),
+        ([("Cache-Control", "private, max-age=60")], 2),
+        ([("Cache-Control", "no-cache, max-age=60")], 2),
+        ([("Cache-Control", 'max-age="60"')], 2),
+        ([("Cache-Control", "max-age=60"), ("Cache-Control", "max-age=60")], 2),
+        ([("Cache-Control", "max-age=60"), ("Age", "invalid")], 2),
+    ],
+)
+async def test_catalog_honors_explicit_provider_freshness_policy(
+    headers: list[tuple[str, str]],
+    search_request_count: int,
+) -> None:
+    """Cache only explicit, valid provider freshness under Cache-Control and Age rules."""
+    clock = ManualClock()
+    cache, _ = _shared_cache(clock)
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token", "expires_in": 3600},
+            )
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers=headers,
+            json={"tracks": {"items": [_track_payload("policy-track")]}},
+        )
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
+
+    await catalog.search_tracks("Kiki", _MARKET)
+    await catalog.search_tracks("Kiki", _MARKET)
+
+    assert len(requests) == search_request_count
+    await catalog.aclose()
+    await cache.aclose()
+
+
+async def test_catalog_caps_negative_search_freshness() -> None:
+    """Cap empty-result freshness even when the provider declares a much longer lifetime."""
+    clock = ManualClock()
+    cache, _ = _shared_cache(clock)
+    search_request_count = 0
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal search_request_count
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token", "expires_in": 3600},
+            )
+        search_request_count += 1
+        return httpx.Response(
+            200,
+            headers={"Cache-Control": "max-age=99999"},
+            json={"tracks": {"items": []}},
+        )
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
+
+    assert await catalog.search_tracks("unknown", _MARKET) == ()
+    assert await catalog.search_tracks("unknown", _MARKET) == ()
+    clock.advance(900.001)
+    assert await catalog.search_tracks("unknown", _MARKET) == ()
+
+    assert search_request_count == 2
+    await catalog.aclose()
+    await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [("ETag", '"unexpected"')],
+        [("ETag", "")],
+        [("ETag", '"track-v1"'), ("ETag", '"track-v1"')],
+    ],
+)
+async def test_catalog_rejects_invalid_retained_304_metadata(
+    headers: list[tuple[str, str]],
+) -> None:
+    """Do not serve stale Candidates when a 304 response cannot validate its metadata."""
+    clock = ManualClock()
+    cache, _ = _shared_cache(clock)
+    search_request_count = 0
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal search_request_count
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token", "expires_in": 3600},
+            )
+        search_request_count += 1
+        if search_request_count == 1:
+            return httpx.Response(
+                200,
+                headers={"Cache-Control": "max-age=10", "ETag": '"track-v1"'},
+                json={"tracks": {"items": [_track_payload("first-track")]}},
+            )
+        return httpx.Response(304, headers=headers)
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
+
+    await catalog.search_tracks("Kiki", _MARKET)
+    clock.advance(10.001)
+    with pytest.raises(CatalogProviderError):
+        await catalog.search_tracks("Kiki", _MARKET)
+
+    await catalog.aclose()
+    await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    "revalidation_headers",
+    [
+        {"Cache-Control": "no-store"},
+        {"Cache-Control": "max-age=60", "Age": "invalid"},
+    ],
+)
+async def test_catalog_discards_retained_value_after_uncacheable_304(
+    revalidation_headers: dict[str, str],
+) -> None:
+    clock = ManualClock()
+    cache, _ = _shared_cache(clock)
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token", "expires_in": 3600},
+            )
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"Cache-Control": "max-age=10", "ETag": '"track-v1"'},
+                json={"tracks": {"items": [_track_payload("first-track")]}},
+            )
+        if len(requests) == 2:
+            assert requests[-1].headers["if-none-match"] == '"track-v1"'
+            return httpx.Response(304, headers=revalidation_headers)
+        assert "if-none-match" not in requests[-1].headers
+        return httpx.Response(
+            200,
+            headers={"Cache-Control": "no-store"},
+            json={"tracks": {"items": [_track_payload("fresh-track")]}},
+        )
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
+
+    assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "first-track"
+    clock.advance(10.001)
+    assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "first-track"
+    assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "fresh-track"
+
+    assert len(requests) == 3
+    await catalog.aclose()
+    await cache.aclose()
+
+
 async def test_catalog_returns_year_only_release_date_unchanged() -> None:
     """Return Spotify's year-only release date unchanged."""
     track = _track_payload("playable-track")
@@ -141,7 +524,7 @@ async def test_catalog_returns_year_only_release_date_unchanged() -> None:
             )
         return httpx.Response(200, json={"tracks": {"items": [track]}})
 
-    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings())
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), DisabledCache())
 
     candidates = await catalog.search_tracks("Kiki", _MARKET)
 
@@ -190,6 +573,7 @@ async def test_catalog_retries_one_bounded_rate_limit_with_a_fake_clock() -> Non
     catalog = SpotifyCatalog(
         _client(httpx.MockTransport(handle)),
         _settings(request_timeout_seconds=5.0),
+        DisabledCache(),
         clock=clock,
         sleep=clock.sleep,
     )
@@ -231,6 +615,7 @@ async def test_catalog_rejects_rate_limits_that_cannot_be_retried(
     catalog = SpotifyCatalog(
         _client(httpx.MockTransport(handle)),
         _settings(request_timeout_seconds=5.0),
+        DisabledCache(),
         clock=clock,
         sleep=clock.sleep,
     )
@@ -260,6 +645,7 @@ async def test_catalog_rejects_second_rate_limit_without_returning_candidates() 
     catalog = SpotifyCatalog(
         _client(httpx.MockTransport(handle)),
         _settings(request_timeout_seconds=5.0),
+        DisabledCache(),
         clock=clock,
         sleep=clock.sleep,
     )
@@ -290,6 +676,7 @@ async def test_catalog_refreshes_token_at_its_safe_pre_expiry_boundary() -> None
     catalog = SpotifyCatalog(
         _client(httpx.MockTransport(handle)),
         _settings(token_expiry_skew_seconds=3.0),
+        DisabledCache(),
         clock=clock,
         sleep=clock.sleep,
     )
@@ -325,7 +712,7 @@ async def test_catalog_returns_ordered_album_candidates_and_empty_track_searches
         albums = [_track_payload(f"track-{position}")["album"] for position in range(4)]
         return httpx.Response(200, json={"albums": {"items": albums}})
 
-    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings())
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), DisabledCache())
 
     no_tracks = await catalog.search_tracks("No Match", _MARKET)
     albums = await catalog.search_albums("Kiki's Delivery Service", _MARKET)
@@ -344,7 +731,7 @@ async def test_catalog_maps_authentication_rejection_without_logging_credentials
     async def handle(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, request=request)
 
-    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings())
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), DisabledCache())
 
     with pytest.raises(CatalogProviderError, match="Spotify catalog request failed"):
         await catalog.search_tracks("Kiki", _MARKET)
@@ -376,7 +763,7 @@ async def test_catalog_translates_network_failures_to_typed_errors(
             )
         raise failure
 
-    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings())
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), DisabledCache())
     expected_error = (
         PipelineTimeoutError
         if isinstance(failure, httpx.TimeoutException)
@@ -406,7 +793,7 @@ async def test_catalog_rejects_http_and_malformed_search_responses() -> None:
             )
         return next(responses)
 
-    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings())
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), DisabledCache())
 
     for query in ("first", "second"):
         with pytest.raises(CatalogProviderError, match="Spotify catalog request failed"):
@@ -463,7 +850,7 @@ async def test_catalog_rejects_calendar_invalid_release_dates() -> None:
             )
         return httpx.Response(200, json={"tracks": {"items": [track]}})
 
-    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings())
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), DisabledCache())
 
     with pytest.raises(CatalogProviderError, match="Spotify catalog request failed"):
         await catalog.search_tracks("Kiki", _MARKET)
@@ -486,7 +873,7 @@ async def test_catalog_rejects_non_ascii_release_date_digits() -> None:
             )
         return httpx.Response(200, json={"tracks": {"items": [track]}})
 
-    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings())
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), DisabledCache())
 
     with pytest.raises(CatalogProviderError, match="Spotify catalog request failed"):
         await catalog.search_tracks("Kiki", _MARKET)

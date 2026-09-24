@@ -78,7 +78,7 @@ async def _create_production_pipeline(
     Args:
         default_market: Validated Spotify market used when an API request omits it.
         spotify_catalog: Lifespan-owned Spotify catalog used without transferring ownership.
-        cache: Lifespan-owned shared cache borrowed by Open Library resolution.
+        cache: Lifespan-owned shared cache borrowed by Spotify and Open Library resolution.
     """
     interpretation_settings = InterpretationConfig()
     llm_provider_selection = LLMProviderSelectionConfig()  # type: ignore[call-arg]
@@ -178,6 +178,12 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
     try:
         spotify_settings = SpotifyConfig()  # type: ignore[call-arg]
 
+        def create_catalog(
+            settings: SpotifyConfig,
+        ) -> AbstractAsyncContextManager[object]:
+            """Bind the one lifespan-owned shared cache to the Spotify catalog factory."""
+            return create_spotify_catalog(settings, cache)
+
         async def create_pipeline() -> ExtractionPipelineProtocol:
             """Compose the pipeline with the lifespan's validated default market."""
             spotify_catalog = cast(SpotifyCatalog, application.state.spotify_catalog)
@@ -191,7 +197,7 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
             application,
             create_pipeline,
             spotify_settings,
-            create_spotify_catalog,
+            create_catalog,
         ):
             yield
     finally:

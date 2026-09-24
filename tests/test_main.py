@@ -489,8 +489,10 @@ async def test_disabled_production_lifespan_never_constructs_a_redis_client(
     @asynccontextmanager
     async def spotify_catalog_factory(
         settings: object,
+        cache: object,
     ) -> AsyncGenerator[_FakeSpotifyCatalog]:
         del settings
+        assert isinstance(cache, DisabledCache)
         yield _FakeSpotifyCatalog()
 
     def fail_redis_factory(*args: object, **kwargs: object) -> NoReturn:
@@ -545,13 +547,16 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
         default_market = SpotifyMarket("US")
 
     book_resolver = _RecordingBookResolver()
-    received_caches: list[object] = []
+    received_book_caches: list[object] = []
+    received_spotify_caches: list[object] = []
 
     @asynccontextmanager
     async def spotify_catalog_factory(
         settings: object,
+        configured_cache: object,
     ) -> AsyncGenerator[_FakeSpotifyCatalog]:
         del settings
+        received_spotify_caches.append(configured_cache)
         yield _FakeSpotifyCatalog()
 
     def create_configured_cache(settings: CacheConfig) -> _FakeCache:
@@ -560,7 +565,7 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
 
     def create_book_resolver(settings: object, configured_cache: object) -> _FakeBookResolver:
         del settings
-        received_caches.append(configured_cache)
+        received_book_caches.append(configured_cache)
         return book_resolver
 
     monkeypatch.setattr(main_module, "SpotifyConfig", _FakeSpotifySettings)
@@ -585,7 +590,8 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
     application = create_app()
 
     async with application.router.lifespan_context(application):
-        assert received_caches == [cache]
+        assert received_book_caches == [cache]
+        assert received_spotify_caches == [cache]
         assert cache.close_calls == 0
 
     assert book_resolver.close_calls == 1
@@ -608,8 +614,10 @@ async def test_enabled_cache_closes_once_after_partial_startup_failure(
     @asynccontextmanager
     async def spotify_catalog_factory(
         settings: object,
+        configured_cache: object,
     ) -> AsyncGenerator[_FakeSpotifyCatalog]:
         del settings
+        assert configured_cache is cache
         yield _FakeSpotifyCatalog()
 
     def create_configured_cache(settings: CacheConfig) -> _FakeCache:

@@ -18,11 +18,20 @@ from redis.exceptions import RedisError
 
 from reelio.cache.config import CacheConfig
 from reelio.cache.disabled import DisabledCache
-from reelio.cache.interface import AsyncCache, CacheCodecError, CacheEntry, JsonObject
+from reelio.cache.interface import (
+    AsyncCache,
+    CacheCodecError,
+    CacheEntry,
+    CacheSkip,
+    CacheWrite,
+    JsonObject,
+    RetainedCacheValue,
+    RevalidatingCacheEntry,
+)
 
 logger = logging.getLogger(__name__)
 
-_ENVELOPE_VERSION = 1
+_ENVELOPE_VERSION = 2
 _LAYER_PATTERN = re.compile(r"[a-z][a-z0-9-]*(?::[a-z][a-z0-9-]*)*")
 _KEY_VERSION_PATTERN = re.compile(r"v[1-9][0-9]*")
 
@@ -45,15 +54,31 @@ if redis.call("GET", KEYS[2]) == ARGV[1] then
 end
 return 0
 """
+_OWNED_DISCARD_SCRIPT = """
+-- OWNED_DISCARD
+if redis.call("GET", KEYS[2]) == ARGV[1] then
+    redis.call("UNLINK", KEYS[1])
+    return redis.call("DEL", KEYS[2])
+end
+return 0
+"""
 _CORRUPTION_DELETE_SCRIPT = """
 if redis.call("GET", KEYS[1]) == ARGV[1] then
     return redis.call("UNLINK", KEYS[1])
 end
 return 0
 """
+_ATOMIC_READ_SCRIPT = """
+local raw_payload = redis.call("GET", KEYS[1])
+if not raw_payload then
+    return {0, -2}
+end
+return {1, raw_payload, redis.call("PTTL", KEYS[1])}
+"""
 
 
 type _ScriptArgument = bytes | str | int
+type _CacheDescriptor[ValueT] = CacheEntry[ValueT] | RevalidatingCacheEntry[ValueT]
 
 
 class _RedisScript(Protocol):
@@ -71,10 +96,6 @@ class _RedisScript(Protocol):
 
 class _RedisClient(Protocol):
     """Contain the minimal Redis command surface owned by this cache."""
-
-    def get(self, name: str) -> Awaitable[bytes | str | None]:
-        """Load one raw cache payload."""
-        ...
 
     def set(
         self,
@@ -120,22 +141,31 @@ class _CacheRuntime:
 
 @dataclass(frozen=True, slots=True)
 class _Scripts:
-    """Contain lazily registered token-owned Redis scripts."""
+    """Contain lazily registered cache coordination scripts."""
 
     renew: _RedisScript
     release: _RedisScript
     fill: _RedisScript
+    discard: _RedisScript
     delete_corrupt: _RedisScript
+    read: _RedisScript
 
 
 @dataclass(frozen=True, slots=True)
 class _CacheRead[ValueT]:
-    """Classify one raw data-key read without collapsing corruption into absence."""
+    """Classify one Redis data-key read without collapsing corruption into absence."""
 
-    state: Literal["absent", "valid", "corrupt"]
+    state: Literal["absent", "fresh", "retained", "corrupt"]
     value: ValueT | None = None
     raw_payload: bytes | str | None = None
     corruption_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _OrdinaryCacheValue[ValueT]:
+    """Adapt ordinary TTL callers to the shared revalidating state machine."""
+
+    value: ValueT
 
 
 @dataclass(slots=True)
@@ -159,9 +189,14 @@ _UNOWNED_LOAD = _UnownedLoad()
 _PRODUCTION_POLICY = _CachePolicy()
 _PRODUCTION_RUNTIME = _CacheRuntime(time.monotonic, asyncio.sleep, lambda: secrets.token_hex(32))
 
+type _LoadOutcome[ValueT] = _OrdinaryCacheValue[ValueT] | CacheWrite[ValueT] | CacheSkip[ValueT]
+type _RevalidatingLoader[ValueT] = Callable[
+    [RetainedCacheValue[ValueT] | None], Awaitable[_LoadOutcome[ValueT]]
+]
+
 
 class RedisCache:
-    """Coordinate token-owned shared cache fills while keeping cache failures local."""
+    """Coordinate token-owned fills and conditional revalidation through one cache seam."""
 
     def __init__(
         self,
@@ -200,48 +235,42 @@ class RedisCache:
         entry: CacheEntry[ValueT],
         loader: Callable[[], Awaitable[ValueT]],
     ) -> ValueT:
-        """Return a decoded cache hit or an uncoordinated loader result.
+        """Return a fresh ordinary-TTL value or invoke its loader.
 
         Args:
-            entry: Versioned operation descriptor including the waiter deadline.
-            loader: Awaitable operation producing the value for a cache miss.
+            entry: Versioned cache operation descriptor.
+            loader: Awaitable operation producing a required value for a miss.
 
         Returns:
-            A decoded cached value or the loader's original value.
+            Decoded cache value or the loader's original value.
         """
-        try:
-            key = self._cache_key(entry)
-        except (TypeError, ValueError):
-            _emit_cache_event(entry.layer, "fail_open", "key_build_failed", warning=True)
-            return await loader()
 
-        if await self._is_closed():
-            _emit_cache_event(entry.layer, "fail_open", "cache_closed", warning=True)
-            return await loader()
+        async def revalidating_loader(
+            retained_value: RetainedCacheValue[ValueT] | None,
+        ) -> _OrdinaryCacheValue[ValueT]:
+            del retained_value
+            return _OrdinaryCacheValue(await loader())
 
-        cache_read = await self._read_cached_value(entry, key, operation="read")
-        if isinstance(cache_read, _CommandUnavailable):
-            return await loader()
-        if cache_read.state == "valid":
-            _emit_cache_event(entry.layer, "hit")
-            return cast(ValueT, cache_read.value)
-        if cache_read.state == "corrupt":
-            healed_cache_read = await self._heal_corruption(entry, key, cache_read)
-            if isinstance(healed_cache_read, (_CommandUnavailable, _UnownedLoad)):
-                return await loader()
-            if healed_cache_read.state == "valid":
-                _emit_cache_event(entry.layer, "hit")
-                return cast(ValueT, healed_cache_read.value)
+        return await self._get_or_load(entry, revalidating_loader)
 
-        _emit_cache_event(entry.layer, "miss")
-        lease_key = self._lease_key(key)
-        ownership = await self._try_acquire_lease(entry, lease_key)
-        if isinstance(ownership, _CommandUnavailable):
-            return await loader()
-        if ownership is not None:
-            return await self._load_as_owner(entry, key, lease_key, ownership, loader)
+    async def get_or_load_revalidating[ValueT](
+        self,
+        entry: RevalidatingCacheEntry[ValueT],
+        loader: Callable[
+            [RetainedCacheValue[ValueT] | None],
+            Awaitable[CacheWrite[ValueT] | CacheSkip[ValueT]],
+        ],
+    ) -> ValueT:
+        """Return a fresh value or revalidate a physically retained normalized value.
 
-        return await self._wait_or_load(entry, key, lease_key, loader)
+        Args:
+            entry: Versioned cache descriptor with shared operation identity.
+            loader: Loader receiving only the latest retained normalized value, if any.
+
+        Returns:
+            Decoded fresh value or the value produced by the loader.
+        """
+        return await self._get_or_load(entry, loader)
 
     async def aclose(self) -> None:
         """Cancel renewal work and close the owned Redis client at most once."""
@@ -259,7 +288,40 @@ class RedisCache:
                 await asyncio.gather(*renewal_tasks, return_exceptions=True)
             await self._client.aclose()
 
-    def _cache_key[ValueT](self, entry: CacheEntry[ValueT]) -> str:
+    async def _get_or_load[ValueT](
+        self,
+        entry: _CacheDescriptor[ValueT],
+        loader: _RevalidatingLoader[ValueT],
+    ) -> ValueT:
+        """Execute one cache operation while hiding lease and read-state mechanics."""
+        try:
+            key = self._cache_key(entry)
+        except (TypeError, ValueError):
+            _emit_cache_event(entry.layer, "fail_open", "key_build_failed", warning=True)
+            return await self._load_without_cache(loader)
+
+        if await self._is_closed():
+            _emit_cache_event(entry.layer, "fail_open", "cache_closed", warning=True)
+            return await self._load_without_cache(loader)
+
+        cache_read = await self._read_and_heal(entry, key, operation="read")
+        if isinstance(cache_read, (_CommandUnavailable, _UnownedLoad)):
+            return await self._load_without_cache(loader)
+        if cache_read.state == "fresh":
+            _emit_cache_event(entry.layer, "hit")
+            return cast(ValueT, cache_read.value)
+
+        _emit_cache_event(entry.layer, "miss")
+        lease_key = self._lease_key(key)
+        ownership = await self._try_acquire_lease(entry, lease_key)
+        if isinstance(ownership, _CommandUnavailable):
+            return await self._load_without_cache(loader)
+        if ownership is not None:
+            return await self._load_as_owner(entry, key, lease_key, ownership, loader)
+
+        return await self._wait_or_load(entry, key, lease_key, loader)
+
+    def _cache_key[ValueT](self, entry: _CacheDescriptor[ValueT]) -> str:
         """Build the HMAC-obscured visible Redis key for one cache entry.
 
         Args:
@@ -288,12 +350,12 @@ class RedisCache:
 
     async def _wait_or_load[ValueT](
         self,
-        entry: CacheEntry[ValueT],
+        entry: _CacheDescriptor[ValueT],
         key: str,
         lease_key: str,
-        loader: Callable[[], Awaitable[ValueT]],
+        loader: _RevalidatingLoader[ValueT],
     ) -> ValueT:
-        """Poll a contended fill for one bounded layer deadline before loading unowned."""
+        """Poll a contended fill, then make one final ownership attempt before fallback."""
         _emit_cache_event(entry.layer, "wait", "started")
         deadline = self._runtime.monotonic() + entry.wait_timeout_seconds
         while True:
@@ -304,44 +366,61 @@ class RedisCache:
             if self._runtime.monotonic() >= deadline:
                 break
 
-            cache_read = await self._read_cached_value(entry, key, operation="wait_read")
-            if isinstance(cache_read, _CommandUnavailable):
-                return await loader()
-            if cache_read.state == "valid":
+            cache_read = await self._read_and_heal(entry, key, operation="wait_read")
+            if isinstance(cache_read, (_CommandUnavailable, _UnownedLoad)):
+                return await self._load_without_cache(loader)
+            if cache_read.state == "fresh":
                 _emit_cache_event(entry.layer, "hit")
                 return cast(ValueT, cache_read.value)
-            if cache_read.state == "corrupt":
-                healed_cache_read = await self._heal_corruption(entry, key, cache_read)
-                if isinstance(healed_cache_read, (_CommandUnavailable, _UnownedLoad)):
-                    return await loader()
-                if healed_cache_read.state == "valid":
-                    _emit_cache_event(entry.layer, "hit")
-                    return cast(ValueT, healed_cache_read.value)
 
             ownership = await self._try_acquire_lease(entry, lease_key)
             if isinstance(ownership, _CommandUnavailable):
-                return await loader()
+                return await self._load_without_cache(loader)
             if ownership is not None:
                 return await self._load_as_owner(entry, key, lease_key, ownership, loader)
 
         _emit_cache_event(entry.layer, "wait", "deadline")
-        return await loader()
+        ownership = await self._try_acquire_lease(entry, lease_key)
+        if isinstance(ownership, _CommandUnavailable):
+            return await self._load_without_cache(loader)
+        if ownership is not None:
+            return await self._load_as_owner(entry, key, lease_key, ownership, loader)
+
+        final_cache_read = await self._read_and_heal(entry, key, operation="wait_read")
+        if isinstance(final_cache_read, (_CommandUnavailable, _UnownedLoad)):
+            return await self._load_without_cache(loader)
+        if final_cache_read.state == "fresh":
+            _emit_cache_event(entry.layer, "hit")
+            return cast(ValueT, final_cache_read.value)
+        return await self._load_without_cache(loader, final_cache_read)
 
     async def _load_as_owner[ValueT](
         self,
-        entry: CacheEntry[ValueT],
+        entry: _CacheDescriptor[ValueT],
         key: str,
         lease_key: str,
         ownership: _LeaseOwnership,
-        loader: Callable[[], Awaitable[ValueT]],
+        loader: _RevalidatingLoader[ValueT],
     ) -> ValueT:
-        """Run one loader under a lease and fill only while the token remains current."""
+        """Re-read under a lease, then load and write only while that lease remains owned."""
         renewal_task = await self._start_renewal(entry, lease_key, ownership)
         if renewal_task is None:
-            return await loader()
+            return await self._load_without_cache(loader)
 
+        ownership_read = await self._read_and_heal(entry, key, operation="read")
+        if isinstance(ownership_read, (_CommandUnavailable, _UnownedLoad)):
+            await self._stop_renewal(renewal_task)
+            await self._release_lease(entry, lease_key, ownership)
+            return await self._load_without_cache(loader)
+        if ownership_read.state == "fresh":
+            await self._stop_renewal(renewal_task)
+            await self._release_lease(entry, lease_key, ownership)
+            _emit_cache_event(entry.layer, "hit")
+            return cast(ValueT, ownership_read.value)
+
+        retained_value = self._retained_value(ownership_read)
         try:
-            loaded_value = await loader()
+            load_outcome = await loader(retained_value)
         except BaseException:
             await self._stop_renewal(renewal_task)
             await self._release_lease(entry, lease_key, ownership)
@@ -349,13 +428,33 @@ class RedisCache:
 
         await self._stop_renewal(renewal_task)
         if ownership.lost or await self._is_closed():
-            return loaded_value
-        await self._store_if_owned(entry, key, lease_key, ownership, loaded_value)
-        return loaded_value
+            return load_outcome.value
+        if isinstance(load_outcome, CacheSkip):
+            await self._discard_if_owned(entry, key, lease_key, ownership)
+            return load_outcome.value
+        await self._store_if_owned(entry, key, lease_key, ownership, load_outcome)
+        return load_outcome.value
+
+    async def _load_without_cache[ValueT](
+        self,
+        loader: _RevalidatingLoader[ValueT],
+        cache_read: _CacheRead[ValueT] | None = None,
+    ) -> ValueT:
+        """Invoke a loader without write authority and expose only current retained data."""
+        return (await loader(self._retained_value(cache_read))).value
+
+    def _retained_value[ValueT](
+        self,
+        cache_read: _CacheRead[ValueT] | None,
+    ) -> RetainedCacheValue[ValueT] | None:
+        """Wrap a still-retained value without exposing absent or corrupt cache states."""
+        if cache_read is None or cache_read.state != "retained":
+            return None
+        return RetainedCacheValue(cast(ValueT, cache_read.value))
 
     async def _start_renewal[ValueT](
         self,
-        entry: CacheEntry[ValueT],
+        entry: _CacheDescriptor[ValueT],
         lease_key: str,
         ownership: _LeaseOwnership,
     ) -> asyncio.Task[None] | None:
@@ -379,7 +478,7 @@ class RedisCache:
 
     async def _renew_lease[ValueT](
         self,
-        entry: CacheEntry[ValueT],
+        entry: _CacheDescriptor[ValueT],
         lease_key: str,
         ownership: _LeaseOwnership,
     ) -> None:
@@ -406,24 +505,24 @@ class RedisCache:
 
     async def _store_if_owned[ValueT](
         self,
-        entry: CacheEntry[ValueT],
+        entry: _CacheDescriptor[ValueT],
         key: str,
         lease_key: str,
         ownership: _LeaseOwnership,
-        value: ValueT,
+        load_outcome: _OrdinaryCacheValue[ValueT] | CacheWrite[ValueT],
     ) -> None:
         """Serialize once and atomically fill only while the owner token still matches."""
         try:
-            ttl_seconds = entry.ttl_seconds(value)
-            if type(ttl_seconds) is not int or ttl_seconds <= 0:
-                raise ValueError("Cache TTL must be a positive integer")
-            encoded_value = entry.codec.encode(value)
+            cache_write = self._cache_write(entry, load_outcome)
+            encoded_value = entry.codec.encode(cache_write.value)
             if not isinstance(encoded_value, dict):
                 raise TypeError("Cache codec must encode a JSON object")
             envelope = {
                 "envelope_version": _ENVELOPE_VERSION,
                 "value_version": entry.codec.version,
                 "value": encoded_value,
+                "freshness_seconds": cache_write.freshness_seconds,
+                "retention_seconds": cache_write.retention_seconds,
             }
             payload = json.dumps(
                 envelope,
@@ -447,7 +546,7 @@ class RedisCache:
             "ownership_write",
             lambda: self._scripts_for_client().fill(
                 keys=[key, lease_key],
-                args=[ownership.token, payload, ttl_seconds],
+                args=[ownership.token, payload, cache_write.retention_seconds],
             ),
         )
         if result is _COMMAND_UNAVAILABLE:
@@ -457,9 +556,51 @@ class RedisCache:
             return
         _emit_cache_event(entry.layer, "fill")
 
+    def _cache_write[ValueT](
+        self,
+        entry: _CacheDescriptor[ValueT],
+        load_outcome: _OrdinaryCacheValue[ValueT] | CacheWrite[ValueT],
+    ) -> CacheWrite[ValueT]:
+        """Adapt ordinary TTL values without moving validation outside the guarded write."""
+        if isinstance(load_outcome, CacheWrite):
+            return load_outcome
+        if not isinstance(entry, CacheEntry):
+            raise TypeError("Revalidating loaders must return CacheWrite or CacheSkip")
+        ttl_seconds = entry.ttl_seconds(load_outcome.value)
+        if type(ttl_seconds) is not int or ttl_seconds <= 0:
+            raise ValueError("Cache TTL must be a positive integer")
+        return CacheWrite(
+            load_outcome.value,
+            freshness_seconds=ttl_seconds,
+            retention_seconds=ttl_seconds,
+        )
+
+    async def _discard_if_owned[ValueT](
+        self,
+        entry: _CacheDescriptor[ValueT],
+        key: str,
+        lease_key: str,
+        ownership: _LeaseOwnership,
+    ) -> None:
+        """Remove retained data only while the loader still owns the coordinating lease."""
+        result = await self._run_redis_command(
+            entry,
+            "ownership_discard",
+            lambda: self._scripts_for_client().discard(
+                keys=[key, lease_key],
+                args=[ownership.token],
+            ),
+        )
+        if result is _COMMAND_UNAVAILABLE:
+            return
+        if not bool(result):
+            _emit_cache_event(entry.layer, "lease_loss", "ownership_discard_lost", warning=True)
+            return
+        _emit_cache_event(entry.layer, "discard")
+
     async def _release_lease[ValueT](
         self,
-        entry: CacheEntry[ValueT],
+        entry: _CacheDescriptor[ValueT],
         lease_key: str,
         ownership: _LeaseOwnership,
     ) -> None:
@@ -477,28 +618,43 @@ class RedisCache:
         if result is not _COMMAND_UNAVAILABLE and not bool(result):
             _emit_cache_event(entry.layer, "lease_loss", "lease_release_lost", warning=True)
 
+    async def _read_and_heal[ValueT](
+        self,
+        entry: _CacheDescriptor[ValueT],
+        key: str,
+        *,
+        operation: Literal["read", "wait_read"],
+    ) -> _CacheRead[ValueT] | _CommandUnavailable | _UnownedLoad:
+        """Run the atomic read and conditionally remove malformed retained data."""
+        cache_read = await self._read_cached_value(entry, key, operation=operation)
+        if isinstance(cache_read, _CommandUnavailable) or cache_read.state != "corrupt":
+            return cache_read
+        return await self._heal_corruption(entry, key, cache_read, operation=operation)
+
     async def _read_cached_value[ValueT](
         self,
-        entry: CacheEntry[ValueT],
+        entry: _CacheDescriptor[ValueT],
         key: str,
         *,
         operation: Literal["read", "wait_read"],
     ) -> _CacheRead[ValueT] | _CommandUnavailable:
-        """Read and classify one raw cache payload under the command bound."""
-        raw_payload = await self._run_redis_command(
+        """Atomically read raw bytes and Redis physical retention under the command bound."""
+        atomic_read = await self._run_redis_command(
             entry,
             operation,
-            lambda: self._client.get(key),
+            lambda: self._scripts_for_client().read(keys=[key], args=[]),
         )
-        if isinstance(raw_payload, _CommandUnavailable):
+        if isinstance(atomic_read, _CommandUnavailable):
             return _COMMAND_UNAVAILABLE
-        return _decode_cached_value(raw_payload, entry)
+        return _decode_atomic_read(atomic_read, entry)
 
     async def _heal_corruption[ValueT](
         self,
-        entry: CacheEntry[ValueT],
+        entry: _CacheDescriptor[ValueT],
         key: str,
         cache_read: _CacheRead[ValueT],
+        *,
+        operation: Literal["read", "wait_read"],
     ) -> _CacheRead[ValueT] | _CommandUnavailable | _UnownedLoad:
         """Conditionally unlink corrupt bytes without deleting a concurrent repair."""
         for cleanup_attempt in range(2):
@@ -518,7 +674,7 @@ class RedisCache:
             if bool(cleanup_result):
                 return _CacheRead("absent")
 
-            refreshed_cache_read = await self._read_cached_value(entry, key, operation="read")
+            refreshed_cache_read = await self._read_cached_value(entry, key, operation=operation)
             if isinstance(refreshed_cache_read, _CommandUnavailable):
                 return _COMMAND_UNAVAILABLE
             if refreshed_cache_read.state != "corrupt":
@@ -530,15 +686,14 @@ class RedisCache:
 
     async def _delete_corrupt_payload(self, key: str, raw_bytes: bytes) -> object:
         """Run one compare-raw-payload-and-UNLINK script invocation."""
-        script_args: list[_ScriptArgument] = [raw_bytes]
         return await self._scripts_for_client().delete_corrupt(
             keys=[key],
-            args=script_args,
+            args=[raw_bytes],
         )
 
     async def _try_acquire_lease[ValueT](
         self,
-        entry: CacheEntry[ValueT],
+        entry: _CacheDescriptor[ValueT],
         lease_key: str,
     ) -> _LeaseOwnership | None | _CommandUnavailable:
         """Acquire a token-owned lease or report ordinary existing-owner contention."""
@@ -559,7 +714,7 @@ class RedisCache:
 
     async def _run_redis_command[ValueT, ResultT](
         self,
-        entry: CacheEntry[ValueT],
+        entry: _CacheDescriptor[ValueT],
         operation: str,
         command: Callable[[], Awaitable[ResultT]],
     ) -> ResultT | _CommandUnavailable:
@@ -624,13 +779,15 @@ class RedisCache:
             return self._closed
 
     def _scripts_for_client(self) -> _Scripts:
-        """Register token-owned scripts lazily without opening a Redis connection."""
+        """Register coordination scripts lazily without opening a Redis connection."""
         if self._scripts is None:
             self._scripts = _Scripts(
                 renew=self._client.register_script(_LEASE_RENEW_SCRIPT),
                 release=self._client.register_script(_LEASE_RELEASE_SCRIPT),
                 fill=self._client.register_script(_LEASE_FILL_SCRIPT),
+                discard=self._client.register_script(_OWNED_DISCARD_SCRIPT),
                 delete_corrupt=self._client.register_script(_CORRUPTION_DELETE_SCRIPT),
+                read=self._client.register_script(_ATOMIC_READ_SCRIPT),
             )
         return self._scripts
 
@@ -649,7 +806,7 @@ def create_cache(settings: CacheConfig) -> AsyncCache:
     """Create the configured cache without connecting to Redis during startup.
 
     Args:
-        settings: Validated shared-cache configuration.
+        settings: Validated application cache configuration.
 
     Returns:
         DisabledCache when disabled, otherwise one RedisCache owning a lazy client.
@@ -660,14 +817,8 @@ def create_cache(settings: CacheConfig) -> AsyncCache:
     redis_url = settings.redis_url
     key_secret = settings.key_secret
     if redis_url is None or key_secret is None:
-        raise ValueError("Enabled cache settings must include Redis URL and key secret")
-    client = Redis.from_url(
-        redis_url.get_secret_value(),
-        socket_connect_timeout=1.0,
-        socket_timeout=1.0,
-        retry_on_timeout=False,
-        decode_responses=False,
-    )
+        raise ValueError("Enabled cache requires Redis URL and key secret")
+    client = Redis.from_url(redis_url.get_secret_value(), decode_responses=False)
     return RedisCache(
         cast(_RedisClient, client),
         settings.namespace,
@@ -675,13 +826,37 @@ def create_cache(settings: CacheConfig) -> AsyncCache:
     )
 
 
-def _decode_cached_value[ValueT](
-    raw_payload: bytes | str | None,
-    entry: CacheEntry[ValueT],
+def _decode_atomic_read[ValueT](
+    atomic_result: object,
+    entry: _CacheDescriptor[ValueT],
 ) -> _CacheRead[ValueT]:
-    """Classify a raw cache value as absent, valid, or safely recoverable corruption."""
-    if raw_payload is None:
+    """Validate the exact atomic Redis read result before decoding cached bytes."""
+    if not isinstance(atomic_result, (list, tuple)):
+        return _CacheRead("corrupt", corruption_reason="atomic_read_shape")
+    if (
+        len(atomic_result) == 2
+        and type(atomic_result[0]) is int
+        and atomic_result[0] == 0
+        and type(atomic_result[1]) is int
+        and atomic_result[1] == -2
+    ):
         return _CacheRead("absent")
+    if (
+        len(atomic_result) == 3
+        and type(atomic_result[0]) is int
+        and atomic_result[0] == 1
+        and isinstance(atomic_result[1], (bytes, str))
+    ):
+        return _decode_cached_value(atomic_result[1], atomic_result[2], entry)
+    return _CacheRead("corrupt", corruption_reason="atomic_read_shape")
+
+
+def _decode_cached_value[ValueT](
+    raw_payload: bytes | str,
+    pttl_milliseconds: object,
+    entry: _CacheDescriptor[ValueT],
+) -> _CacheRead[ValueT]:
+    """Classify one envelope by strict metadata and Redis-owned physical retention."""
     try:
         payload_text = raw_payload.decode() if isinstance(raw_payload, bytes) else raw_payload
     except UnicodeDecodeError:
@@ -702,23 +877,75 @@ def _decode_cached_value[ValueT](
         "envelope_version",
         "value_version",
         "value",
+        "freshness_seconds",
+        "retention_seconds",
     }:
         return _CacheRead(
             "corrupt",
             raw_payload=raw_payload,
             corruption_reason="envelope_shape",
         )
-    if envelope["envelope_version"] != _ENVELOPE_VERSION:
+    if (
+        type(envelope["envelope_version"]) is not int
+        or envelope["envelope_version"] != _ENVELOPE_VERSION
+    ):
         return _CacheRead(
             "corrupt",
             raw_payload=raw_payload,
             corruption_reason="envelope_version",
         )
-    if envelope["value_version"] != entry.codec.version:
+    if (
+        not isinstance(envelope["value_version"], str)
+        or envelope["value_version"] != entry.codec.version
+    ):
         return _CacheRead(
             "corrupt",
             raw_payload=raw_payload,
             corruption_reason="codec_version",
+        )
+    freshness_seconds = envelope["freshness_seconds"]
+    retention_seconds = envelope["retention_seconds"]
+    if (
+        type(freshness_seconds) is not int
+        or freshness_seconds < 0
+        or type(retention_seconds) is not int
+        or retention_seconds <= 0
+        or freshness_seconds > retention_seconds
+    ):
+        return _CacheRead(
+            "corrupt",
+            raw_payload=raw_payload,
+            corruption_reason="envelope_retention",
+        )
+    if type(pttl_milliseconds) is not int:
+        return _CacheRead(
+            "corrupt",
+            raw_payload=raw_payload,
+            corruption_reason="pttl_shape",
+        )
+    if pttl_milliseconds == -1:
+        return _CacheRead(
+            "corrupt",
+            raw_payload=raw_payload,
+            corruption_reason="pttl_persistent",
+        )
+    if pttl_milliseconds == -2:
+        return _CacheRead(
+            "corrupt",
+            raw_payload=raw_payload,
+            corruption_reason="pttl_absent",
+        )
+    if pttl_milliseconds < 0:
+        return _CacheRead(
+            "corrupt",
+            raw_payload=raw_payload,
+            corruption_reason="pttl_negative",
+        )
+    if pttl_milliseconds > retention_seconds * 1_000:
+        return _CacheRead(
+            "corrupt",
+            raw_payload=raw_payload,
+            corruption_reason="pttl_above_retention",
         )
     encoded_value = envelope["value"]
     if not isinstance(encoded_value, dict):
@@ -735,7 +962,10 @@ def _decode_cached_value[ValueT](
             raw_payload=raw_payload,
             corruption_reason="codec_validation",
         )
-    return _CacheRead("valid", value=decoded_value)
+    fresh_threshold_milliseconds = (retention_seconds - freshness_seconds) * 1_000
+    state: Literal["fresh", "retained"]
+    state = "fresh" if pttl_milliseconds > fresh_threshold_milliseconds else "retained"
+    return _CacheRead(state, value=decoded_value)
 
 
 def _as_raw_bytes(raw_payload: bytes | str) -> bytes:

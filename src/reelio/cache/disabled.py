@@ -2,7 +2,13 @@
 
 from collections.abc import Awaitable, Callable
 
-from reelio.cache.interface import CacheEntry
+from reelio.cache.interface import (
+    CacheEntry,
+    CacheSkip,
+    CacheWrite,
+    RetainedCacheValue,
+    RevalidatingCacheEntry,
+)
 
 
 class DisabledCache:
@@ -24,6 +30,26 @@ class DisabledCache:
         """
         del entry
         return await loader()
+
+    async def get_or_load_revalidating[ValueT](
+        self,
+        entry: RevalidatingCacheEntry[ValueT],
+        loader: Callable[
+            [RetainedCacheValue[ValueT] | None],
+            Awaitable[CacheWrite[ValueT] | CacheSkip[ValueT]],
+        ],
+    ) -> ValueT:
+        """Load once without retaining a value for a later revalidation.
+
+        Args:
+            entry: Ignored cache operation descriptor.
+            loader: Operation receiving no retained value.
+
+        Returns:
+            The loaded normalized value.
+        """
+        del entry
+        return (await loader(None)).value
 
     async def aclose(self) -> None:
         """Release no resources because disabled caching owns none."""
