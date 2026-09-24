@@ -1,12 +1,14 @@
 """TMDB candidate resolution contract tests."""
 
 import asyncio
+import json
 from collections.abc import Callable
 from typing import cast
 
 import httpx
 import pytest
 
+from reelio.cache import AsyncCache, DisabledCache, RedisCache
 from reelio.extraction.exceptions import EnrichmentError, PipelineTimeoutError
 from reelio.extraction.services.enrichment.config import TMDBConfig
 from reelio.extraction.services.enrichment.tmdb import (
@@ -17,8 +19,10 @@ from reelio.extraction.types import (
     MovieMention,
     ResultStatus,
     ScreenWorkMentions,
+    ScreenWorkResults,
     TVSeriesMention,
 )
+from tests.cache.fakes import FakeRedis, ManualClock
 
 
 def _settings(**values: object) -> TMDBConfig:
@@ -31,6 +35,23 @@ def _client(handler: httpx.AsyncBaseTransport) -> httpx.AsyncClient:
         base_url="https://api.themoviedb.org/3/",
         transport=handler,
     )
+
+
+def _resolver(
+    client: httpx.AsyncClient,
+    *,
+    cache: AsyncCache | None = None,
+    image_base_url: str = "https://image.tmdb.org/t/p/w500",
+) -> TMDBScreenWorkResolver:
+    return TMDBScreenWorkResolver(
+        client,
+        image_base_url,
+        DisabledCache() if cache is None else cache,
+    )
+
+
+def _shared_cache(redis: FakeRedis) -> RedisCache:
+    return RedisCache(redis, "reelio:test", b"tmdb-cache-test-key")
 
 
 def _mentions(
@@ -119,7 +140,7 @@ async def test_resolver_selects_first_title_and_year_match_and_enriches() -> Non
 
     transport = httpx.MockTransport(handle)
     client = _client(transport)
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500/")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500/")
     movie_mention = MovieMention(title="Amélie", year=2001)
 
     results = await resolver.resolve(_mentions(movies=[movie_mention]))
@@ -199,7 +220,7 @@ async def test_resolver_searches_adjacent_years_after_exact_year_has_no_match(
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     movie_mention = MovieMention(title="Target", year=2000)
 
     results = await resolver.resolve(_mentions(movies=[movie_mention]))
@@ -249,7 +270,7 @@ async def test_resolver_rejects_movie_details_release_year_more_than_one_year_aw
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     movie_mention = MovieMention(title="Target", year=2000)
 
     results = await resolver.resolve(_mentions(movies=[movie_mention]))
@@ -295,7 +316,7 @@ async def test_resolver_matches_provider_alternative_title() -> None:
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(_mentions(movies=[MovieMention(title="Amélie", year=2001)]))
 
@@ -327,7 +348,7 @@ async def test_resolver_searches_only_first_page_per_year_before_returning_unres
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     movie_mention = MovieMention(title="Missing Film", year=2000)
 
     results = await resolver.resolve(_mentions(movies=[movie_mention]))
@@ -405,7 +426,7 @@ async def test_resolver_resolves_tv_primary_original_and_alternative_titles() ->
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     mentions = [
         TVSeriesMention(title="Primary", year=2001),
         TVSeriesMention(title="Original", year=2002),
@@ -480,7 +501,7 @@ async def test_resolver_searches_tv_adjacent_years_after_exact_year_has_no_match
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     tv_series_mention = TVSeriesMention(title="Target", year=2000)
 
     results = await resolver.resolve(_mentions(tv_series=[tv_series_mention]))
@@ -538,7 +559,7 @@ async def test_resolver_limits_tv_resolution_to_first_page_and_three_candidates(
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(tv_series=[TVSeriesMention(title="Target", year=2020)])
@@ -592,7 +613,7 @@ async def test_resolver_returns_first_matching_tv_candidate() -> None:
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(tv_series=[TVSeriesMention(title="Target", year=2015)])
@@ -649,7 +670,7 @@ async def test_resolver_retains_unresolved_tv_mentions_after_mismatches_or_absen
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     mentions = [
         TVSeriesMention(title="Wrong Year", year=2000),
         TVSeriesMention(title="Wrong Title", year=2000),
@@ -719,7 +740,7 @@ async def test_resolver_enriches_canonical_tv_identity_and_provider_ordered_meta
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500/")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500/")
     mention = TVSeriesMention(title="Canonical Title", year=2019)
 
     results = await resolver.resolve(_mentions(tv_series=[mention]))
@@ -787,7 +808,7 @@ async def test_resolver_maps_tv_last_air_year_only_for_complete_series(
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(tv_series=[TVSeriesMention(title="Status Test", year=2020)])
@@ -836,7 +857,7 @@ async def test_resolver_handles_short_or_absent_tv_aggregate_cast(
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(tv_series=[TVSeriesMention(title="Cast Test", year=2020)])
@@ -877,7 +898,7 @@ async def test_resolver_keeps_optional_tv_metadata_nullable() -> None:
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(tv_series=[TVSeriesMention(title="Optional Metadata", year=2020)])
@@ -957,7 +978,7 @@ async def test_resolver_preserves_per_kind_order_despite_out_of_order_completion
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     movie_mentions = [
         MovieMention(title="1 Movie", year=2020),
         MovieMention(title="2 Movie", year=2020),
@@ -982,7 +1003,7 @@ async def test_resolver_maps_tmdb_http_failures_to_enrichment_error() -> None:
         return httpx.Response(503, request=request)
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     with pytest.raises(EnrichmentError, match="TMDB candidate resolution"):
         await resolver.resolve(_mentions(movies=[MovieMention(title="Dune: Part One", year=2021)]))
@@ -997,7 +1018,7 @@ async def test_resolver_maps_tmdb_timeouts_to_pipeline_timeout() -> None:
         raise httpx.ReadTimeout("timed out", request=request)
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     with pytest.raises(PipelineTimeoutError, match="TMDB candidate resolution timed out"):
         await resolver.resolve(_mentions(movies=[MovieMention(title="Dune: Part One", year=2021)]))
@@ -1012,7 +1033,7 @@ async def test_resolver_maps_invalid_tv_json_to_enrichment_error() -> None:
         return httpx.Response(200, content=b"{")
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     with pytest.raises(EnrichmentError, match="TMDB candidate resolution"):
         await resolver.resolve(
@@ -1050,7 +1071,7 @@ async def test_resolver_rejects_missing_required_tv_appended_responses(
         return httpx.Response(200, json=payload)
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     with pytest.raises(EnrichmentError, match="TMDB candidate resolution"):
         await resolver.resolve(
@@ -1091,7 +1112,7 @@ async def test_resolver_aborts_grouped_resolution_without_partial_results() -> N
         return httpx.Response(503, request=request)
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     with pytest.raises(EnrichmentError, match="TMDB candidate resolution"):
         await resolver.resolve(
@@ -1106,7 +1127,7 @@ async def test_resolver_aborts_grouped_resolution_without_partial_results() -> N
 
 async def test_factory_builds_closable_tmdb_resolver() -> None:
     """Build the production resolver from validated TMDB settings."""
-    resolver = create_tmdb_screen_work_resolver(_settings())
+    resolver = create_tmdb_screen_work_resolver(_settings(), DisabledCache())
 
     assert isinstance(resolver, TMDBScreenWorkResolver)
 
@@ -1171,7 +1192,7 @@ async def test_resolver_waits_for_every_strict_resolution_before_fuzzy_fallback(
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     fuzzy_movie_mention = MovieMention(title="Target Movie", year=2020)
     exact_tv_mention = TVSeriesMention(title="Exact Series", year=2020)
 
@@ -1254,7 +1275,7 @@ async def test_resolver_keeps_strict_exact_matches_ahead_of_fuzzy_candidates(
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
@@ -1304,7 +1325,7 @@ async def test_resolver_fuzzy_matches_movie_primary_title_with_unicode_normaliza
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     movie_mention = MovieMention(title="Amélie", year=2020)
 
     results = await resolver.resolve(_mentions(movies=[movie_mention]))
@@ -1350,7 +1371,7 @@ async def test_resolver_fuzzy_matches_tv_original_title_with_collapsed_whitespac
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     tv_series_mention = TVSeriesMention(title="AMÉLIE", year=2020)
 
     results = await resolver.resolve(_mentions(tv_series=[tv_series_mention]))
@@ -1407,7 +1428,7 @@ async def test_resolver_fuzzy_title_threshold_preserves_accents_and_punctuation(
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     movie_mention = MovieMention(title=mention_title, year=2020)
 
     results = await resolver.resolve(_mentions(movies=[movie_mention]))
@@ -1451,7 +1472,7 @@ async def test_resolver_fuzzy_resolution_ignores_alternative_titles() -> None:
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     movie_mention = MovieMention(title="Target Movie", year=2020)
 
     results = await resolver.resolve(_mentions(movies=[movie_mention]))
@@ -1535,7 +1556,7 @@ async def test_resolver_fuzzy_uses_provider_order_within_three_candidate_bounds(
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
@@ -1581,7 +1602,7 @@ async def test_resolver_fuzzy_reuses_details_loaded_by_strict_verification() -> 
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
@@ -1635,7 +1656,7 @@ async def test_resolver_fuzzy_skips_movies_without_acceptable_detail_release_yea
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     movie_mention = MovieMention(title="Target Movie", year=2020)
 
     results = await resolver.resolve(_mentions(movies=[movie_mention]))
@@ -1696,7 +1717,7 @@ async def test_resolver_fuzzy_skips_tv_without_acceptable_detail_first_air_year(
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     tv_series_mention = TVSeriesMention(title="Target Series", year=2020)
 
     results = await resolver.resolve(_mentions(tv_series=[tv_series_mention]))
@@ -1741,7 +1762,7 @@ async def test_resolver_rejects_missing_required_movie_fallback_details(
         return httpx.Response(200, json=payload)
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     with pytest.raises(EnrichmentError, match="TMDB candidate resolution"):
         await resolver.resolve(_mentions(movies=[MovieMention(title="Target Movie", year=2020)]))
@@ -1781,7 +1802,7 @@ async def test_resolver_rejects_missing_required_tv_fallback_details(
         return httpx.Response(200, json=payload)
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     with pytest.raises(EnrichmentError, match="TMDB candidate resolution"):
         await resolver.resolve(
@@ -1855,7 +1876,7 @@ async def test_resolver_preserves_fallback_result_order_after_reverse_detail_com
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     movie_mentions = [
         MovieMention(title="One Movie", year=2020),
         MovieMention(title="Two Movie", year=2020),
@@ -1910,7 +1931,7 @@ async def test_resolver_maps_fallback_detail_failures(
         return httpx.Response(200, content=b"{")
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     with pytest.raises(expected_exception, match="TMDB candidate resolution"):
         await resolver.resolve(_mentions(movies=[MovieMention(title="Target Movie", year=2020)]))
@@ -1965,7 +1986,7 @@ async def test_resolver_aborts_grouped_fallback_resolution_without_partial_resul
         return httpx.Response(503, request=request)
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     with pytest.raises(EnrichmentError, match="TMDB candidate resolution"):
         await resolver.resolve(
@@ -2023,7 +2044,7 @@ async def test_resolver_fragment_searches_movie_and_tv_without_years() -> None:
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     movie_mention = MovieMention(title="Target Movie", year=2020)
     tv_series_mention = TVSeriesMention(title="Target Series", year=2020)
 
@@ -2094,7 +2115,7 @@ async def test_resolver_waits_for_direct_fuzzy_resolution_before_fragment_search
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     resolve_task = asyncio.create_task(
         resolver.resolve(
             _mentions(
@@ -2155,7 +2176,7 @@ async def test_resolver_skips_fragment_search_after_earlier_resolution(
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
@@ -2190,7 +2211,7 @@ async def test_resolver_derives_bounded_fragment_queries(
         return httpx.Response(200, json={"results": []})
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     movie_mention = MovieMention(title=title, year=2020)
 
     results = await resolver.resolve(_mentions(movies=[movie_mention]))
@@ -2244,7 +2265,7 @@ async def test_resolver_preserves_normalized_title_tokens_in_fragment_queries(
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(_mentions(movies=[MovieMention(title=title, year=2020)]))
 
@@ -2288,7 +2309,7 @@ async def test_resolver_limits_fragment_search_to_five_candidates() -> None:
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
@@ -2328,7 +2349,7 @@ async def test_resolver_uses_provider_order_for_fragment_candidates() -> None:
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
@@ -2392,7 +2413,7 @@ async def test_resolver_uses_complete_titles_for_fragment_fuzzy_matching(
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(_mentions(movies=[MovieMention(title=title, year=2020)]))
 
@@ -2462,7 +2483,7 @@ async def test_resolver_skips_fragment_candidates_without_acceptable_detail_year
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(
@@ -2536,7 +2557,7 @@ async def test_resolver_preserves_fragment_result_order_after_reverse_completion
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     movie_mentions = [
         MovieMention(title="One Film", year=2020),
         MovieMention(title="Two Movie", year=2020),
@@ -2583,7 +2604,7 @@ async def test_resolver_reuses_rejected_direct_fuzzy_details_for_fragment_search
         )
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     results = await resolver.resolve(
         _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
@@ -2674,7 +2695,7 @@ async def test_resolver_maps_fragment_search_and_detail_failures(
         return httpx.Response(200, json=payload)
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
     mentions = (
         _mentions(movies=[MovieMention(title="Target Movie", year=2020)])
         if kind == "movie"
@@ -2714,7 +2735,7 @@ async def test_resolver_aborts_fragment_resolution_after_sibling_success() -> No
         raise AssertionError(f"Unexpected TMDB request: {request.url.path}")
 
     client = _client(httpx.MockTransport(handle))
-    resolver = TMDBScreenWorkResolver(client, "https://image.tmdb.org/t/p/w500")
+    resolver = _resolver(client, image_base_url="https://image.tmdb.org/t/p/w500")
 
     with pytest.raises(EnrichmentError, match="TMDB candidate resolution"):
         await resolver.resolve(
@@ -2725,3 +2746,625 @@ async def test_resolver_aborts_fragment_resolution_after_sibling_success() -> No
         )
 
     await resolver.aclose()
+
+
+async def test_resolver_reuses_normalized_movie_and_tv_values_across_resolvers() -> None:
+    """Cache normalized Screen Work values without sharing mutable result collections."""
+    clock = ManualClock()
+    redis = FakeRedis(clock)
+    cache = _shared_cache(redis)
+    sentinel = "provider-only-sentinel"
+    first_requests: list[str] = []
+
+    async def first_handler(request: httpx.Request) -> httpx.Response:
+        first_requests.append(request.url.path)
+        if request.url.path == "/3/search/movie":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 11,
+                            "title": "Cached Movie",
+                            "original_title": "Cached Movie",
+                            "release_date": "2020-01-01",
+                            "ignored": sentinel,
+                        }
+                    ],
+                    "total_pages": 42,
+                },
+            )
+        if request.url.path == "/3/movie/11":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 11,
+                    "title": "Cached Movie",
+                    "release_date": "2020-01-01",
+                    "overview": "Movie description",
+                    "poster_path": "/movie.jpg",
+                    "imdb_id": " tt0000011 ",
+                    "vote_average": 8.2,
+                    "credits": {
+                        "cast": [{"name": "Movie Cast"}, {"name": "Movie Cast"}],
+                        "crew": [{"name": "Movie Director", "job": "Director"}],
+                    },
+                    "ignored": sentinel,
+                },
+            )
+        if request.url.path == "/3/search/tv":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 22,
+                            "name": "Cached Series",
+                            "original_name": "Cached Series",
+                            "first_air_date": "2020-01-01",
+                            "ignored": sentinel,
+                        }
+                    ],
+                    "total_pages": 42,
+                },
+            )
+        if request.url.path == "/3/tv/22":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 22,
+                    "name": "Cached Series",
+                    "first_air_date": "2020-01-01",
+                    "overview": "Series description",
+                    "poster_path": "/series.jpg",
+                    "vote_average": 7.1,
+                    "aggregate_credits": {
+                        "cast": [{"name": "Series Cast"}, {"name": "Series Cast"}]
+                    },
+                    "created_by": [{"name": "Series Creator"}],
+                    "external_ids": {"imdb_id": " tt0000022 "},
+                    "ignored": sentinel,
+                },
+            )
+        raise AssertionError(f"Unexpected first-resolver request: {request.url.path}")
+
+    first_resolver = _resolver(_client(httpx.MockTransport(first_handler)), cache=cache)
+    first_results = await first_resolver.resolve(
+        _mentions(
+            movies=[MovieMention(title="Cached Movie", year=2020)],
+            tv_series=[TVSeriesMention(title="Cached Series", year=2020)],
+        )
+    )
+    first_movie = first_results.movies[0].movie
+    first_series = first_results.tv_series[0].tv_series
+    assert first_movie is not None
+    assert first_series is not None
+    first_movie.cast.append("mutated cast")
+    first_movie.directors.append("mutated director")
+    first_series.cast.append("mutated cast")
+    first_series.creators.append("mutated creator")
+    await first_resolver.aclose()
+
+    second_requests = 0
+
+    async def second_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal second_requests
+        second_requests += 1
+        raise AssertionError(f"Cache hit unexpectedly requested {request.url.path}")
+
+    second_resolver = _resolver(_client(httpx.MockTransport(second_handler)), cache=cache)
+    second_results = await second_resolver.resolve(
+        _mentions(
+            movies=[MovieMention(title="Cached Movie", year=2020)],
+            tv_series=[TVSeriesMention(title="Cached Series", year=2020)],
+        )
+    )
+    second_movie = second_results.movies[0].movie
+    second_series = second_results.tv_series[0].tv_series
+    assert first_requests.count("/3/search/movie") == 1
+    assert first_requests.count("/3/movie/11") == 1
+    assert first_requests.count("/3/search/tv") == 1
+    assert first_requests.count("/3/tv/22") == 1
+    assert second_requests == 0
+    assert second_movie is not None
+    assert second_series is not None
+    assert second_movie.cast == ["Movie Cast", "Movie Cast"]
+    assert second_movie.directors == ["Movie Director"]
+    assert second_series.cast == ["Series Cast", "Series Cast"]
+    assert second_series.creators == ["Series Creator"]
+    assert second_movie.cast is not first_movie.cast
+    assert second_movie.directors is not first_movie.directors
+    assert second_series.cast is not first_series.cast
+    assert second_series.creators is not first_series.creators
+    assert all(sentinel.encode() not in (redis.raw_value(key) or b"") for key in redis.keys)
+    await second_resolver.aclose()
+    await cache.aclose()
+
+
+async def test_resolver_cache_identity_separates_tmdb_operations() -> None:
+    """Cache only identical TMDB Search and detail operations."""
+    clock = ManualClock()
+    redis = FakeRedis(clock)
+    cache = _shared_cache(redis)
+    requests: list[tuple[str, dict[str, str]]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        requests.append((request.url.path, params))
+        query = params.get("query")
+        if request.url.path == "/3/search/movie":
+            year = int(params["year"])
+            if query == "Second":
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "id": 2,
+                                "title": "Second",
+                                "original_title": "Second",
+                                "release_date": f"{year}-01-01",
+                            }
+                        ]
+                    },
+                )
+            if query == "Alt":
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "id": 1,
+                                "title": "Different",
+                                "original_title": "Different",
+                                "release_date": f"{year}-01-01",
+                            }
+                        ]
+                    },
+                )
+            if query == "Exact" and year < 2000:
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "id": 3,
+                                "title": "Exact",
+                                "original_title": "Exact",
+                                "release_date": "1990-01-01",
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 1,
+                            "title": "Exact",
+                            "original_title": "Exact",
+                            "release_date": f"{year}-01-01",
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/3/search/tv":
+            tv_year = params["first_air_date_year"]
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 1,
+                            "name": "Exact",
+                            "original_name": "Exact",
+                            "first_air_date": f"{tv_year}-01-01",
+                        }
+                    ]
+                },
+            )
+        if request.url.path.startswith("/3/movie/"):
+            tmdb_id = int(request.url.path.rsplit("/", maxsplit=1)[1])
+            return httpx.Response(
+                200,
+                json={
+                    "id": tmdb_id,
+                    "title": "Different"
+                    if params["append_to_response"].endswith("alternative_titles")
+                    else "Exact",
+                    "release_date": "1999-01-01" if tmdb_id == 3 else "2020-01-01",
+                    "poster_path": "/poster.jpg",
+                    "alternative_titles": {"titles": [{"title": "Alt"}]},
+                    "credits": {},
+                },
+            )
+        if request.url.path == "/3/tv/1":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 1,
+                    "name": "Exact",
+                    "first_air_date": "2020-01-01",
+                    "poster_path": "/series.jpg",
+                    "aggregate_credits": {},
+                    "external_ids": {},
+                },
+            )
+        raise AssertionError(f"Unexpected cache-identity request: {request.url.path}")
+
+    async def resolve(
+        mentions: ScreenWorkMentions,
+        *,
+        image_base_url: str = "https://image.tmdb.org/t/p/w500",
+    ) -> ScreenWorkResults:
+        resolver = _resolver(
+            _client(httpx.MockTransport(handler)),
+            cache=cache,
+            image_base_url=image_base_url,
+        )
+        try:
+            return await resolver.resolve(mentions)
+        finally:
+            await resolver.aclose()
+
+    exact_mentions = _mentions(movies=[MovieMention(title="Exact", year=2020)])
+    await resolve(exact_mentions)
+    assert [path for path, _ in requests] == ["/3/search/movie", "/3/movie/1"]
+    requests.clear()
+
+    await resolve(exact_mentions)
+    assert requests == []
+
+    await resolve(_mentions(movies=[MovieMention(title="Exact ", year=2020)]))
+    assert [path for path, _ in requests] == ["/3/search/movie"]
+    requests.clear()
+
+    await resolve(_mentions(movies=[MovieMention(title="Exact", year=2021)]))
+    assert [path for path, _ in requests] == ["/3/search/movie"]
+    requests.clear()
+
+    await resolve(_mentions(tv_series=[TVSeriesMention(title="Exact", year=2020)]))
+    assert [path for path, _ in requests] == ["/3/search/tv", "/3/tv/1"]
+    requests.clear()
+
+    await resolve(_mentions(movies=[MovieMention(title="Second", year=2020)]))
+    assert [path for path, _ in requests] == ["/3/search/movie", "/3/movie/2"]
+    requests.clear()
+
+    await resolve(_mentions(movies=[MovieMention(title="Alt", year=2020)]))
+    assert [path for path, _ in requests] == ["/3/search/movie", "/3/movie/1"]
+    assert requests[1][1]["append_to_response"] == "credits,alternative_titles"
+    requests.clear()
+
+    image_base_results = await resolve(
+        exact_mentions,
+        image_base_url="https://images.example.invalid/t/p/original",
+    )
+    assert [path for path, _ in requests] == ["/3/movie/1"]
+    assert image_base_results.movies[0].movie is not None
+    assert (
+        image_base_results.movies[0].movie.poster_url
+        == "https://images.example.invalid/t/p/original/poster.jpg"
+    )
+    requests.clear()
+
+    await resolve(_mentions(movies=[MovieMention(title="Exact", year=1990)]))
+    assert any(path == "/3/movie/3" for path, _ in requests)
+    assert any(
+        params.get("append_to_response") == "credits"
+        for path, params in requests
+        if path == "/3/movie/3"
+    )
+    requests.clear()
+
+    fuzzy_results = await resolve(_mentions(movies=[MovieMention(title="Exact", year=2000)]))
+    assert fuzzy_results.movies[0].status is ResultStatus.RESOLVED
+    assert any(path == "/3/movie/3" for path, _ in requests)
+    assert any(
+        params.get("append_to_response") == "credits"
+        for path, params in requests
+        if path == "/3/movie/3"
+    )
+    await cache.aclose()
+
+
+async def test_resolver_cache_expires_positive_searches_at_the_ttl_boundary() -> None:
+    """Reload positive Search operations exactly when their cache TTL expires."""
+    clock = ManualClock()
+    redis = FakeRedis(clock)
+    cache = _shared_cache(redis)
+    search_requests = 0
+    detail_requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal detail_requests, search_requests
+        if request.url.path == "/3/search/movie":
+            search_requests += 1
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 1,
+                            "title": "TTL Movie",
+                            "original_title": "TTL Movie",
+                            "release_date": "2020-01-01",
+                        }
+                    ]
+                },
+            )
+        detail_requests += 1
+        return httpx.Response(
+            200,
+            json={"id": 1, "title": "TTL Movie", "release_date": "2020-01-01"},
+        )
+
+    resolver = _resolver(_client(httpx.MockTransport(handler)), cache=cache)
+    mentions = _mentions(movies=[MovieMention(title="TTL Movie", year=2020)])
+    await resolver.resolve(mentions)
+    clock.advance(21_599.999)
+    await resolver.resolve(mentions)
+    assert (search_requests, detail_requests) == (1, 1)
+    clock.advance(0.001)
+    await resolver.resolve(mentions)
+    assert (search_requests, detail_requests) == (2, 1)
+    await resolver.aclose()
+    await cache.aclose()
+
+
+async def test_resolver_cache_expires_empty_searches_at_the_ttl_boundary() -> None:
+    """Reload empty Search operations exactly when their shorter cache TTL expires."""
+    clock = ManualClock()
+    redis = FakeRedis(clock)
+    cache = _shared_cache(redis)
+    search_requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal search_requests
+        search_requests += 1
+        return httpx.Response(200, json={"results": []})
+
+    resolver = _resolver(_client(httpx.MockTransport(handler)), cache=cache)
+    mentions = _mentions(movies=[MovieMention(title="Missing", year=2020)])
+    await resolver.resolve(mentions)
+    clock.advance(899.999)
+    await resolver.resolve(mentions)
+    assert search_requests == 3
+    clock.advance(0.001)
+    await resolver.resolve(mentions)
+    assert search_requests == 6
+    await resolver.aclose()
+    await cache.aclose()
+
+
+async def test_resolver_cache_expires_details_without_reloading_fresh_searches() -> None:
+    """Reload cached details at their boundary while a freshly loaded Search remains valid."""
+    clock = ManualClock()
+    redis = FakeRedis(clock)
+    cache = _shared_cache(redis)
+    search_requests = 0
+    detail_requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal detail_requests, search_requests
+        if request.url.path == "/3/search/movie":
+            search_requests += 1
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 1,
+                            "title": "Detail TTL Movie",
+                            "original_title": "Detail TTL Movie",
+                            "release_date": "2020-01-01",
+                        }
+                    ]
+                },
+            )
+        detail_requests += 1
+        return httpx.Response(
+            200,
+            json={"id": 1, "title": "Detail TTL Movie", "release_date": "2020-01-01"},
+        )
+
+    resolver = _resolver(_client(httpx.MockTransport(handler)), cache=cache)
+    mentions = _mentions(movies=[MovieMention(title="Detail TTL Movie", year=2020)])
+    await resolver.resolve(mentions)
+    clock.advance(86_399.999)
+    await resolver.resolve(mentions)
+    assert (search_requests, detail_requests) == (2, 1)
+    clock.advance(0.001)
+    await resolver.resolve(mentions)
+    assert (search_requests, detail_requests) == (2, 2)
+    await resolver.aclose()
+    await cache.aclose()
+
+
+@pytest.mark.parametrize("cache_failure", ["read", "ownership_write"])
+async def test_resolver_fails_open_when_tmdb_cache_commands_fail(
+    cache_failure: str,
+) -> None:
+    """Resolve valid TMDB data when one cache command is unavailable."""
+    clock = ManualClock()
+    redis = FakeRedis(clock)
+    redis.fail_operations.add(cache_failure)
+    cache = _shared_cache(redis)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/3/search/movie":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 1,
+                            "title": "Cache Failure Movie",
+                            "original_title": "Cache Failure Movie",
+                            "release_date": "2020-01-01",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": 1,
+                "title": "Cache Failure Movie",
+                "release_date": "2020-01-01",
+            },
+        )
+
+    resolver = _resolver(_client(httpx.MockTransport(handler)), cache=cache)
+    results = await resolver.resolve(
+        _mentions(movies=[MovieMention(title="Cache Failure Movie", year=2020)])
+    )
+    assert results.movies[0].status is ResultStatus.RESOLVED
+    await resolver.aclose()
+    await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_exception"),
+    [
+        ("http_429", EnrichmentError),
+        ("http_5xx", EnrichmentError),
+        ("timeout", PipelineTimeoutError),
+        ("malformed_json", EnrichmentError),
+        ("provider_validation", EnrichmentError),
+        ("required_detail", EnrichmentError),
+    ],
+)
+async def test_resolver_never_caches_failed_tmdb_operations(
+    failure_kind: str,
+    expected_exception: type[Exception],
+) -> None:
+    """Retry a failed TMDB operation until a valid normalized value succeeds."""
+    clock = ManualClock()
+    redis = FakeRedis(clock)
+    cache = _shared_cache(redis)
+    failure_pending = True
+    provider_requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal failure_pending, provider_requests
+        provider_requests += 1
+        if request.url.path == "/3/search/movie":
+            if failure_pending and failure_kind != "required_detail":
+                failure_pending = False
+                if failure_kind == "http_429":
+                    return httpx.Response(429, request=request)
+                if failure_kind == "http_5xx":
+                    return httpx.Response(503, request=request)
+                if failure_kind == "timeout":
+                    raise httpx.ReadTimeout("TMDB timeout", request=request)
+                if failure_kind == "malformed_json":
+                    return httpx.Response(200, content=b"{", request=request)
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "title": "Failure Movie",
+                                "original_title": "Failure Movie",
+                                "release_date": "2020-01-01",
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 1,
+                            "title": "Failure Movie",
+                            "original_title": "Failure Movie",
+                            "release_date": "2020-01-01",
+                        }
+                    ]
+                },
+            )
+        if failure_pending:
+            failure_pending = False
+            return httpx.Response(
+                200,
+                json={"id": 1, "title": "Failure Movie"},
+            )
+        return httpx.Response(
+            200,
+            json={"id": 1, "title": "Failure Movie", "release_date": "2020-01-01"},
+        )
+
+    resolver = _resolver(_client(httpx.MockTransport(handler)), cache=cache)
+    mentions = _mentions(movies=[MovieMention(title="Failure Movie", year=2020)])
+    with pytest.raises(expected_exception, match="TMDB candidate resolution"):
+        await resolver.resolve(mentions)
+    failed_request_count = provider_requests
+
+    recovered_results = await resolver.resolve(mentions)
+    assert recovered_results.movies[0].status is ResultStatus.RESOLVED
+    assert provider_requests > failed_request_count
+    recovered_request_count = provider_requests
+
+    cached_results = await resolver.resolve(mentions)
+    assert cached_results.movies[0].status is ResultStatus.RESOLVED
+    assert provider_requests == recovered_request_count
+    await resolver.aclose()
+    await cache.aclose()
+
+
+async def test_resolver_heals_strictly_invalid_cached_tmdb_detail() -> None:
+    """Reload and replace a normalized TMDB detail cache payload with invalid fields."""
+    clock = ManualClock()
+    redis = FakeRedis(clock)
+    cache = _shared_cache(redis)
+    detail_requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal detail_requests
+        if request.url.path == "/3/search/movie":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": 1,
+                            "title": "Corrupt Movie",
+                            "original_title": "Corrupt Movie",
+                            "release_date": "2020-01-01",
+                        }
+                    ]
+                },
+            )
+        detail_requests += 1
+        return httpx.Response(
+            200,
+            json={"id": 1, "title": "Corrupt Movie", "release_date": "2020-01-01"},
+        )
+
+    resolver = _resolver(_client(httpx.MockTransport(handler)), cache=cache)
+    mentions = _mentions(movies=[MovieMention(title="Corrupt Movie", year=2020)])
+    await resolver.resolve(mentions)
+    detail_key = next(
+        key
+        for key in redis.keys
+        if json.loads(redis.raw_value(key) or b"{}").get("value_version") == "movie-detail-v1"
+    )
+    corrupt_envelope = json.loads(redis.raw_value(detail_key) or b"{}")
+    corrupt_envelope["value"]["tmdb_id"] = "not-an-integer"
+    await redis.put_raw(
+        detail_key,
+        json.dumps(corrupt_envelope, separators=(",", ":")).encode(),
+        ex=86_400,
+    )
+
+    results = await resolver.resolve(mentions)
+    assert results.movies[0].status is ResultStatus.RESOLVED
+    assert detail_requests == 2
+    healed_payload = redis.raw_value(detail_key)
+    assert healed_payload is not None
+    assert b"not-an-integer" not in healed_payload
+    await resolver.aclose()
+    await cache.aclose()

@@ -78,7 +78,7 @@ async def _create_production_pipeline(
     Args:
         default_market: Validated Spotify market used when an API request omits it.
         spotify_catalog: Lifespan-owned Spotify catalog used without transferring ownership.
-        cache: Lifespan-owned shared cache borrowed by Spotify and Open Library resolution.
+        cache: Lifespan-owned shared cache borrowed by TMDB, Spotify, and Open Library.
     """
     interpretation_settings = InterpretationConfig()
     llm_provider_selection = LLMProviderSelectionConfig()  # type: ignore[call-arg]
@@ -107,7 +107,7 @@ async def _create_production_pipeline(
             provider=llm_provider,
             settings=interpretation_settings,
         )
-        screen_work_resolver = create_tmdb_screen_work_resolver(_tmdb_settings)
+        screen_work_resolver = create_tmdb_screen_work_resolver(_tmdb_settings, cache)
         open_library_settings = OpenLibraryConfig()  # type: ignore[call-arg]
         book_resolver = create_open_library_book_resolver(open_library_settings, cache)
         cleanup.push_async_callback(book_resolver.aclose)

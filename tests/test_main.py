@@ -303,8 +303,12 @@ async def test_production_lifespan_closes_one_selected_provider(
         assert selection.llm_provider is LLMProvider.OPENAI
         return provider
 
-    def create_resolver(settings: object) -> _FakeScreenWorkResolver:
+    def create_resolver(
+        settings: object,
+        configured_cache: object,
+    ) -> _FakeScreenWorkResolver:
         nonlocal resolver_factory_calls
+        del settings, configured_cache
         resolver_factory_calls += 1
         return resolver
 
@@ -377,8 +381,12 @@ async def test_production_lifespan_closes_resolver_after_aggregation_setup_failu
         assert selection.llm_provider is LLMProvider.OPENAI
         return provider
 
-    def create_resolver(settings: object) -> _FakeScreenWorkResolver:
+    def create_resolver(
+        settings: object,
+        configured_cache: object,
+    ) -> _FakeScreenWorkResolver:
         nonlocal resolver_factory_calls
+        del settings, configured_cache
         resolver_factory_calls += 1
         return resolver
 
@@ -526,7 +534,7 @@ async def test_disabled_production_lifespan_never_constructs_a_redis_client(
 async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipeline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pass one enabled cache into Open Library and close it after pipeline teardown."""
+    """Pass one enabled cache into TMDB, Spotify, and Open Library before teardown."""
     monkeypatch.setenv("REELIO_CACHE_ENABLED", "true")
     monkeypatch.setenv("REELIO_CACHE_REDIS_URL", "redis://localhost:6379/0")
     monkeypatch.setenv("REELIO_CACHE_KEY_SECRET", "cache-key")
@@ -549,6 +557,7 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
     book_resolver = _RecordingBookResolver()
     received_book_caches: list[object] = []
     received_spotify_caches: list[object] = []
+    received_tmdb_caches: list[object] = []
 
     @asynccontextmanager
     async def spotify_catalog_factory(
@@ -558,6 +567,14 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
         del settings
         received_spotify_caches.append(configured_cache)
         yield _FakeSpotifyCatalog()
+
+    def create_resolver(
+        settings: object,
+        configured_cache: object,
+    ) -> _FakeScreenWorkResolver:
+        del settings
+        received_tmdb_caches.append(configured_cache)
+        return screen_work_resolver
 
     def create_configured_cache(settings: CacheConfig) -> _FakeCache:
         assert settings.enabled is True
@@ -580,7 +597,7 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
     monkeypatch.setattr(
         main_module,
         "create_tmdb_screen_work_resolver",
-        lambda settings: screen_work_resolver,
+        create_resolver,
     )
     monkeypatch.setattr(
         main_module,
@@ -591,6 +608,7 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
 
     async with application.router.lifespan_context(application):
         assert received_book_caches == [cache]
+        assert received_tmdb_caches == [cache]
         assert received_spotify_caches == [cache]
         assert cache.close_calls == 0
 
