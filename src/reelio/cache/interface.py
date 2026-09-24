@@ -2,6 +2,7 @@
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from math import isfinite
 from typing import Protocol
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
@@ -40,6 +41,7 @@ class CacheEntry[ValueT]:
         identity: Canonical operation identity used only as HMAC input.
         codec: Application-owned cache value codec.
         ttl_seconds: Function selecting a positive expiry for a loaded value.
+        wait_timeout_seconds: Maximum waiter poll duration before an unowned load.
     """
 
     layer: str
@@ -47,6 +49,12 @@ class CacheEntry[ValueT]:
     identity: JsonObject
     codec: CacheCodec[ValueT]
     ttl_seconds: Callable[[ValueT], int]
+    wait_timeout_seconds: float
+
+    def __post_init__(self) -> None:
+        """Validate the bounded miss-coordination policy."""
+        if not isfinite(self.wait_timeout_seconds) or self.wait_timeout_seconds <= 0:
+            raise ValueError("Cache wait timeout must be finite and positive")
 
 
 class AsyncCache(Protocol):

@@ -20,6 +20,16 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    services:
+      redis:
+        image: redis:7.4.11-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -53,6 +63,11 @@ jobs:
 
       - name: Run complete pytest suite
         run: uv run --locked pytest
+      - name: Run Redis lease-script smoke scenario
+        env:
+          REELIO_TEST_REDIS_URL: redis://localhost:6379/15
+        run: uv run --locked pytest -m redis_smoke tests/cache/test_redis_smoke.py
+
 
       - name: Check Ruff linting
         run: uv run --locked ruff check .

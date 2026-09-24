@@ -988,6 +988,7 @@ def _catalog_cache_entry[ValueT](
         identity={"path": path, "params": identity_parameters},
         codec=codec,
         ttl_seconds=ttl_seconds,
+        wait_timeout_seconds=1.0,
     )
 
 

@@ -36,6 +36,9 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "redis_smoke: requires REELIO_TEST_REDIS_URL and a Redis-compatible server",
+]
 
 [tool.ruff]
 target-version = "py312"
