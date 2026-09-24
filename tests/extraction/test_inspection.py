@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import math
 import shutil
 import wave
 from collections.abc import Callable, Mapping
 from decimal import Decimal
+from itertools import count
 from pathlib import Path
 from types import TracebackType
 from typing import cast
@@ -18,6 +21,8 @@ from requests.exceptions import Timeout
 from yt_dlp.utils import DownloadError, YoutubeDLError
 
 import reelio.extraction.services.transcription.inspection as transcription_inspection
+from reelio.cache import CacheEntry, DisabledCache, RedisCache
+from reelio.cache.redis import _CacheRuntime
 from reelio.extraction.exceptions import (
     DurationLimitExceededError,
     InvalidSourceError,
@@ -34,23 +39,33 @@ from reelio.extraction.services.transcription.inspection import (
     YtDlpMetadataExtractor,
 )
 from reelio.extraction.services.transcription.service import SourceMetadataService
-from reelio.extraction.types import Platform
+from reelio.extraction.types import Platform, Source, SourceIdentity
+from tests.cache.fakes import FakeRedis, ManualClock
 
 _VIDEO_ID = "dQw4w9WgXcQ"
 _CANONICAL_URL = f"https://www.youtube.com/watch?v={_VIDEO_ID}"
 
 
 class _FakeExtractor:
-    def __init__(self, metadata: object, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        metadata: object,
+        error: Exception | None = None,
+        prepared_audio: PreparedAudio | None = None,
+    ) -> None:
         self.metadata = metadata
         self.error = error
+        self.prepared_audio = prepared_audio
         self.calls: list[str] = []
 
     def extract(self, canonical_url: str) -> ExtractedMetadata:
         self.calls.append(canonical_url)
         if self.error is not None:
             raise self.error
-        return ExtractedMetadata(cast(Mapping[str, object], self.metadata))
+        return ExtractedMetadata(
+            cast(Mapping[str, object], self.metadata),
+            self.prepared_audio,
+        )
 
 
 def _metadata(**overrides: object) -> dict[str, object]:
@@ -77,7 +92,62 @@ def _service(
     extractor: _FakeExtractor,
     max_duration: int = 1800,
 ) -> SourceMetadataService:
-    return SourceMetadataService(extractor=extractor, settings=_settings(max_duration))
+    return SourceMetadataService(
+        extractor=extractor,
+        settings=_settings(max_duration),
+        cache=DisabledCache(),
+    )
+
+
+class _SequenceExtractor:
+    def __init__(self, outcomes: list[object]) -> None:
+        self._outcomes = outcomes
+        self.calls: list[str] = []
+
+    def extract(self, canonical_url: str) -> ExtractedMetadata:
+        self.calls.append(canonical_url)
+        if not self._outcomes:
+            raise AssertionError("Unexpected metadata extraction")
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return ExtractedMetadata(cast(Mapping[str, object], outcome))
+
+
+def _cached_service(
+    extractor: transcription_inspection.MetadataExtractor,
+    cache: RedisCache,
+    max_duration: int = 1800,
+) -> SourceMetadataService:
+    return SourceMetadataService(
+        extractor=extractor,
+        settings=_settings(max_duration),
+        cache=cache,
+    )
+
+
+def _redis_source_cache(clock: ManualClock) -> tuple[RedisCache, FakeRedis]:
+    """Build one deterministic shared cache for Source-layer tests."""
+    tokens = count()
+    redis = FakeRedis(clock)
+    cache = RedisCache(
+        redis,
+        "reelio:test",
+        b"source-cache-test-key",
+        runtime=_CacheRuntime(clock, asyncio.sleep, lambda: f"source-{next(tokens)}"),
+    )
+    return cache, redis
+
+
+def _cached_value(
+    cache: RedisCache,
+    redis: FakeRedis,
+    entry: CacheEntry[Source],
+) -> dict[str, object]:
+    cache_key = cache._cache_key(entry)
+    raw_value = redis.raw_value(cache_key)
+    assert raw_value is not None
+    return cast(dict[str, object], json.loads(raw_value)["value"])
 
 
 @pytest.mark.parametrize(
@@ -551,6 +621,7 @@ async def test_missing_metadata_duration_uses_probed_audio_duration(
     metadata_service = SourceMetadataService(
         YtDlpMetadataExtractor(60, tmp_path),
         _settings(60),
+        DisabledCache(),
     )
     if expected_duration is None:
         with pytest.raises(DurationLimitExceededError):
@@ -623,6 +694,7 @@ async def test_duration_filter_cancellation_is_not_retried(
         await SourceMetadataService(
             YtDlpMetadataExtractor(60, tmp_path),
             _settings(60),
+            DisabledCache(),
         ).inspect(_CANONICAL_URL)
 
     assert metadata_youtube_dl.extract_calls == [(_CANONICAL_URL, False)]
@@ -781,10 +853,10 @@ async def test_inspection_error_log_identifies_failure_reason(
     assert record.__dict__["reason"] == expected_reason
 
 
-async def test_debug_event_contains_normalized_source_fields(
+async def test_debug_event_excludes_source_identifiers(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Record normalized Source sizes without logging untrusted metadata text."""
+    """Record Source sizes without retaining Source identity or text values."""
     extractor = _FakeExtractor(
         _metadata(
             title="Logged title",
@@ -802,20 +874,23 @@ async def test_debug_event_contains_normalized_source_fields(
     )
     fields = record.__dict__
     assert fields["stage"] == "transcription"
-    assert fields["submitted_url"] == _CANONICAL_URL
     assert fields["platform"] == "youtube"
-    assert fields["video_id"] == _VIDEO_ID
-    assert fields["canonical_url"] == _CANONICAL_URL
-    assert "title" not in fields
     assert fields["title_length"] == len("Logged title")
-    assert "description" not in fields
     assert fields["description_length"] == len("Logged description")
-    assert "channel" not in fields
     assert fields["channel_length"] == len("Logged channel")
+    assert fields["duration_seconds"] == 13
+    for sensitive_field in (
+        "submitted_url",
+        "video_id",
+        "canonical_url",
+        "title",
+        "description",
+        "channel",
+    ):
+        assert sensitive_field not in fields
     assert "Logged title" not in caplog.text
     assert "Logged description" not in caplog.text
     assert "Logged channel" not in caplog.text
-    assert fields["duration_seconds"] == 13
 
 
 async def test_debug_event_redacts_sensitive_submitted_query_values(
@@ -1436,3 +1511,432 @@ async def test_social_video_formats_allow_audio_entries_with_one_video() -> None
     source = (await _service(extractor).inspect("https://www.instagram.com/reel/ABC123")).source
 
     assert source.video_id == "ABC123"
+
+
+async def test_youtube_metadata_cache_hit_skips_provider_and_omits_prepared_audio(
+    tmp_path: Path,
+) -> None:
+    """Reuse normalized YouTube metadata without sharing request audio ownership."""
+    clock = ManualClock()
+    cache, redis = _redis_source_cache(clock)
+    request_directory = tmp_path / "request"
+    request_directory.mkdir()
+    audio_path = request_directory / "audio.webm"
+    audio_path.write_bytes(b"audio")
+    extractor = _FakeExtractor(
+        _metadata(extractor_only="not cacheable"),
+        prepared_audio=PreparedAudio(audio_path, request_directory),
+    )
+    service = _cached_service(extractor, cache)
+    first = None
+    second = None
+
+    try:
+        first = await service.inspect(_CANONICAL_URL)
+        second = await service.inspect(_CANONICAL_URL)
+
+        assert extractor.calls == [_CANONICAL_URL]
+        assert second.source == first.source
+        assert second.source is not first.source
+        assert second.prepared_audio is None
+        assert _cached_value(
+            cache,
+            redis,
+            transcription_service._source_metadata_entry(
+                SourceIdentity(Platform.YOUTUBE, _VIDEO_ID)
+            ),
+        ) == {
+            "platform": "youtube",
+            "video_id": _VIDEO_ID,
+            "url": _CANONICAL_URL,
+            "title": "Example video",
+            "description": "A complete description.",
+            "channel": "Example channel",
+            "duration_seconds": 12,
+        }
+    finally:
+        if first is not None:
+            first.cleanup()
+        if second is not None:
+            second.cleanup()
+        await cache.aclose()
+
+
+async def test_social_cache_payloads_exclude_raw_metadata_and_prepared_audio(
+    tmp_path: Path,
+) -> None:
+    """Persist only Source fields and alias identity values for social inspections."""
+    clock = ManualClock()
+    cache, redis = _redis_source_cache(clock)
+    submitted_url = "https://www.instagram.com/p/ABC_123/"
+    normalized_submitted_url = "https://www.instagram.com/p/ABC_123"
+    canonical_url = "https://www.instagram.com/reel/ABC_123"
+    source_identity = SourceIdentity(Platform.INSTAGRAM, "ABC_123")
+    request_directory = tmp_path / "request"
+    request_directory.mkdir()
+    audio_path = request_directory / "audio.webm"
+    audio_path.write_bytes(b"audio")
+    extractor = _FakeExtractor(
+        _social_metadata(
+            "Instagram",
+            source_identity.external_content_id,
+            canonical_url,
+            extractor_only="raw-extractor-sentinel",
+        ),
+        prepared_audio=PreparedAudio(audio_path, request_directory),
+    )
+    service = _cached_service(extractor, cache)
+    inspected = None
+
+    try:
+        inspected = await service.inspect(submitted_url)
+        alias_entry = transcription_service._source_alias_entry(
+            Platform.INSTAGRAM,
+            normalized_submitted_url,
+        )
+        alias_key = cache._cache_key(alias_entry)
+        alias_raw_value = redis.raw_value(alias_key)
+        assert alias_raw_value is not None
+        assert json.loads(alias_raw_value)["value"] == {
+            "platform": "instagram",
+            "external_content_id": "ABC_123",
+        }
+        metadata_value = _cached_value(
+            cache,
+            redis,
+            transcription_service._source_metadata_entry(source_identity),
+        )
+        assert set(metadata_value) == {
+            "platform",
+            "video_id",
+            "url",
+            "title",
+            "description",
+            "channel",
+            "duration_seconds",
+        }
+        cached_payloads = [
+            redis.raw_value(cache_key) for cache_key in redis.keys if ":source:" in cache_key
+        ]
+        assert all(payload is not None for payload in cached_payloads)
+        cached_source_data = b"".join(
+            payload for payload in cached_payloads if payload is not None
+        ).decode()
+        assert "raw-extractor-sentinel" not in cached_source_data
+        assert str(audio_path) not in cached_source_data
+    finally:
+        if inspected is not None:
+            inspected.cleanup()
+        await cache.aclose()
+
+
+async def test_source_metadata_cache_expires_at_the_exact_ttl_boundary() -> None:
+    """Serve Source metadata until, but not at, the configured freshness boundary."""
+    clock = ManualClock()
+    cache, _ = _redis_source_cache(clock)
+    extractor = _FakeExtractor(_metadata())
+    service = _cached_service(extractor, cache)
+
+    try:
+        await service.inspect(_CANONICAL_URL)
+        clock.advance(2_591_999.999)
+        await service.inspect(_CANONICAL_URL)
+        assert len(extractor.calls) == 1
+
+        clock.advance(0.001)
+        await service.inspect(_CANONICAL_URL)
+        assert len(extractor.calls) == 2
+    finally:
+        await cache.aclose()
+
+
+async def test_cached_source_rechecks_the_current_duration_limit() -> None:
+    """Apply the current duration policy even when metadata is freshly cached."""
+    clock = ManualClock()
+    cache, _ = _redis_source_cache(clock)
+    warm_extractor = _FakeExtractor(_metadata(duration=30.0))
+    restricted_extractor = _FakeExtractor(_metadata(duration=30.0))
+    warming_service = _cached_service(warm_extractor, cache, max_duration=60)
+    restricted_service = _cached_service(restricted_extractor, cache, max_duration=15)
+
+    try:
+        await warming_service.inspect(_CANONICAL_URL)
+        with pytest.raises(DurationLimitExceededError):
+            await restricted_service.inspect(_CANONICAL_URL)
+        assert restricted_extractor.calls == []
+    finally:
+        await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    ("first_outcome", "expected_error"),
+    [
+        (MetadataProviderError("provider failed"), MetadataProviderError),
+        (YoutubeDLError("Video unavailable"), SourceUnavailableError),
+        (Timeout("provider timed out"), PipelineTimeoutError),
+        (_metadata(id=object()), MetadataProviderError),
+        (_metadata(duration=1800.1), DurationLimitExceededError),
+    ],
+    ids=["provider", "unavailable", "timeout", "malformed", "duration"],
+)
+async def test_failed_source_inspections_are_not_cached(
+    first_outcome: object,
+    expected_error: type[Exception],
+) -> None:
+    """Allow a retry to inspect successfully after every typed first failure."""
+    clock = ManualClock()
+    cache, _ = _redis_source_cache(clock)
+    extractor = _SequenceExtractor([first_outcome, _metadata()])
+    service = _cached_service(extractor, cache)
+
+    try:
+        with pytest.raises(expected_error):
+            await service.inspect(_CANONICAL_URL)
+        recovered = await service.inspect(_CANONICAL_URL)
+
+        assert recovered.source.video_id == _VIDEO_ID
+        assert extractor.calls == [_CANONICAL_URL, _CANONICAL_URL]
+    finally:
+        await cache.aclose()
+
+
+async def test_corrupt_source_metadata_is_deleted_and_reloaded() -> None:
+    """Heal a corrupt metadata entry before loading a fresh normalized Source."""
+    clock = ManualClock()
+    cache, redis = _redis_source_cache(clock)
+    extractor = _FakeExtractor(_metadata())
+    service = _cached_service(extractor, cache)
+    metadata_entry = transcription_service._source_metadata_entry(
+        SourceIdentity(Platform.YOUTUBE, _VIDEO_ID)
+    )
+
+    try:
+        await service.inspect(_CANONICAL_URL)
+        await redis.put_raw(
+            cache._cache_key(metadata_entry),
+            json.dumps(
+                {
+                    "envelope_version": 2,
+                    "value_version": "source-metadata-v1",
+                    "value": {
+                        "platform": "youtube",
+                        "video_id": _VIDEO_ID,
+                        "url": _CANONICAL_URL,
+                        "title": "Example video",
+                        "description": "A complete description.",
+                        "channel": "Example channel",
+                        "duration_seconds": 12,
+                        "unexpected": True,
+                    },
+                    "freshness_seconds": 2_592_000,
+                    "retention_seconds": 2_592_000,
+                }
+            ).encode(),
+        )
+
+        recovered = await service.inspect(_CANONICAL_URL)
+        assert recovered.source.video_id == _VIDEO_ID
+        assert len(extractor.calls) == 2
+        assert _cached_value(cache, redis, metadata_entry)["video_id"] == _VIDEO_ID
+    finally:
+        await cache.aclose()
+
+
+async def test_alias_without_metadata_reinspects_instead_of_constructing_source() -> None:
+    """Treat a retained social alias as an identity hint until metadata is available."""
+    clock = ManualClock()
+    cache, _ = _redis_source_cache(clock)
+    submitted_url = "https://www.instagram.com/p/ABC_123/"
+    source_identity = SourceIdentity(Platform.INSTAGRAM, "ABC_123")
+    extractor = _FakeExtractor(
+        _social_metadata(
+            "Instagram",
+            source_identity.external_content_id,
+            "https://www.instagram.com/reel/ABC_123",
+        )
+    )
+    service = _cached_service(extractor, cache)
+
+    async def alias_loader() -> SourceIdentity:
+        return source_identity
+
+    try:
+        await cache.get_or_load(
+            transcription_service._source_alias_entry(
+                Platform.INSTAGRAM,
+                "https://www.instagram.com/p/ABC_123",
+            ),
+            alias_loader,
+        )
+        inspected = await service.inspect(submitted_url)
+
+        assert inspected.source.video_id == source_identity.external_content_id
+        assert extractor.calls == ["https://www.instagram.com/p/ABC_123"]
+    finally:
+        await cache.aclose()
+
+
+async def test_conflicting_alias_never_replaces_or_returns_stale_identity() -> None:
+    """Retain the first alias writer while recovering metadata under the new identity."""
+    clock = ManualClock()
+    cache, redis = _redis_source_cache(clock)
+    submitted_url = "https://www.instagram.com/p/ABC_123/"
+    source_a = SourceIdentity(Platform.INSTAGRAM, "source-a")
+    source_b = SourceIdentity(Platform.INSTAGRAM, "source-b")
+    canonical_url = "https://www.instagram.com/reel/ABC_123"
+    extractor = _SequenceExtractor(
+        [
+            _social_metadata("Instagram", source_a.external_content_id, canonical_url),
+            _social_metadata("Instagram", source_b.external_content_id, canonical_url),
+            _social_metadata("Instagram", source_b.external_content_id, canonical_url),
+        ]
+    )
+    service = _cached_service(extractor, cache)
+    source_a_entry = transcription_service._source_metadata_entry(source_a)
+    source_b_entry = transcription_service._source_metadata_entry(source_b)
+
+    try:
+        await service.inspect(submitted_url)
+        await redis.put_raw(cache._cache_key(source_a_entry), b"{")
+
+        recovered = await service.inspect(submitted_url)
+        assert recovered.source.video_id == source_b.external_content_id
+        assert redis.raw_value(cache._cache_key(source_a_entry)) is None
+        assert _cached_value(cache, redis, source_b_entry)["video_id"] == "source-b"
+
+        safe_retry = await service.inspect(submitted_url)
+        assert safe_retry.source.video_id == source_b.external_content_id
+        assert len(extractor.calls) == 3
+    finally:
+        await cache.aclose()
+
+
+@pytest.mark.parametrize("operation", ["read", "ownership_write"])
+@pytest.mark.parametrize(
+    ("provider_error", "expected_error"),
+    [
+        (None, None),
+        (YoutubeDLError("Video unavailable"), SourceUnavailableError),
+    ],
+    ids=["success", "unavailable"],
+)
+async def test_source_cache_failures_preserve_provider_outcomes(
+    operation: str,
+    provider_error: Exception | None,
+    expected_error: type[Exception] | None,
+) -> None:
+    """Fail open on Source cache outages without changing provider outcomes."""
+    clock = ManualClock()
+    cache, redis = _redis_source_cache(clock)
+    extractor = _FakeExtractor(_metadata(), error=provider_error)
+    service = _cached_service(extractor, cache)
+    redis.fail_operations.add(operation)
+
+    try:
+        if expected_error is None:
+            assert (await service.inspect(_CANONICAL_URL)).source.video_id == _VIDEO_ID
+        else:
+            with pytest.raises(expected_error):
+                await service.inspect(_CANONICAL_URL)
+        assert extractor.calls == [_CANONICAL_URL]
+    finally:
+        await cache.aclose()
+
+
+async def test_alias_registration_failure_preserves_successful_inspection() -> None:
+    """Keep a successful social Source when only canonical alias registration fails."""
+    clock = ManualClock()
+    cache, redis = _redis_source_cache(clock)
+    submitted_url = "https://www.instagram.com/p/ABC_123/"
+    source_a = SourceIdentity(Platform.INSTAGRAM, "source-a")
+    source_b = SourceIdentity(Platform.INSTAGRAM, "source-b")
+    canonical_url = "https://www.instagram.com/reel/ABC_123"
+    source_b_value = Source(
+        platform=Platform.INSTAGRAM,
+        video_id=source_b.external_content_id,
+        url=canonical_url,
+        title="Source B",
+        description="Description B",
+        channel="Channel B",
+        duration_seconds=12,
+    )
+
+    async def alias_loader() -> SourceIdentity:
+        return source_a
+
+    async def metadata_loader() -> Source:
+        return source_b_value
+
+    try:
+        await cache.get_or_load(
+            transcription_service._source_alias_entry(
+                Platform.INSTAGRAM,
+                "https://www.instagram.com/p/ABC_123",
+            ),
+            alias_loader,
+        )
+        await cache.get_or_load(
+            transcription_service._source_metadata_entry(source_b),
+            metadata_loader,
+        )
+        redis.fail_operations.add("ownership_write")
+        extractor = _FakeExtractor(
+            _social_metadata("Instagram", source_b.external_content_id, canonical_url)
+        )
+        service = _cached_service(extractor, cache)
+
+        inspected = await service.inspect(submitted_url)
+        assert inspected.source == source_b_value
+        assert extractor.calls == ["https://www.instagram.com/p/ABC_123"]
+    finally:
+        await cache.aclose()
+
+
+async def test_source_cache_keys_and_logs_exclude_source_sensitive_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Keep Source identities and text out of cache keys and structured logging."""
+    clock = ManualClock()
+    cache, redis = _redis_source_cache(clock)
+    submitted_url = "https://www.instagram.com/p/ABC_123/"
+    canonical_url = "https://www.instagram.com/reel/ABC_123"
+    external_content_id = "private-content-id"
+    title = "Private title"
+    description = "Private description"
+    channel = "Private channel"
+    service = _cached_service(
+        _FakeExtractor(
+            _social_metadata(
+                "Instagram",
+                external_content_id,
+                canonical_url,
+                title=title,
+                description=description,
+                channel=channel,
+            )
+        ),
+        cache,
+    )
+
+    try:
+        with caplog.at_level(logging.DEBUG):
+            await service.inspect(submitted_url)
+        sensitive_values = (
+            submitted_url,
+            canonical_url,
+            external_content_id,
+            title,
+            description,
+            channel,
+        )
+        for cache_key in redis.keys:
+            assert ":source:" in cache_key
+            assert all(value not in cache_key for value in sensitive_values)
+        for record in caplog.records:
+            if record.name in {
+                transcription_service.__name__,
+                "reelio.cache.redis",
+            }:
+                assert all(value not in str(record.__dict__) for value in sensitive_values)
+    finally:
+        await cache.aclose()

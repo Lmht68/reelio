@@ -138,6 +138,19 @@ class Platform(StrEnum):
     X = "x"
 
 
+@dataclass(frozen=True, slots=True)
+class SourceIdentity:
+    """Identify one provider-authoritative source across cache layers.
+
+    Attributes:
+        platform: Platform hosting the source.
+        external_content_id: Stable identifier assigned by the platform provider.
+    """
+
+    platform: Platform
+    external_content_id: str
+
+
 class TranscriptMethod(StrEnum):
     """Methods used to produce a normalized transcript."""
 

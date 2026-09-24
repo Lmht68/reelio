@@ -95,6 +95,7 @@ async def _create_production_pipeline(
                 temp_media_dir=_transcription_settings.temp_media_dir,
             ),
             settings=_transcription_settings,
+            cache=cache,
         )
         transcription_service = TranscriptionService(
             provider=YouTubeCaptionProvider(),

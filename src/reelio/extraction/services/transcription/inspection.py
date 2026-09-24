@@ -12,7 +12,7 @@ from math import ceil, isfinite
 from numbers import Real
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
-from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qsl, urlsplit, urlunsplit
 
 import av
 import yt_dlp
@@ -25,7 +25,7 @@ from reelio.extraction.exceptions import (
     UnsupportedPlatformError,
 )
 from reelio.extraction.services.transcription.util import extract_info_with_retries
-from reelio.extraction.types import Platform
+from reelio.extraction.types import Platform, SourceIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +35,6 @@ _UNSUPPORTED_PLATFORM_MESSAGE: Final[str] = (
     "Only YouTube, Instagram, Facebook, TikTok, and X URLs are supported."
 )
 _MISSING = object()
-_REDACTED_LOG_VALUE: Final[str] = "[REDACTED]"
-_SENSITIVE_QUERY_PARTS: Final[frozenset[str]] = frozenset(
-    {"api", "apikey", "auth", "authorization", "key", "password", "secret", "token"}
-)
 
 _YOUTUBE_HOSTS: Final[frozenset[str]] = frozenset(
     {
@@ -366,14 +362,15 @@ class SubmittedSource:
 
     platform: Platform
     provider_url: str
-    youtube_video_id: str | None = None
+    normalized_url: str
+    local_youtube_video_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class NormalizedMetadata:
     """Carry validated provider metadata before Source construction."""
 
-    video_id: str
+    source_identity: SourceIdentity
     canonical_url: str
     title: str
     description: str
@@ -405,27 +402,48 @@ def classify_submitted_url(submitted_url: str) -> SubmittedSource:
         return SubmittedSource(
             platform=Platform.YOUTUBE,
             provider_url=f"https://www.youtube.com/watch?v={video_id}",
-            youtube_video_id=video_id,
+            normalized_url=_minimal_url(parsed_url),
+            local_youtube_video_id=video_id,
         )
 
     if host in _INSTAGRAM_HOSTS:
         _reject_video_query(query_pairs)
         _instagram_shortcode(path_segments)
-        return SubmittedSource(Platform.INSTAGRAM, _minimal_url(parsed_url))
+        normalized_url = _minimal_url(parsed_url)
+        return SubmittedSource(
+            platform=Platform.INSTAGRAM,
+            provider_url=normalized_url,
+            normalized_url=normalized_url,
+        )
 
     if host in _FACEBOOK_HOSTS or host in _FACEBOOK_SHORT_HOSTS:
         _facebook_identity(host, path_segments, query_pairs)
-        return SubmittedSource(Platform.FACEBOOK, _minimal_url(parsed_url))
+        normalized_url = _minimal_url(parsed_url)
+        return SubmittedSource(
+            platform=Platform.FACEBOOK,
+            provider_url=normalized_url,
+            normalized_url=normalized_url,
+        )
 
     if host in _TIKTOK_HOSTS or host in _TIKTOK_SHORT_HOSTS:
         _reject_video_query(query_pairs)
         _tiktok_identity(host, path_segments)
-        return SubmittedSource(Platform.TIKTOK, _minimal_url(parsed_url))
+        normalized_url = _minimal_url(parsed_url)
+        return SubmittedSource(
+            platform=Platform.TIKTOK,
+            provider_url=normalized_url,
+            normalized_url=normalized_url,
+        )
 
     if host in _X_HOSTS or host in _X_SHORT_HOSTS:
         _reject_video_query(query_pairs)
         _x_identity(host, path_segments)
-        return SubmittedSource(Platform.X, _minimal_url(parsed_url))
+        normalized_url = _minimal_url(parsed_url)
+        return SubmittedSource(
+            platform=Platform.X,
+            provider_url=normalized_url,
+            normalized_url=normalized_url,
+        )
 
     if _looks_like_supported_host_trick(host):
         raise _invalid_source_error("deceptive_supported_host")
@@ -454,7 +472,7 @@ def normalize_processed_metadata(
     _reject_collections_and_live(metadata, submitted.platform)
 
     if submitted.platform is Platform.YOUTUBE:
-        video_id = submitted.youtube_video_id
+        video_id = submitted.local_youtube_video_id
         if video_id is None:
             raise _metadata_provider_error("missing_submitted_video_id")
         provider_id = metadata.get("id", _MISSING)
@@ -489,7 +507,7 @@ def normalize_processed_metadata(
     duration_seconds = _normalize_duration(metadata)
 
     return NormalizedMetadata(
-        video_id=video_id,
+        source_identity=SourceIdentity(submitted.platform, video_id),
         canonical_url=canonical_url,
         title=title,
         description=description,
@@ -975,44 +993,3 @@ def _is_timeout_exception(error: BaseException) -> bool:
 def _is_unavailable_error(message: str) -> bool:
     normalized_message = message.casefold()
     return any(marker in normalized_message for marker in _UNAVAILABLE_MARKERS)
-
-
-def safe_submitted_url(submitted_url: str) -> str:
-    """Redact sensitive query values and fragments before structured logging.
-
-    Args:
-        submitted_url: URL submitted by the API caller.
-
-    Returns:
-        str: Submitted URL with sensitive query values and fragments removed.
-    """
-    try:
-        parsed_url = urlsplit(submitted_url)
-        query_pairs = parse_qsl(parsed_url.query, keep_blank_values=True)
-    except ValueError:
-        return _REDACTED_LOG_VALUE
-
-    has_sensitive_query = any(_is_sensitive_query_key(key) for key, _ in query_pairs)
-    if not parsed_url.fragment and not has_sensitive_query:
-        return submitted_url
-
-    safe_pairs = [
-        (key, _REDACTED_LOG_VALUE if _is_sensitive_query_key(key) else value)
-        for key, value in query_pairs
-    ]
-    return urlunsplit(
-        (
-            parsed_url.scheme,
-            parsed_url.netloc,
-            parsed_url.path,
-            urlencode(safe_pairs),
-            "",
-        )
-    )
-
-
-def _is_sensitive_query_key(key: str) -> bool:
-    normalized_key = key.casefold().replace("-", "_")
-    return normalized_key in _SENSITIVE_QUERY_PARTS or any(
-        part in normalized_key for part in ("api_key", "token", "secret", "password")
-    )
