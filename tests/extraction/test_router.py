@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from yt_dlp.utils import YoutubeDLError
 
+import reelio.extraction.services.transcription.service as transcription_service_module
 from reelio.cache import DisabledCache, RedisCache
 from reelio.cache.redis import _CacheRuntime
 from reelio.extraction.exceptions import (
@@ -49,6 +50,7 @@ from reelio.extraction.services.transcription.acquisition import (
 from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.services.transcription.inspection import ExtractedMetadata
 from reelio.extraction.services.transcription.service import (
+    CachedTranscriptionService,
     SourceMetadataService,
     TranscriptionService,
 )
@@ -258,21 +260,29 @@ class _CaptionTrack:
         self.language_code = language_code
         self.is_generated = False
         self._segments = segments
+        self.fetch_calls = 0
 
     def fetch_segments(self) -> Sequence[str]:
+        self.fetch_calls += 1
         return self._segments
 
 
 class _CaptionProvider:
     def __init__(self, tracks: Sequence[_CaptionTrack]) -> None:
         self._tracks = tracks
+        self.calls: list[str] = []
 
     def list_tracks(self, video_id: str) -> Sequence[_CaptionTrack]:
+        self.calls.append(video_id)
         return self._tracks
 
 
 class _AudioDownloader:
-    def download(self, source: object, destination: Path) -> Path:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Path]] = []
+
+    def download(self, source_url: str, destination: Path) -> Path:
+        self.calls.append((source_url, destination))
         audio_path = destination / "audio.webm"
         audio_path.write_bytes(b"audio")
         return audio_path
@@ -286,8 +296,10 @@ class _FailingWhisperTranscriber:
 class _FixedWhisperTranscriber:
     def __init__(self, result: WhisperResult) -> None:
         self.result = result
+        self.calls: list[Path] = []
 
     def transcribe(self, audio_path: Path) -> WhisperResult:
+        self.calls.append(audio_path)
         return self.result
 
 
@@ -433,7 +445,7 @@ def _enriched_music_release(
 
 def _pipeline(
     metadata_service: SourceMetadataService,
-    transcription_service: TranscriptionService,
+    transcript_service: TranscriptionService | CachedTranscriptionService,
     mentions: ScreenWorkMentions | None = None,
     results: ScreenWorkResults | None = None,
     music_mentions: MusicMentions | None = None,
@@ -514,7 +526,7 @@ def _pipeline(
 
     return ExtractionPipeline(
         metadata_service,
-        transcription_service,
+        transcript_service,
         _FakeInterpretationService(
             ExtractionMentions(
                 screen_works=interpreted_screen_works,
@@ -2342,5 +2354,301 @@ async def test_cache_read_failure_preserves_typed_source_errors(
             "error": {"code": expected_code, "message": expected_message}
         }
         assert extractor.calls == [_CANONICAL_URL, _CANONICAL_URL]
+    finally:
+        await cache.aclose()
+
+
+async def test_endpoint_reuses_caption_transcript_without_repeating_acquisition(
+    client: AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Reuse one Caption Transcript through the public Source extraction endpoint."""
+    clock = ManualClock()
+    cache, _ = _router_cache(clock)
+    extractor = _OutcomeMetadataExtractor([_youtube_metadata()])
+    track = _CaptionTrack("en", ["Cached Caption Transcript."])
+    provider = _CaptionProvider([track])
+    downloader = _AudioDownloader()
+    transcriber = _FixedWhisperTranscriber(
+        WhisperResult(text="unused Whisper", language="en", segment_count=1)
+    )
+    pipeline = _pipeline(
+        SourceMetadataService(
+            extractor=extractor,
+            settings=_settings(),
+            cache=cache,
+        ),
+        CachedTranscriptionService(
+            TranscriptionService(
+                provider=provider,
+                audio_downloader=downloader,
+                transcriber=transcriber,
+                temp_media_dir=tmp_path,
+                semaphore=asyncio.Semaphore(1),
+            ),
+            cache,
+        ),
+    )
+    _install_pipeline(app, pipeline)
+
+    try:
+        first_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
+        second_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
+
+        expected_transcript = {
+            "text": "Cached Caption Transcript.",
+            "language": "en",
+            "method": "youtube_captions",
+        }
+        assert first_response.status_code == 200
+        assert second_response.status_code == 200
+        assert first_response.json()["transcript"] == expected_transcript
+        assert second_response.json()["transcript"] == expected_transcript
+        assert extractor.calls == [_CANONICAL_URL]
+        assert provider.calls == [_VIDEO_ID]
+        assert track.fetch_calls == 1
+        assert downloader.calls == []
+        assert transcriber.calls == []
+    finally:
+        await cache.aclose()
+
+
+async def test_endpoint_reuses_whisper_transcript_without_repeating_acquisition(
+    client: AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Reuse one social-video Whisper Transcript through the public endpoint."""
+    clock = ManualClock()
+    cache, _ = _router_cache(clock)
+    submitted_url = "https://www.instagram.com/reel/ABC123"
+    extractor = _SocialMetadataExtractor(
+        {
+            "id": "ABC123",
+            "extractor_key": "Instagram",
+            "webpage_url": submitted_url,
+            "title": "Whisper cache router video",
+            "description": "Whisper cache router description",
+            "channel": "Whisper cache router channel",
+            "duration": 42.2,
+            "formats": [{"vcodec": "avc1"}],
+        }
+    )
+    provider = _CaptionProvider([_CaptionTrack("en", ["unused Caption"])])
+    downloader = _AudioDownloader()
+    transcriber = _FixedWhisperTranscriber(
+        WhisperResult(
+            text="  Cached Whisper Transcript.  ",
+            language="fr",
+            segment_count=2,
+        )
+    )
+    pipeline = _pipeline(
+        SourceMetadataService(
+            extractor=extractor,
+            settings=_settings(),
+            cache=cache,
+        ),
+        CachedTranscriptionService(
+            TranscriptionService(
+                provider=provider,
+                audio_downloader=downloader,
+                transcriber=transcriber,
+                temp_media_dir=tmp_path,
+                semaphore=asyncio.Semaphore(1),
+            ),
+            cache,
+        ),
+    )
+    _install_pipeline(app, pipeline)
+
+    try:
+        first_response = await client.post("/api/extractions", json={"url": submitted_url})
+        second_response = await client.post("/api/extractions", json={"url": submitted_url})
+
+        expected_transcript = {
+            "text": "Cached Whisper Transcript.",
+            "language": "fr",
+            "method": "whisper",
+        }
+        assert first_response.status_code == 200
+        assert second_response.status_code == 200
+        assert first_response.json()["transcript"] == expected_transcript
+        assert second_response.json()["transcript"] == expected_transcript
+        assert extractor.calls == [submitted_url]
+        assert provider.calls == []
+        assert len(downloader.calls) == 1
+        assert downloader.calls[0][0] == submitted_url
+        assert len(transcriber.calls) == 1
+    finally:
+        await cache.aclose()
+
+
+async def test_endpoint_reuses_transcript_across_markets_while_enriching_each_market(
+    client: AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Keep Transcript reuse independent from market-sensitive downstream work."""
+    clock = ManualClock()
+    cache, _ = _router_cache(clock)
+    extractor = _OutcomeMetadataExtractor([_youtube_metadata()])
+    track = _CaptionTrack("en", ["Market-independent Transcript."])
+    provider = _CaptionProvider([track])
+    interpretation_service = _FakeInterpretationService()
+    result_aggregator = _FakeResultAggregator()
+    pipeline = ExtractionPipeline(
+        SourceMetadataService(
+            extractor=extractor,
+            settings=_settings(),
+            cache=cache,
+        ),
+        CachedTranscriptionService(
+            TranscriptionService(
+                provider=provider,
+                audio_downloader=_AudioDownloader(),
+                transcriber=_FixedWhisperTranscriber(
+                    WhisperResult(text="unused Whisper", language="en", segment_count=1)
+                ),
+                temp_media_dir=tmp_path,
+                semaphore=asyncio.Semaphore(1),
+            ),
+            cache,
+        ),
+        interpretation_service,
+        result_aggregator,
+    )
+    _install_pipeline(app, pipeline)
+
+    try:
+        us_response = await client.post(
+            "/api/extractions",
+            json={"url": _CANONICAL_URL, "market": "US"},
+        )
+        jp_response = await client.post(
+            "/api/extractions",
+            json={"url": _CANONICAL_URL, "market": "JP"},
+        )
+
+        assert us_response.status_code == 200
+        assert jp_response.status_code == 200
+        assert us_response.json()["transcript"] == jp_response.json()["transcript"]
+        assert extractor.calls == [_CANONICAL_URL]
+        assert provider.calls == [_VIDEO_ID]
+        assert track.fetch_calls == 1
+        assert len(interpretation_service.calls) == 2
+        assert len(result_aggregator.calls) == 2
+        assert result_aggregator.markets == [SpotifyMarket("US"), SpotifyMarket("JP")]
+    finally:
+        await cache.aclose()
+
+
+async def test_direct_transcript_submissions_do_not_use_video_transcript_cache(
+    client: AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Keep direct text submissions isolated from cached video-derived Transcripts."""
+    clock = ManualClock()
+    cache, _ = _router_cache(clock)
+    extractor = _OutcomeMetadataExtractor([_youtube_metadata()])
+    track = _CaptionTrack("en", ["Shared Transcript Text."])
+    provider = _CaptionProvider([track])
+    pipeline = _pipeline(
+        SourceMetadataService(
+            extractor=extractor,
+            settings=_settings(),
+            cache=cache,
+        ),
+        CachedTranscriptionService(
+            TranscriptionService(
+                provider=provider,
+                audio_downloader=_AudioDownloader(),
+                transcriber=_FixedWhisperTranscriber(
+                    WhisperResult(text="unused Whisper", language="en", segment_count=1)
+                ),
+                temp_media_dir=tmp_path,
+                semaphore=asyncio.Semaphore(1),
+            ),
+            cache,
+        ),
+    )
+    _install_pipeline(app, pipeline)
+
+    try:
+        before_warm = await client.post(
+            "/api/internal/extractions",
+            json={"transcript": "Shared Transcript Text."},
+        )
+        video_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
+        after_warm = await client.post(
+            "/api/internal/extractions",
+            json={"transcript": "Shared Transcript Text."},
+        )
+
+        expected_submission = {
+            "text": "Shared Transcript Text.",
+            "language": "und",
+            "method": "text_submission",
+        }
+        assert before_warm.status_code == 200
+        assert before_warm.json()["transcript"] == expected_submission
+        assert video_response.status_code == 200
+        assert video_response.json()["transcript"]["method"] == "youtube_captions"
+        assert after_warm.status_code == 200
+        assert after_warm.json()["transcript"] == expected_submission
+        assert extractor.calls == [_CANONICAL_URL]
+        assert provider.calls == [_VIDEO_ID]
+        assert track.fetch_calls == 1
+    finally:
+        await cache.aclose()
+
+
+async def test_endpoint_transcript_contract_bump_preserves_source_metadata_reuse(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reacquire only the Transcript after its acquisition-contract version changes."""
+    clock = ManualClock()
+    cache, _ = _router_cache(clock)
+    extractor = _OutcomeMetadataExtractor([_youtube_metadata()])
+    track = _CaptionTrack("en", ["Transcript contract v1."])
+    provider = _CaptionProvider([track])
+    pipeline = _pipeline(
+        SourceMetadataService(
+            extractor=extractor,
+            settings=_settings(),
+            cache=cache,
+        ),
+        CachedTranscriptionService(
+            TranscriptionService(
+                provider=provider,
+                audio_downloader=_AudioDownloader(),
+                transcriber=_FixedWhisperTranscriber(
+                    WhisperResult(text="unused Whisper", language="en", segment_count=1)
+                ),
+                temp_media_dir=tmp_path,
+                semaphore=asyncio.Semaphore(1),
+            ),
+            cache,
+        ),
+    )
+    _install_pipeline(app, pipeline)
+
+    try:
+        first_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
+        track._segments = ["Transcript contract v2."]
+        monkeypatch.setattr(
+            transcription_service_module,
+            "_TRANSCRIPT_ACQUISITION_CONTRACT_VERSION",
+            "transcript-acquisition-v2",
+        )
+        second_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
+
+        assert first_response.status_code == 200
+        assert first_response.json()["transcript"]["text"] == "Transcript contract v1."
+        assert second_response.status_code == 200
+        assert second_response.json()["transcript"]["text"] == "Transcript contract v2."
+        assert extractor.calls == [_CANONICAL_URL]
+        assert provider.calls == [_VIDEO_ID, _VIDEO_ID]
+        assert track.fetch_calls == 2
     finally:
         await cache.aclose()

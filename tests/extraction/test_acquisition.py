@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import tempfile
 import threading
 import xml.etree.ElementTree as ElementTree
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from itertools import count
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import ClassVar, cast
@@ -20,6 +22,9 @@ from youtube_transcript_api import CouldNotRetrieveTranscript
 from yt_dlp.utils import DownloadError
 
 import reelio.extraction.services.transcription.acquisition as acquisition_service
+import reelio.extraction.services.transcription.service as transcription_service
+from reelio.cache import CacheEntry, RedisCache
+from reelio.cache.redis import _CacheRuntime
 from reelio.extraction.exceptions import PipelineTimeoutError, TranscriptionError
 from reelio.extraction.services.transcription.acquisition import (
     AudioDownloader,
@@ -33,8 +38,18 @@ from reelio.extraction.services.transcription.acquisition import (
 )
 from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.services.transcription.inspection import PreparedAudio
-from reelio.extraction.services.transcription.service import TranscriptionService
-from reelio.extraction.types import Platform, Source, Transcript, TranscriptMethod
+from reelio.extraction.services.transcription.service import (
+    CachedTranscriptionService,
+    TranscriptionService,
+)
+from reelio.extraction.types import (
+    Platform,
+    Source,
+    SourceIdentity,
+    Transcript,
+    TranscriptMethod,
+)
+from tests.cache.fakes import FakeRedis, ManualClock
 
 _VIDEO_ID = "dQw4w9WgXcQ"
 _CANONICAL_URL = f"https://www.youtube.com/watch?v={_VIDEO_ID}"
@@ -688,6 +703,68 @@ def _transcription_service(
         ),
         semaphore=semaphore if semaphore is not None else asyncio.Semaphore(1),
     )
+
+
+def _transcript_cache(clock: ManualClock) -> tuple[RedisCache, FakeRedis]:
+    tokens = count()
+    redis = FakeRedis(clock)
+    cache = RedisCache(
+        redis,
+        "reelio:test",
+        b"acquisition-transcript-cache-test-key",
+        runtime=_CacheRuntime(clock, asyncio.sleep, lambda: f"transcript-{next(tokens)}"),
+    )
+    return cache, redis
+
+
+def _transcript_entry_for(source: Source) -> CacheEntry[Transcript]:
+    return transcription_service._transcript_entry(SourceIdentity(source.platform, source.video_id))
+
+
+def _stored_envelope(redis: FakeRedis, key: str) -> dict[str, object]:
+    raw_envelope = redis.raw_value(key)
+    assert raw_envelope is not None
+    return cast(dict[str, object], json.loads(raw_envelope))
+
+
+def _transcript_envelope(value: dict[str, object], value_version: str) -> bytes:
+    return json.dumps(
+        {
+            "envelope_version": 2,
+            "value_version": value_version,
+            "value": value,
+            "freshness_seconds": 2_592_000,
+            "retention_seconds": 2_592_000,
+        }
+    ).encode()
+
+
+class _OutcomeWhisperTranscriber:
+    def __init__(self, outcomes: list[WhisperResult | Exception]) -> None:
+        self._outcomes = outcomes
+        self.calls: list[Path] = []
+
+    def transcribe(self, audio_path: Path) -> WhisperResult:
+        self.calls.append(audio_path)
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class _OutcomeAudioDownloader:
+    def __init__(self, outcomes: list[Exception | None]) -> None:
+        self._outcomes = outcomes
+        self.calls: list[tuple[str, Path]] = []
+
+    def download(self, source_url: str, destination: Path) -> Path:
+        self.calls.append((source_url, destination))
+        outcome = self._outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+        audio_path = destination / "audio.webm"
+        audio_path.write_bytes(b"audio")
+        return audio_path
 
 
 async def test_captionless_source_falls_back_to_whisper(tmp_path: Path) -> None:
@@ -1397,3 +1474,416 @@ async def test_social_success_logs_whisper_without_caption_event(
     messages = [record.getMessage() for record in caplog.records]
     assert "transcript acquired" in messages
     assert "caption track unavailable" not in messages
+
+
+async def test_cached_caption_transcript_reuses_normalized_application_value(
+    tmp_path: Path,
+) -> None:
+    """Reuse one Caption Transcript without retaining provider-only data."""
+    clock = ManualClock()
+    cache, redis = _transcript_cache(clock)
+    source = _source()
+    track = _FakeCaptionTrack(
+        "en",
+        False,
+        ["Caption cache transcript."],
+    )
+    provider = _FakeCaptionProvider([track])
+    downloader = _FakeAudioDownloader()
+    transcriber = _FakeWhisperTranscriber(
+        WhisperResult(text="unused Whisper text", language="en", segment_count=17)
+    )
+    service = CachedTranscriptionService(
+        _transcription_service(
+            provider,
+            audio_downloader=downloader,
+            transcriber=transcriber,
+            temp_media_dir=tmp_path,
+        ),
+        cache,
+    )
+    entry = _transcript_entry_for(source)
+    cache_key = cache._cache_key(entry)
+
+    try:
+        first = await service.acquire(source, _CANONICAL_URL)
+        second = await service.acquire(source, _CANONICAL_URL)
+
+        assert first == Transcript(
+            text="Caption cache transcript.",
+            language="en",
+            method=TranscriptMethod.YOUTUBE_CAPTIONS,
+        )
+        assert second == first
+        assert second is not first
+        assert provider.calls == [_VIDEO_ID]
+        assert track.fetch_calls == 1
+        assert downloader.calls == []
+        assert transcriber.calls == []
+
+        raw_envelope = redis.raw_value(cache_key)
+        assert raw_envelope is not None
+        assert _stored_envelope(redis, cache_key)["value"] == {
+            "text": "Caption cache transcript.",
+            "language": "en",
+            "method": "youtube_captions",
+        }
+        assert _VIDEO_ID.encode() not in raw_envelope
+        assert b"segment_count" not in raw_envelope
+        assert b"audio" not in raw_envelope
+    finally:
+        await cache.aclose()
+
+
+async def test_cached_whisper_transcript_bypasses_all_acquisition_work(
+    tmp_path: Path,
+) -> None:
+    """Reuse a normalized Whisper Transcript without caching media or result metadata."""
+    clock = ManualClock()
+    cache, redis = _transcript_cache(clock)
+    source = _social_source(Platform.INSTAGRAM)
+    provider = _FakeCaptionProvider([_FakeCaptionTrack("en", False, ["unused captions"])])
+    downloader = _FakeAudioDownloader()
+    transcriber = _FakeWhisperTranscriber(
+        WhisperResult(
+            text="  Whisper cache transcript.  ",
+            language="fr",
+            segment_count=17,
+        )
+    )
+    service = CachedTranscriptionService(
+        _transcription_service(
+            provider,
+            audio_downloader=downloader,
+            transcriber=transcriber,
+            temp_media_dir=tmp_path,
+        ),
+        cache,
+    )
+    entry = _transcript_entry_for(source)
+    cache_key = cache._cache_key(entry)
+
+    try:
+        first = await service.acquire(source, source.url)
+        second = await service.acquire(source, source.url)
+
+        assert first == Transcript(
+            text="Whisper cache transcript.",
+            language="fr",
+            method=TranscriptMethod.WHISPER,
+        )
+        assert second == first
+        assert second is not first
+        assert provider.calls == []
+        assert len(downloader.calls) == 1
+        assert len(transcriber.calls) == 1
+
+        raw_envelope = redis.raw_value(cache_key)
+        assert raw_envelope is not None
+        assert _stored_envelope(redis, cache_key)["value"] == {
+            "text": "Whisper cache transcript.",
+            "language": "fr",
+            "method": "whisper",
+        }
+        assert str(downloader.calls[0][1]).encode() not in raw_envelope
+        assert b"audio" not in raw_envelope
+        assert b"segment_count" not in raw_envelope
+    finally:
+        await cache.aclose()
+
+
+async def test_cached_transcript_expires_at_the_exact_thirty_day_boundary(
+    tmp_path: Path,
+) -> None:
+    """Serve a hit before 30 days and reacquire exactly at 30 days."""
+    clock = ManualClock()
+    cache, _ = _transcript_cache(clock)
+    source = _source()
+    track = _FakeCaptionTrack("en", False, ["Transcript expiry test."])
+    provider = _FakeCaptionProvider([track])
+    service = CachedTranscriptionService(
+        _transcription_service(provider, temp_media_dir=tmp_path),
+        cache,
+    )
+
+    try:
+        assert (await service.acquire(source, _CANONICAL_URL)).text == "Transcript expiry test."
+
+        clock.advance(2_591_999.999)
+        assert (await service.acquire(source, _CANONICAL_URL)).text == "Transcript expiry test."
+        assert provider.calls == [_VIDEO_ID]
+
+        clock.advance(0.001)
+        assert (await service.acquire(source, _CANONICAL_URL)).text == "Transcript expiry test."
+        assert provider.calls == [_VIDEO_ID, _VIDEO_ID]
+        assert track.fetch_calls == 2
+    finally:
+        await cache.aclose()
+
+
+async def test_transcript_contract_version_bump_uses_a_new_cache_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reacquire a Transcript after an acquisition-contract version change."""
+    clock = ManualClock()
+    cache, redis = _transcript_cache(clock)
+    source = _source()
+    track = _FakeCaptionTrack("en", False, ["Transcript contract v1."])
+    provider = _FakeCaptionProvider([track])
+    service = CachedTranscriptionService(
+        _transcription_service(provider, temp_media_dir=tmp_path),
+        cache,
+    )
+    v1_entry = _transcript_entry_for(source)
+    v1_key = cache._cache_key(v1_entry)
+
+    try:
+        first = await service.acquire(source, _CANONICAL_URL)
+        assert first.text == "Transcript contract v1."
+        assert redis.raw_value(v1_key) is not None
+
+        track._segments = ["Transcript contract v2."]
+        monkeypatch.setattr(
+            transcription_service,
+            "_TRANSCRIPT_ACQUISITION_CONTRACT_VERSION",
+            "transcript-acquisition-v2",
+        )
+
+        second = await service.acquire(source, _CANONICAL_URL)
+        v2_entry = _transcript_entry_for(source)
+        v2_key = cache._cache_key(v2_entry)
+
+        assert second.text == "Transcript contract v2."
+        assert provider.calls == [_VIDEO_ID, _VIDEO_ID]
+        assert v2_key != v1_key
+        assert redis.raw_value(v1_key) is not None
+        assert redis.raw_value(v2_key) is not None
+        assert v2_entry.codec.version == "transcript-acquisition-v2"
+    finally:
+        await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        {
+            "text": "Valid Transcript.",
+            "language": "en",
+            "method": "youtube_captions",
+            "unexpected": "provider data",
+        },
+        {"text": "", "language": "en", "method": "youtube_captions"},
+        {
+            "text": "Non-normalized   Transcript.",
+            "language": "en",
+            "method": "youtube_captions",
+        },
+        {
+            "text": "Valid Transcript.",
+            "language": " ",
+            "method": "youtube_captions",
+        },
+        {"text": "Valid Transcript.", "language": "en", "method": "provider"},
+        {
+            "text": "Valid Transcript.",
+            "language": "en",
+            "method": "text_submission",
+        },
+    ],
+    ids=[
+        "extra_field",
+        "blank_text",
+        "non_normalized_text",
+        "blank_language",
+        "unknown_method",
+        "text_submission",
+    ],
+)
+async def test_invalid_transcript_cache_envelopes_are_healed(
+    invalid_value: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    """Treat invalid cached Transcripts as misses and replace them with valid values."""
+    clock = ManualClock()
+    cache, redis = _transcript_cache(clock)
+    source = _source()
+    track = _FakeCaptionTrack("en", False, ["Healed Transcript."])
+    provider = _FakeCaptionProvider([track])
+    service = CachedTranscriptionService(
+        _transcription_service(provider, temp_media_dir=tmp_path),
+        cache,
+    )
+    entry = _transcript_entry_for(source)
+    cache_key = cache._cache_key(entry)
+    await redis.put_raw(
+        cache_key,
+        _transcript_envelope(invalid_value, entry.codec.version),
+    )
+
+    try:
+        first = await service.acquire(source, _CANONICAL_URL)
+        second = await service.acquire(source, _CANONICAL_URL)
+
+        assert first == Transcript(
+            text="Healed Transcript.",
+            language="en",
+            method=TranscriptMethod.YOUTUBE_CAPTIONS,
+        )
+        assert second == first
+        assert second is not first
+        assert provider.calls == [_VIDEO_ID]
+        assert track.fetch_calls == 1
+        assert _stored_envelope(redis, cache_key)["value"] == {
+            "text": "Healed Transcript.",
+            "language": "en",
+            "method": "youtube_captions",
+        }
+    finally:
+        await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    [
+        "transcript_unavailable",
+        "acquisition_failure",
+        "timeout",
+        "empty_whisper",
+        "malformed_whisper",
+    ],
+)
+async def test_transcript_acquisition_failures_are_not_cached(
+    failure_kind: str,
+    tmp_path: Path,
+) -> None:
+    """Preserve a typed acquisition failure and retry through real adapters."""
+    clock = ManualClock()
+    cache, _ = _transcript_cache(clock)
+    source = _source()
+    provider = _FakeCaptionProvider([])
+    successful_result = WhisperResult(
+        text="Recovered Transcript.",
+        language="en",
+        segment_count=1,
+    )
+    downloader: _FakeAudioDownloader | _OutcomeAudioDownloader = _FakeAudioDownloader()
+    transcriber = _OutcomeWhisperTranscriber(
+        [_WhisperProviderFailure("whisper provider failure"), successful_result]
+    )
+    expected_error_type: type[TranscriptionError] | type[PipelineTimeoutError]
+    expected_transcriber_calls = 2
+
+    if failure_kind == "acquisition_failure":
+        downloader = _OutcomeAudioDownloader([_WhisperProviderFailure("download failure"), None])
+        transcriber = _OutcomeWhisperTranscriber([successful_result])
+        expected_error_type = TranscriptionError
+        expected_transcriber_calls = 1
+    elif failure_kind == "timeout":
+        transcriber = _OutcomeWhisperTranscriber([Timeout("whisper timeout"), successful_result])
+        expected_error_type = PipelineTimeoutError
+    elif failure_kind == "empty_whisper":
+        transcriber = _OutcomeWhisperTranscriber(
+            [
+                WhisperResult(text=" \t", language="en", segment_count=1),
+                successful_result,
+            ]
+        )
+        expected_error_type = TranscriptionError
+    elif failure_kind == "malformed_whisper":
+        transcriber = _OutcomeWhisperTranscriber(
+            [
+                WhisperResult(
+                    text=cast(str, object()),
+                    language="en",
+                    segment_count=1,
+                ),
+                successful_result,
+            ]
+        )
+        expected_error_type = TranscriptionError
+    else:
+        expected_error_type = TranscriptionError
+
+    service = CachedTranscriptionService(
+        _transcription_service(
+            provider,
+            audio_downloader=downloader,
+            transcriber=transcriber,
+            temp_media_dir=tmp_path,
+        ),
+        cache,
+    )
+
+    try:
+        with pytest.raises(expected_error_type) as error:
+            await service.acquire(source, _CANONICAL_URL)
+
+        expected_message = (
+            "Transcript acquisition timed out."
+            if expected_error_type is PipelineTimeoutError
+            else "Transcript is unavailable for this video."
+        )
+        assert str(error.value) == expected_message
+
+        recovered = await service.acquire(source, _CANONICAL_URL)
+
+        assert recovered == Transcript(
+            text="Recovered Transcript.",
+            language="en",
+            method=TranscriptMethod.WHISPER,
+        )
+        assert provider.calls == [_VIDEO_ID, _VIDEO_ID]
+        assert len(downloader.calls) == 2
+        assert len(transcriber.calls) == expected_transcriber_calls
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    ("cache_operation", "expects_typed_error"),
+    [
+        ("read", True),
+        ("lease_acquire", True),
+        ("ownership_write", False),
+    ],
+)
+async def test_transcript_cache_failures_preserve_acquisition_behavior(
+    cache_operation: str,
+    expects_typed_error: bool,
+    tmp_path: Path,
+) -> None:
+    """Fail open from each cache boundary without exposing cache exceptions."""
+    clock = ManualClock()
+    cache, redis = _transcript_cache(clock)
+    source = _source()
+    redis.fail_operations.add(cache_operation)
+    provider = (
+        _FakeCaptionProvider([])
+        if expects_typed_error
+        else _FakeCaptionProvider([_FakeCaptionTrack("en", False, ["Cache fail-open."])])
+    )
+    service = CachedTranscriptionService(
+        _transcription_service(provider, temp_media_dir=tmp_path),
+        cache,
+    )
+
+    try:
+        if expects_typed_error:
+            with pytest.raises(
+                TranscriptionError,
+                match=r"^Transcript is unavailable for this video\.$",
+            ):
+                await service.acquire(source, _CANONICAL_URL)
+        else:
+            assert await service.acquire(source, _CANONICAL_URL) == Transcript(
+                text="Cache fail-open.",
+                language="en",
+                method=TranscriptMethod.YOUTUBE_CAPTIONS,
+            )
+
+        assert redis.command_counts[cache_operation] >= 1
+        assert provider.calls == [_VIDEO_ID]
+    finally:
+        await cache.aclose()

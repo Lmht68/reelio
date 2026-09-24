@@ -4,6 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from requests.exceptions import RequestException, Timeout
@@ -23,7 +24,14 @@ from reelio.extraction.exceptions import (
     UnsupportedPlatformError,
 )
 from reelio.extraction.services.transcription.config import TranscriptionConfig
-from reelio.extraction.types import Platform, Source, SourceIdentity, Transcript
+from reelio.extraction.types import (
+    Platform,
+    Source,
+    SourceIdentity,
+    Transcript,
+    TranscriptMethod,
+    normalize_transcript_segments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +46,10 @@ _SOURCE_CACHE_TTL_SECONDS = 2_592_000
 _SOURCE_CACHE_WAIT_TIMEOUT_SECONDS = 1.0
 _SOURCE_ALIAS_CONTRACT_VERSION = "source-alias-v1"
 _SOURCE_METADATA_CONTRACT_VERSION = "source-metadata-v1"
+
+_TRANSCRIPT_CACHE_TTL_SECONDS = 2_592_000
+_TRANSCRIPT_CACHE_WAIT_TIMEOUT_SECONDS = 1.0
+_TRANSCRIPT_ACQUISITION_CONTRACT_VERSION = "transcript-acquisition-v1"
 
 
 class _SourceAliasPayload(BaseModel):
@@ -57,6 +69,14 @@ class _SourceMetadataPayload(BaseModel):
     description: str
     channel: str
     duration_seconds: int
+
+
+class _TranscriptPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    text: str
+    language: str
+    method: str
 
 
 class _SourceAliasCodec:
@@ -147,6 +167,49 @@ class _SourceMetadataCodec:
         return source
 
 
+class _TranscriptCodec:
+    """Serialize a video-derived Transcript for one acquisition contract."""
+
+    def __init__(self, acquisition_contract_version: str) -> None:
+        self.version = acquisition_contract_version
+
+    def encode(self, value: Transcript) -> JsonObject:
+        """Encode one cacheable Caption- or Whisper-derived Transcript."""
+        _validate_cacheable_transcript(value)
+        payload = _TranscriptPayload(
+            text=value.text,
+            language=value.language,
+            method=value.method.value,
+        )
+        return {
+            "text": payload.text,
+            "language": payload.language,
+            "method": payload.method,
+        }
+
+    def decode(self, payload: JsonObject) -> Transcript:
+        """Decode one exact cacheable Transcript into a new allocation."""
+        try:
+            decoded = _TranscriptPayload.model_validate(payload)
+        except ValidationError as exc:
+            raise CacheCodecError("Invalid Transcript cache value") from exc
+
+        if decoded.method == TranscriptMethod.YOUTUBE_CAPTIONS.value:
+            method = TranscriptMethod.YOUTUBE_CAPTIONS
+        elif decoded.method == TranscriptMethod.WHISPER.value:
+            method = TranscriptMethod.WHISPER
+        else:
+            raise CacheCodecError("Transcript method is not cacheable")
+
+        transcript = Transcript(
+            text=decoded.text,
+            language=decoded.language,
+            method=method,
+        )
+        _validate_cacheable_transcript(transcript)
+        return transcript
+
+
 def _validate_source_identity(
     source_identity: SourceIdentity,
     expected_platform: Platform,
@@ -233,12 +296,50 @@ def _source_metadata_entry(source_identity: SourceIdentity) -> CacheEntry[Source
     )
 
 
+def _transcript_entry(source_identity: SourceIdentity) -> CacheEntry[Transcript]:
+    acquisition_contract_version = _TRANSCRIPT_ACQUISITION_CONTRACT_VERSION
+    return CacheEntry(
+        layer="source:transcript",
+        key_version="v1",
+        identity={
+            "platform": source_identity.platform.value,
+            "external_content_id": source_identity.external_content_id,
+            "contract_version": acquisition_contract_version,
+        },
+        codec=_TranscriptCodec(acquisition_contract_version),
+        ttl_seconds=_transcript_ttl_seconds,
+        wait_timeout_seconds=_TRANSCRIPT_CACHE_WAIT_TIMEOUT_SECONDS,
+    )
+
+
 def _source_alias_ttl_seconds(_: SourceIdentity) -> int:
     return _SOURCE_CACHE_TTL_SECONDS
 
 
 def _source_metadata_ttl_seconds(_: Source) -> int:
     return _SOURCE_CACHE_TTL_SECONDS
+
+
+def _transcript_ttl_seconds(_: Transcript) -> int:
+    return _TRANSCRIPT_CACHE_TTL_SECONDS
+
+
+def _validate_cacheable_transcript(transcript: Transcript) -> None:
+    if not isinstance(transcript, Transcript):
+        raise CacheCodecError("Expected Transcript cache value")
+    if (
+        not isinstance(transcript.text, str)
+        or not transcript.text
+        or transcript.text != normalize_transcript_segments((transcript.text,))
+    ):
+        raise CacheCodecError("Transcript text must be nonempty and normalized")
+    if not isinstance(transcript.language, str) or not transcript.language.strip():
+        raise CacheCodecError("Transcript language must be nonblank")
+    if (
+        transcript.method is not TranscriptMethod.YOUTUBE_CAPTIONS
+        and transcript.method is not TranscriptMethod.WHISPER
+    ):
+        raise CacheCodecError("Transcript method is not cacheable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -647,3 +748,58 @@ class TranscriptionService:
             raise PipelineTimeoutError(_TRANSCRIPT_TIMEOUT_MESSAGE) from exc
         except acquisition._WhisperProviderFailure as exc:
             raise TranscriptionError(_TRANSCRIPT_UNAVAILABLE_MESSAGE) from exc
+
+
+class _UncachedTranscriptAcquirer(Protocol):
+    """Define the uncached Transcript acquisition contract."""
+
+    async def acquire(
+        self,
+        source: Source,
+        submitted_url: str,
+        prepared_audio: inspection.PreparedAudio | None = None,
+    ) -> Transcript:
+        """Acquire one normalized Transcript for a validated Source."""
+        ...
+
+
+class CachedTranscriptionService:
+    """Reuse successful video-derived Transcripts by authoritative Source identity."""
+
+    def __init__(self, acquirer: _UncachedTranscriptAcquirer, cache: AsyncCache) -> None:
+        """Initialize a cached wrapper around one uncached acquirer.
+
+        Args:
+            acquirer: Service that owns Caption and Whisper acquisition behavior.
+            cache: Shared application-lifespan cache for reusable Transcripts.
+        """
+        self._acquirer = acquirer
+        self._cache = cache
+
+    async def acquire(
+        self,
+        source: Source,
+        submitted_url: str,
+        prepared_audio: inspection.PreparedAudio | None = None,
+    ) -> Transcript:
+        """Load or acquire one cacheable video-derived Transcript.
+
+        Args:
+            source: Validated Source whose identity scopes Transcript reuse.
+            submitted_url: Validated URL supplied by the API caller.
+            prepared_audio: Audio downloaded during metadata inspection, when available.
+
+        Returns:
+            Transcript: Caption or Whisper text and acquisition metadata.
+
+        Raises:
+            TranscriptionError: If the uncached acquirer finds no usable Transcript.
+            PipelineTimeoutError: If the uncached terminal Whisper path times out.
+            asyncio.CancelledError: If the caller cancels Transcript acquisition.
+        """
+        source_identity = SourceIdentity(source.platform, source.video_id)
+
+        async def loader() -> Transcript:
+            return await self._acquirer.acquire(source, submitted_url, prepared_audio)
+
+        return await self._cache.get_or_load(_transcript_entry(source_identity), loader)

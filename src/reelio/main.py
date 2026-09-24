@@ -53,6 +53,7 @@ from reelio.extraction.services.transcription.config import (
 )
 from reelio.extraction.services.transcription.inspection import YtDlpMetadataExtractor
 from reelio.extraction.services.transcription.service import (
+    CachedTranscriptionService,
     SourceMetadataService,
     TranscriptionService,
 )
@@ -78,7 +79,8 @@ async def _create_production_pipeline(
     Args:
         default_market: Validated Spotify market used when an API request omits it.
         spotify_catalog: Lifespan-owned Spotify catalog used without transferring ownership.
-        cache: Lifespan-owned shared cache borrowed by TMDB, Spotify, and Open Library.
+        cache: Lifespan-owned shared cache borrowed by Source metadata, Transcript reuse,
+            TMDB, Spotify, and Open Library.
     """
     interpretation_settings = InterpretationConfig()
     llm_provider_selection = LLMProviderSelectionConfig()  # type: ignore[call-arg]
@@ -97,12 +99,16 @@ async def _create_production_pipeline(
             settings=_transcription_settings,
             cache=cache,
         )
-        transcription_service = TranscriptionService(
+        uncached_transcription_service = TranscriptionService(
             provider=YouTubeCaptionProvider(),
             audio_downloader=YtDlpAudioDownloader(),
             transcriber=transcriber,
             temp_media_dir=_transcription_settings.temp_media_dir,
             semaphore=asyncio.Semaphore(_transcription_settings.whisper_max_concurrent),
+        )
+        transcription_service = CachedTranscriptionService(
+            acquirer=uncached_transcription_service,
+            cache=cache,
         )
         interpretation_service = MentionInterpretationService(
             provider=llm_provider,
