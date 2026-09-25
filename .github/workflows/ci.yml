@@ -63,9 +63,10 @@ jobs:
 
       - name: Run complete pytest suite
         run: uv run --locked pytest
-      - name: Run Redis lease-script smoke scenario
+      - name: Run Redis cache smoke scenarios
         env:
           REELIO_TEST_REDIS_URL: redis://localhost:6379/15
+          REELIO_TEST_REDIS_UNAVAILABLE_URL: redis://localhost:6399/15
         run: uv run --locked pytest -m redis_smoke tests/cache/test_redis_smoke.py
 
 
