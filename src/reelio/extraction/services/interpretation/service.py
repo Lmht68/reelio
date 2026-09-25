@@ -3,10 +3,12 @@
 import logging
 from collections.abc import Sequence
 from time import perf_counter
-from typing import Protocol
+from typing import Protocol, cast
 
 from pydantic import ValidationError
 
+from reelio.cache import AsyncCache, CacheCodecError, CacheEntry
+from reelio.cache.interface import JsonObject
 from reelio.extraction.exceptions import (
     InterpretationInputTooLargeError,
     InvalidLLMResponseError,
@@ -34,6 +36,7 @@ from reelio.extraction.types import (
     MusicReleaseMention,
     ScreenWorkMentions,
     TrackMention,
+    TranscriptMethod,
     TVSeriesMention,
     normalize_book_identity,
     normalize_music_identity,
@@ -46,6 +49,11 @@ logger = logging.getLogger(__name__)
 _INPUT_LIMIT_MESSAGE = "Interpretation Material exceeds the configured limit."
 _INVALID_RESPONSE_MESSAGE = "The LLM returned an invalid mention interpretation response."
 _STAGE = "mention_interpretation"
+
+_INTERPRETATION_CACHE_TTL_SECONDS = 2_592_000
+_INTERPRETATION_CACHE_WAIT_TIMEOUT_SECONDS = 1.0
+_INTERPRETATION_PROMPT_VERSION = "mention-interpretation-prompt-v1"
+_INTERPRETATION_SCHEMA_VERSION = "mention-interpretation-schema-v1"
 
 
 class MentionInterpretationProvider(Protocol):
@@ -81,6 +89,94 @@ class MentionInterpretationProvider(Protocol):
         ...
 
 
+class _InterpretationMentionsCodec:
+    """Serialize validated ordered Mention collections."""
+
+    def __init__(self, schema_version: str) -> None:
+        self.version = schema_version
+
+    def encode(self, value: ExtractionMentions) -> JsonObject:
+        """Encode validated Mention collections without interpretation inputs."""
+        try:
+            response = InterpretationResponse.model_validate(
+                {
+                    "movies": [
+                        {"title": movie.title, "year": movie.year}
+                        for movie in value.screen_works.movies
+                    ],
+                    "tv_series": [
+                        {"title": tv_series.title, "year": tv_series.year}
+                        for tv_series in value.screen_works.tv_series
+                    ],
+                    "tracks": [
+                        {
+                            "track_title": track.track_title,
+                            "artists": track.artists,
+                            "release_title": track.release_title,
+                            "release_year": track.release_year,
+                        }
+                        for track in value.music.tracks
+                    ],
+                    "music_releases": [
+                        {
+                            "release_title": music_release.release_title,
+                            "artists": music_release.artists,
+                            "release_year": music_release.release_year,
+                        }
+                        for music_release in value.music.music_releases
+                    ],
+                    "books": [
+                        {
+                            "title": book.title,
+                            "authors": [author.name for author in book.authors],
+                        }
+                        for book in value.books.books
+                    ],
+                }
+            )
+        except (AttributeError, TypeError, ValidationError) as exc:
+            raise CacheCodecError("Invalid Mention interpretation cache value") from exc
+        return cast(JsonObject, response.model_dump(mode="json"))
+
+    def decode(self, payload: JsonObject) -> ExtractionMentions:
+        """Decode a fresh, validated Mention collection allocation."""
+        try:
+            response = InterpretationResponse.model_validate(payload)
+        except ValidationError as exc:
+            raise CacheCodecError("Invalid Mention interpretation cache value") from exc
+        return _deduplicate(response)
+
+
+def _interpretation_entry(
+    material: InterpretationMaterial,
+    provider_name: LLMProvider,
+    model_name: str,
+    prompt_version: str,
+    schema_version: str,
+) -> CacheEntry[ExtractionMentions]:
+    return CacheEntry(
+        layer="source:interpretation",
+        key_version="v1",
+        identity={
+            "source_title": material.source_title,
+            "source_description": material.source_description,
+            "transcript_language": material.transcript.language,
+            "transcript_text": material.transcript.text,
+            "provider": provider_name.value,
+            "model": model_name,
+            "prompt_version": prompt_version,
+            "interpretation_schema_version": schema_version,
+        },
+        codec=_InterpretationMentionsCodec(schema_version),
+        ttl_seconds=_interpretation_ttl_seconds,
+        wait_timeout_seconds=_INTERPRETATION_CACHE_WAIT_TIMEOUT_SECONDS,
+    )
+
+
+def _interpretation_ttl_seconds(_: ExtractionMentions) -> int:
+    return _INTERPRETATION_CACHE_TTL_SECONDS
+
+
 class MentionInterpretationService:
     """Validate Interpretation Material and produce canonical grouped mentions."""
 
@@ -88,15 +184,20 @@ class MentionInterpretationService:
         self,
         provider: MentionInterpretationProvider,
         settings: InterpretationConfig,
+        cache: AsyncCache,
     ) -> None:
-        """Initialize interpretation with an LLM provider and validated limits.
+        """Initialize interpretation with an LLM provider, limits, and shared cache.
 
         Args:
             provider: Provider-neutral structured completion adapter.
             settings: Interpretation Material size limits.
+            cache: Shared application-lifespan cache for reusable interpretations.
         """
         self._provider = provider
         self._settings = settings
+        self._cache = cache
+        self._prompt_version = _INTERPRETATION_PROMPT_VERSION
+        self._schema_version = _INTERPRETATION_SCHEMA_VERSION
         self._system_prompt = build_system_prompt()
 
     async def interpret(
@@ -119,6 +220,25 @@ class MentionInterpretationService:
             PipelineTimeoutError: If the provider request times out.
         """
         self._validate_input_limits(material)
+        if material.transcript.method is TranscriptMethod.TEXT_SUBMISSION:
+            return await self._interpret_uncached(material)
+
+        async def loader() -> ExtractionMentions:
+            return await self._interpret_uncached(material)
+
+        entry = _interpretation_entry(
+            material,
+            self._provider.provider_name,
+            self._provider.model_name,
+            self._prompt_version,
+            self._schema_version,
+        )
+        return await self._cache.get_or_load(entry, loader)
+
+    async def _interpret_uncached(
+        self,
+        material: InterpretationMaterial,
+    ) -> ExtractionMentions:
         messages = (
             LLMMessage(role="system", content=self._system_prompt),
             LLMMessage(

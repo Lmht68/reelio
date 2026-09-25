@@ -215,7 +215,11 @@ async def _post_extract(
     pipeline = ExtractionPipeline(
         _MetadataService(),
         _TranscriptionService(transcript_text, transcript_language),
-        MentionInterpretationService(interpretation_provider, _interpretation_settings()),
+        MentionInterpretationService(
+            interpretation_provider,
+            _interpretation_settings(),
+            DisabledCache(),
+        ),
         ExtractionResultAggregator(
             FakeScreenWorkResolver(),
             FakeMusicResolver(),

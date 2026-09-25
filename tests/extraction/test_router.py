@@ -569,7 +569,11 @@ async def test_extract_transcript_interprets_normalized_text_without_source(
     pipeline = ExtractionPipeline(
         source_metadata_service,
         transcription_service,
-        MentionInterpretationService(llm_provider, _interpretation_settings()),
+        MentionInterpretationService(
+            llm_provider,
+            _interpretation_settings(),
+            DisabledCache(),
+        ),
         _FakeResultAggregator(),
     )
     _install_pipeline(app, pipeline)
@@ -1390,6 +1394,7 @@ async def test_oversized_submitted_transcript_returns_existing_413_contract(
         MentionInterpretationService(
             llm_provider,
             _interpretation_settings(max_transcript_chars=5),
+            DisabledCache(),
         ),
         _FakeResultAggregator(),
     )
@@ -2536,6 +2541,111 @@ async def test_endpoint_reuses_transcript_across_markets_while_enriching_each_ma
         assert track.fetch_calls == 1
         assert len(interpretation_service.calls) == 2
         assert len(result_aggregator.calls) == 2
+        assert result_aggregator.markets == [SpotifyMarket("US"), SpotifyMarket("JP")]
+    finally:
+        await cache.aclose()
+
+
+async def test_endpoint_reuses_mention_interpretation_across_effective_markets(
+    client: AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Reuse Mention interpretation while aggregating each effective market."""
+    clock = ManualClock()
+    cache, _ = _router_cache(clock)
+    extractor = _OutcomeMetadataExtractor([_youtube_metadata()])
+    caption_track = _CaptionTrack("en", ["Market-independent mention content."])
+    caption_provider = _CaptionProvider([caption_track])
+    llm_provider = _RecordingLLMProvider(
+        json.dumps(
+            {
+                "movies": [
+                    {"title": "Dune: Part One", "year": 2021},
+                    {"title": "Arrival", "year": 2016},
+                ],
+                "tv_series": [{"title": "Fargo", "year": 2014}],
+                "tracks": [
+                    {
+                        "track_title": "Track One",
+                        "artists": ["Artist One"],
+                        "release_title": "Release One",
+                        "release_year": 2020,
+                    }
+                ],
+                "music_releases": [
+                    {
+                        "release_title": "Release One",
+                        "artists": ["Artist One"],
+                        "release_year": 2020,
+                    }
+                ],
+                "books": [{"title": "Book One", "authors": ["Author One"]}],
+            }
+        )
+    )
+    interpretation_service = MentionInterpretationService(
+        llm_provider,
+        _interpretation_settings(),
+        cache,
+    )
+    result_aggregator = _FakeResultAggregator()
+    pipeline = ExtractionPipeline(
+        SourceMetadataService(
+            extractor=extractor,
+            settings=_settings(),
+            cache=cache,
+        ),
+        CachedTranscriptionService(
+            TranscriptionService(
+                provider=caption_provider,
+                audio_downloader=_AudioDownloader(),
+                transcriber=_FixedWhisperTranscriber(
+                    WhisperResult(text="unused Whisper", language="en", segment_count=1)
+                ),
+                temp_media_dir=tmp_path,
+                semaphore=asyncio.Semaphore(1),
+            ),
+            cache,
+        ),
+        interpretation_service,
+        result_aggregator,
+        SpotifyMarket("US"),
+    )
+    _install_pipeline(app, pipeline)
+
+    try:
+        us_response = await client.post(
+            "/api/extractions",
+            json={"url": _CANONICAL_URL, "market": "US"},
+        )
+        jp_response = await client.post(
+            "/api/extractions",
+            json={"url": _CANONICAL_URL, "market": "JP"},
+        )
+
+        assert us_response.status_code == 200
+        assert jp_response.status_code == 200
+        assert us_response.json()["results"] == jp_response.json()["results"]
+        assert len(llm_provider.calls) == 1
+        assert caption_provider.calls == [_VIDEO_ID]
+        assert caption_track.fetch_calls == 1
+        assert [movie.title for movie in result_aggregator.calls[1].screen_works.movies] == [
+            "Dune: Part One",
+            "Arrival",
+        ]
+        assert [
+            tv_series.title for tv_series in result_aggregator.calls[1].screen_works.tv_series
+        ] == ["Fargo"]
+        assert [track.track_title for track in result_aggregator.calls[1].music.tracks] == [
+            "Track One"
+        ]
+        assert [
+            music_release.release_title
+            for music_release in result_aggregator.calls[1].music.music_releases
+        ] == ["Release One"]
+        assert [book.title for book in result_aggregator.calls[1].books.books] == ["Book One"]
+        assert result_aggregator.calls[1] == result_aggregator.calls[0]
+        assert result_aggregator.calls[1] is not result_aggregator.calls[0]
         assert result_aggregator.markets == [SpotifyMarket("US"), SpotifyMarket("JP")]
     finally:
         await cache.aclose()

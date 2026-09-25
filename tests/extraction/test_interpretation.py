@@ -1,10 +1,12 @@
 """Mention interpretation provider contract tests."""
 
+import asyncio
 import json
 import logging
 from collections import deque
 from collections.abc import Callable, Sequence
 from datetime import date
+from itertools import count
 from types import SimpleNamespace
 from typing import cast
 
@@ -13,6 +15,9 @@ import pytest
 from openai import APIError, APITimeoutError, AsyncOpenAI
 
 import reelio.extraction.services.interpretation.deepseek as deepseek_adapter
+import reelio.extraction.services.interpretation.service as interpretation_service_module
+from reelio.cache import AsyncCache, CacheEntry, DisabledCache, RedisCache
+from reelio.cache.redis import _CacheRuntime
 from reelio.extraction.exceptions import (
     InterpretationInputTooLargeError,
     InvalidLLMResponseError,
@@ -49,6 +54,7 @@ from reelio.extraction.types import (
     TVSeriesMention,
     maximum_screen_work_mention_year,
 )
+from tests.cache.fakes import FakeRedis, ManualClock
 
 TrackResponse = tuple[str, Sequence[str], str | None, int | None]
 MusicReleaseResponse = tuple[str, Sequence[str], int | None]
@@ -64,7 +70,7 @@ class _FakeProvider:
     def __init__(
         self,
         responses: Sequence[str] = (),
-        error: MentionInterpretationError | None = None,
+        error: MentionInterpretationError | PipelineTimeoutError | None = None,
     ) -> None:
         self.responses = deque(responses)
         self.error = error
@@ -115,6 +121,16 @@ def _settings(**values: object) -> InterpretationConfig:
     return settings_type(_env_file=None, **values)
 
 
+def _service(
+    provider: _FakeProvider,
+    settings: InterpretationConfig | None = None,
+    cache: AsyncCache | None = None,
+) -> MentionInterpretationService:
+    selected_settings = _settings() if settings is None else settings
+    selected_cache = DisabledCache() if cache is None else cache
+    return MentionInterpretationService(provider, selected_settings, selected_cache)
+
+
 def _deepseek_settings(**values: object) -> DeepSeekConfig:
     settings_type = cast(Callable[..., DeepSeekConfig], DeepSeekConfig)
     return settings_type(_env_file=None, api_key="test-key", **values)
@@ -160,6 +176,49 @@ def _material(
     )
 
 
+def _interpretation_cache(clock: ManualClock) -> tuple[RedisCache, FakeRedis]:
+    tokens = count()
+    redis = FakeRedis(clock)
+    cache = RedisCache(
+        redis,
+        "reelio:test",
+        b"interpretation-cache-test-key",
+        runtime=_CacheRuntime(clock, asyncio.sleep, lambda: f"interpretation-{next(tokens)}"),
+    )
+    return cache, redis
+
+
+def _interpretation_entry_for(
+    service: MentionInterpretationService,
+    material: InterpretationMaterial,
+) -> CacheEntry[ExtractionMentions]:
+    return interpretation_service_module._interpretation_entry(
+        material,
+        service._provider.provider_name,
+        service._provider.model_name,
+        service._prompt_version,
+        service._schema_version,
+    )
+
+
+def _stored_envelope(redis: FakeRedis, key: str) -> dict[str, object]:
+    raw_envelope = redis.raw_value(key)
+    assert raw_envelope is not None
+    return cast(dict[str, object], json.loads(raw_envelope))
+
+
+def _interpretation_envelope(value: dict[str, object], value_version: str) -> bytes:
+    return json.dumps(
+        {
+            "envelope_version": 2,
+            "value_version": value_version,
+            "value": value,
+            "freshness_seconds": 2_592_000,
+            "retention_seconds": 2_592_000,
+        }
+    ).encode()
+
+
 def _response(
     *movies: tuple[str, int],
     tv_series: Sequence[tuple[str, int]] = (),
@@ -198,7 +257,7 @@ async def _interpret(
     response: str,
 ) -> tuple[ExtractionMentions, _FakeProvider]:
     provider = _FakeProvider([response])
-    service = MentionInterpretationService(provider, _settings())
+    service = _service(provider)
     mentions = await service.interpret(_material(_source(), _transcript(transcript_text)))
     return mentions, provider
 
@@ -712,7 +771,7 @@ def test_system_prompt_defines_grouped_screen_work_policy(rule_fragment: str) ->
 async def test_malformed_json_immediately_raises_invalid_response() -> None:
     """Reject malformed JSON without making a validation-repair request."""
     provider = _FakeProvider(["not json"])
-    service = MentionInterpretationService(provider, _settings())
+    service = _service(provider)
 
     with pytest.raises(InvalidLLMResponseError):
         await service.interpret(_material(_source(), _transcript("Dune.")))
@@ -723,7 +782,7 @@ async def test_malformed_json_immediately_raises_invalid_response() -> None:
 async def test_second_queued_response_is_not_used_for_repair() -> None:
     """Leave a queued correction unused because repair requests are disabled."""
     provider = _FakeProvider(["not json", _response(("Dune: Part One", 2021))])
-    service = MentionInterpretationService(provider, _settings())
+    service = _service(provider)
 
     with pytest.raises(InvalidLLMResponseError):
         await service.interpret(_material(_source(), _transcript("Dune.")))
@@ -736,7 +795,7 @@ async def test_provider_failure_preserves_interpretation_exception_policy() -> N
     """Propagate the provider's typed mention interpretation failure."""
     provider_error = MentionInterpretationError("provider unavailable")
     provider = _FakeProvider(error=provider_error)
-    service = MentionInterpretationService(provider, _settings())
+    service = _service(provider)
 
     with pytest.raises(MentionInterpretationError) as error:
         await service.interpret(_material(_source(), _transcript("Dune.")))
@@ -770,7 +829,7 @@ async def test_oversized_interpretation_material_is_rejected_without_provider_ca
 ) -> None:
     """Reject every bounded field rather than sending a truncated prompt."""
     provider = _FakeProvider([_response()])
-    service = MentionInterpretationService(provider, _settings(**setting_overrides))
+    service = _service(provider, _settings(**setting_overrides))
 
     with pytest.raises(InterpretationInputTooLargeError):
         await service.interpret(_material(source, transcript))
@@ -787,7 +846,7 @@ async def test_prompt_injection_remains_json_content_without_channel() -> None:
         channel="This channel must never reach the LLM provider",
     )
     provider = _FakeProvider([_response()])
-    service = MentionInterpretationService(provider, _settings())
+    service = _service(provider)
 
     await service.interpret(_material(source, _transcript(injection)))
 
@@ -1027,7 +1086,7 @@ async def test_strict_response_schema_rejects_invalid_fields(
     """Reject each defect while its corrected twin validates unchanged."""
     InterpretationResponse.model_validate_json(corrected_response)
     provider = _FakeProvider([invalid_response])
-    service = MentionInterpretationService(provider, _settings())
+    service = _service(provider)
 
     with pytest.raises(InvalidLLMResponseError):
         await service.interpret(_material(_source(), _transcript("Dune.")))
@@ -1039,7 +1098,7 @@ async def test_response_accepts_more_than_two_hundred_mentions() -> None:
     """Do not impose an undocumented Screen Work Mention response ceiling."""
     response = _response(*((f"Movie {index}", 2000) for index in range(201)))
     provider = _FakeProvider([response])
-    service = MentionInterpretationService(provider, _settings())
+    service = _service(provider)
 
     mentions = await service.interpret(_material(_source(), _transcript("Many movies.")))
 
@@ -1054,7 +1113,7 @@ async def test_logs_never_include_transcript_or_raw_invalid_response(
     transcript_secret = "private transcript marker"
     raw_response = "private raw response marker"
     provider = _FakeProvider([raw_response])
-    service = MentionInterpretationService(provider, _settings())
+    service = _service(provider)
 
     with (
         caplog.at_level(
@@ -1073,6 +1132,577 @@ async def test_logs_never_include_transcript_or_raw_invalid_response(
     record = cast(_ProviderLogRecord, caplog.records[0])
     assert record.provider == "deepseek"
     assert record.model == "fake-model"
+
+
+async def test_cached_interpretation_reuses_only_validated_mention_values() -> None:
+    """Reuse ordered Mention collections without retaining interpretation inputs."""
+    clock = ManualClock()
+    cache, redis = _interpretation_cache(clock)
+    source = _source(
+        title="Private source title",
+        description="Private source description",
+        channel="Uncached source channel",
+    )
+    material = _material(source, _transcript("Private transcript text"))
+    response = _response(
+        ("Movie One", 2001),
+        ("Movie Two", 2002),
+        tv_series=[("Series One", 2010), ("Series Two", 2011)],
+        tracks=[
+            ("Track One", ("Artist One",), "Release One", 2020),
+            ("Track Two", ("Artist Two", "Artist Three"), None, None),
+        ],
+        music_releases=[
+            ("Release One", ("Artist One",), 2020),
+            ("Release Two", ("Artist Two",), None),
+        ],
+        books=[("Book One", ("Author One",)), ("Book Two", ("Author Two",))],
+    )
+    provider = _FakeProvider([response])
+    service = _service(provider, cache=cache)
+    entry = _interpretation_entry_for(service, material)
+    cache_key = cache._cache_key(entry)
+    expected_value = {
+        "movies": [
+            {"title": "Movie One", "year": 2001},
+            {"title": "Movie Two", "year": 2002},
+        ],
+        "tv_series": [
+            {"title": "Series One", "year": 2010},
+            {"title": "Series Two", "year": 2011},
+        ],
+        "tracks": [
+            {
+                "track_title": "Track One",
+                "artists": ["Artist One"],
+                "release_title": "Release One",
+                "release_year": 2020,
+            },
+            {
+                "track_title": "Track Two",
+                "artists": ["Artist Two", "Artist Three"],
+                "release_title": None,
+                "release_year": None,
+            },
+        ],
+        "music_releases": [
+            {
+                "release_title": "Release One",
+                "artists": ["Artist One"],
+                "release_year": 2020,
+            },
+            {
+                "release_title": "Release Two",
+                "artists": ["Artist Two"],
+                "release_year": None,
+            },
+        ],
+        "books": [
+            {"title": "Book One", "authors": ["Author One"]},
+            {"title": "Book Two", "authors": ["Author Two"]},
+        ],
+    }
+
+    try:
+        first = await service.interpret(material)
+        second = await service.interpret(material)
+
+        assert second == first
+        assert second is not first
+        assert second.screen_works.movies is not first.screen_works.movies
+        assert second.screen_works.tv_series is not first.screen_works.tv_series
+        assert second.music.tracks is not first.music.tracks
+        assert second.music.music_releases is not first.music.music_releases
+        assert second.books.books is not first.books.books
+        assert len(provider.calls) == 1
+        assert _stored_envelope(redis, cache_key)["value"] == expected_value
+
+        raw_envelope = redis.raw_value(cache_key)
+        assert raw_envelope is not None
+        system_message, user_message = provider.calls[0]
+        for private_value in (
+            material.source_title,
+            material.source_description,
+            material.transcript.text,
+            source.channel,
+            system_message.content,
+            user_message.content,
+            response,
+        ):
+            assert private_value.encode() not in raw_envelope
+            assert private_value not in cache_key
+    finally:
+        await cache.aclose()
+
+
+async def test_cached_interpretation_expires_at_the_exact_thirty_day_boundary() -> None:
+    """Use the cached interpretation until, but not at, the thirty-day TTL."""
+    clock = ManualClock()
+    cache, _ = _interpretation_cache(clock)
+    material = _material(_source(), _transcript("Interpretation expiry test."))
+    provider = _FakeProvider(
+        [
+            _response(("First cached movie", 2001)),
+            _response(("Reloaded cached movie", 2002)),
+        ]
+    )
+    service = _service(provider, cache=cache)
+
+    try:
+        assert (await service.interpret(material)).screen_works.movies == [
+            MovieMention(title="First cached movie", year=2001)
+        ]
+
+        clock.advance(2_591_999.999)
+        assert (await service.interpret(material)).screen_works.movies == [
+            MovieMention(title="First cached movie", year=2001)
+        ]
+        assert len(provider.calls) == 1
+
+        clock.advance(0.001)
+        assert (await service.interpret(material)).screen_works.movies == [
+            MovieMention(title="Reloaded cached movie", year=2002)
+        ]
+        assert len(provider.calls) == 2
+    finally:
+        await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("source_title", "Changed source title"),
+        ("source_description", "Changed source description"),
+        ("transcript_language", "fr"),
+        ("transcript_text", "Changed transcript text."),
+    ],
+)
+async def test_interpretation_cache_identity_includes_every_material_field(
+    changed_field: str,
+    changed_value: str,
+) -> None:
+    """Invalidate only when source context or Transcript content changes."""
+    clock = ManualClock()
+    cache, _ = _interpretation_cache(clock)
+    material = _material(_source(), _transcript("Original transcript text."))
+    changed_material = InterpretationMaterial(
+        source_title=(changed_value if changed_field == "source_title" else material.source_title),
+        source_description=(
+            changed_value if changed_field == "source_description" else material.source_description
+        ),
+        transcript=Transcript(
+            text=(
+                changed_value if changed_field == "transcript_text" else material.transcript.text
+            ),
+            language=(
+                changed_value
+                if changed_field == "transcript_language"
+                else material.transcript.language
+            ),
+            method=material.transcript.method,
+        ),
+    )
+    provider = _FakeProvider(
+        [
+            _response(("Original material", 2001)),
+            _response(("Changed material", 2002)),
+        ]
+    )
+    service = _service(provider, cache=cache)
+
+    try:
+        first = await service.interpret(material)
+        changed = await service.interpret(changed_material)
+        original_again = await service.interpret(material)
+
+        assert first.screen_works.movies == [MovieMention(title="Original material", year=2001)]
+        assert changed.screen_works.movies == [MovieMention(title="Changed material", year=2002)]
+        assert original_again == first
+        assert len(provider.calls) == 2
+    finally:
+        await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    "changed_configuration",
+    ["provider", "model", "prompt_version", "schema_version"],
+)
+async def test_interpretation_cache_identity_versions_configuration(
+    changed_configuration: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Create distinct entries for each interpretation configuration dimension."""
+    clock = ManualClock()
+    cache, redis = _interpretation_cache(clock)
+    material = _material(_source(), _transcript("Configuration cache test."))
+    original_provider = _FakeProvider([_response(("Original configuration", 2001))])
+    original_service = _service(original_provider, cache=cache)
+    original_entry = _interpretation_entry_for(original_service, material)
+    original_key = cache._cache_key(original_entry)
+    changed_provider = _FakeProvider([_response(("Changed configuration", 2002))])
+
+    if changed_configuration == "provider":
+        changed_provider.provider_name = LLMProvider.OPENAI
+    elif changed_configuration == "model":
+        changed_provider.model_name = "changed-model"
+    elif changed_configuration == "prompt_version":
+        monkeypatch.setattr(
+            interpretation_service_module,
+            "_INTERPRETATION_PROMPT_VERSION",
+            "mention-interpretation-prompt-v2",
+        )
+    else:
+        monkeypatch.setattr(
+            interpretation_service_module,
+            "_INTERPRETATION_SCHEMA_VERSION",
+            "mention-interpretation-schema-v2",
+        )
+
+    changed_service = _service(changed_provider, cache=cache)
+    changed_entry = _interpretation_entry_for(changed_service, material)
+    changed_key = cache._cache_key(changed_entry)
+
+    try:
+        first = await original_service.interpret(material)
+        changed = await changed_service.interpret(material)
+        original_again = await original_service.interpret(material)
+
+        assert first.screen_works.movies == [
+            MovieMention(title="Original configuration", year=2001)
+        ]
+        assert changed.screen_works.movies == [
+            MovieMention(title="Changed configuration", year=2002)
+        ]
+        assert original_again == first
+        assert original_key != changed_key
+        assert redis.raw_value(original_key) is not None
+        assert redis.raw_value(changed_key) is not None
+        assert len(original_provider.calls) == 1
+        assert len(changed_provider.calls) == 1
+    finally:
+        await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    ("invalid_value", "value_version"),
+    [
+        (
+            {
+                "movies": [],
+                "tv_series": [],
+                "tracks": [],
+                "music_releases": [],
+                "books": [],
+                "provider_only": "unexpected",
+            },
+            None,
+        ),
+        (
+            {
+                "movies": [],
+                "tv_series": [],
+                "tracks": [],
+                "music_releases": [],
+            },
+            None,
+        ),
+        (
+            {
+                "movies": [{"title": "", "year": 2021}],
+                "tv_series": [],
+                "tracks": [],
+                "music_releases": [],
+                "books": [],
+            },
+            None,
+        ),
+        (
+            {
+                "movies": [],
+                "tv_series": [],
+                "tracks": [
+                    {
+                        "track_title": "Track",
+                        "artists": [],
+                        "release_title": None,
+                        "release_year": None,
+                    }
+                ],
+                "music_releases": [],
+                "books": [],
+            },
+            None,
+        ),
+        (
+            {
+                "movies": [],
+                "tv_series": [],
+                "tracks": [],
+                "music_releases": [],
+                "books": [{"title": "Book", "authors": [1]}],
+            },
+            None,
+        ),
+        (
+            {
+                "movies": [],
+                "tv_series": [],
+                "tracks": [],
+                "music_releases": [],
+                "books": [],
+            },
+            "mention-interpretation-schema-v0",
+        ),
+    ],
+    ids=[
+        "extra_field",
+        "missing_field",
+        "invalid_screen_work",
+        "invalid_track",
+        "invalid_book",
+        "incompatible_codec_version",
+    ],
+)
+async def test_invalid_interpretation_cache_values_are_healed(
+    invalid_value: dict[str, object],
+    value_version: str | None,
+) -> None:
+    """Treat malformed cached Mention payloads as misses before replacing them."""
+    clock = ManualClock()
+    cache, redis = _interpretation_cache(clock)
+    material = _material(_source(), _transcript("Corrupt cache recovery test."))
+    provider = _FakeProvider([_response(("Healed mention", 2001))])
+    service = _service(provider, cache=cache)
+    entry = _interpretation_entry_for(service, material)
+    cache_key = cache._cache_key(entry)
+    await redis.put_raw(
+        cache_key,
+        _interpretation_envelope(
+            invalid_value,
+            entry.codec.version if value_version is None else value_version,
+        ),
+    )
+
+    try:
+        first = await service.interpret(material)
+        second = await service.interpret(material)
+
+        assert first.screen_works.movies == [MovieMention(title="Healed mention", year=2001)]
+        assert second == first
+        assert second is not first
+        assert len(provider.calls) == 1
+        assert _stored_envelope(redis, cache_key)["value"] == {
+            "movies": [{"title": "Healed mention", "year": 2001}],
+            "tv_series": [],
+            "tracks": [],
+            "music_releases": [],
+            "books": [],
+        }
+    finally:
+        await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    ["provider", "timeout", "malformed_json", "strict_validation"],
+)
+async def test_interpretation_failures_are_not_cached(failure_kind: str) -> None:
+    """Propagate the first typed failure and reuse only the successful retry."""
+    clock = ManualClock()
+    cache, _ = _interpretation_cache(clock)
+    material = _material(_source(), _transcript("Interpretation retry test."))
+    success = _response(("Recovered mention", 2001))
+
+    if failure_kind == "provider":
+        provider_error: MentionInterpretationError | PipelineTimeoutError | None = (
+            MentionInterpretationError("provider failure")
+        )
+        provider = _FakeProvider([success], error=provider_error)
+    elif failure_kind == "timeout":
+        provider_error = PipelineTimeoutError("provider timeout")
+        provider = _FakeProvider([success], error=provider_error)
+    elif failure_kind == "malformed_json":
+        provider_error = None
+        provider = _FakeProvider(["not JSON", success])
+    else:
+        provider_error = None
+        provider = _FakeProvider(
+            [
+                json.dumps(
+                    {
+                        "movies": [],
+                        "tv_series": [],
+                        "tracks": [],
+                        "music_releases": [],
+                    }
+                ),
+                success,
+            ]
+        )
+    service = _service(provider, cache=cache)
+
+    try:
+        if provider_error is not None:
+            with pytest.raises(type(provider_error)) as error:
+                await service.interpret(material)
+            assert error.value is provider_error
+            provider.error = None
+        else:
+            with pytest.raises(InvalidLLMResponseError):
+                await service.interpret(material)
+
+        recovered = await service.interpret(material)
+        cached = await service.interpret(material)
+
+        assert recovered.screen_works.movies == [MovieMention(title="Recovered mention", year=2001)]
+        assert cached == recovered
+        assert cached is not recovered
+        assert len(provider.calls) == 2
+    finally:
+        await cache.aclose()
+
+
+@pytest.mark.parametrize("operation", ["read", "lease_acquire"])
+@pytest.mark.parametrize(
+    "provider_error",
+    [
+        MentionInterpretationError("provider failure"),
+        PipelineTimeoutError("provider timeout"),
+    ],
+)
+async def test_interpretation_cache_failures_preserve_typed_loader_errors(
+    operation: str,
+    provider_error: MentionInterpretationError | PipelineTimeoutError,
+) -> None:
+    """Keep typed provider failures when cache reads or leases fail open."""
+    clock = ManualClock()
+    cache, redis = _interpretation_cache(clock)
+    material = _material(_source(), _transcript("Cache outage test."))
+    provider = _FakeProvider(error=provider_error)
+    service = _service(provider, cache=cache)
+    redis.fail_operations.add(operation)
+
+    try:
+        with pytest.raises(type(provider_error)) as error:
+            await service.interpret(material)
+
+        assert error.value is provider_error
+        assert len(provider.calls) == 1
+    finally:
+        await cache.aclose()
+
+
+async def test_interpretation_cache_write_failure_returns_valid_mentions() -> None:
+    """Return validated Mentions when cache ownership writes fail open."""
+    clock = ManualClock()
+    cache, redis = _interpretation_cache(clock)
+    material = _material(_source(), _transcript("Cache write outage test."))
+    provider = _FakeProvider([_response(("Write failure mention", 2001))])
+    service = _service(provider, cache=cache)
+    entry = _interpretation_entry_for(service, material)
+    redis.fail_operations.add("ownership_write")
+
+    try:
+        mentions = await service.interpret(material)
+
+        assert mentions.screen_works.movies == [
+            MovieMention(title="Write failure mention", year=2001)
+        ]
+        assert len(provider.calls) == 1
+        assert redis.raw_value(cache._cache_key(entry)) is None
+    finally:
+        await cache.aclose()
+
+
+@pytest.mark.parametrize(
+    ("source", "transcript", "setting_overrides"),
+    [
+        (_source(title="123456"), _transcript("text"), {"max_source_title_chars": 5}),
+        (
+            _source(description="123456"),
+            _transcript("text"),
+            {"max_description_chars": 5},
+        ),
+        (
+            _source(),
+            _transcript("text", language="abcdef"),
+            {"max_transcript_language_chars": 5},
+        ),
+        (_source(), _transcript("123456"), {"max_transcript_chars": 5}),
+    ],
+    ids=["source_title", "source_description", "transcript_language", "transcript"],
+)
+async def test_oversized_material_never_uses_the_interpretation_cache(
+    source: Source,
+    transcript: Transcript,
+    setting_overrides: dict[str, int],
+) -> None:
+    """Reject oversized Material before every cache or provider operation."""
+    clock = ManualClock()
+    cache, redis = _interpretation_cache(clock)
+    provider = _FakeProvider([_response()])
+    service = _service(provider, _settings(**setting_overrides), cache)
+
+    try:
+        with pytest.raises(InterpretationInputTooLargeError):
+            await service.interpret(_material(source, transcript))
+
+        assert provider.calls == []
+        assert redis.command_calls == []
+        assert redis.keys == ()
+    finally:
+        await cache.aclose()
+
+
+async def test_text_submission_never_reads_or_writes_interpretation_entries() -> None:
+    """Keep direct transcript submissions isolated from video-derived cache entries."""
+    clock = ManualClock()
+    cache, redis = _interpretation_cache(clock)
+    source = _source(
+        title="Shared source title",
+        description="Shared source description",
+    )
+    video_material = _material(source, _transcript("Shared transcript text."))
+    submitted_material = InterpretationMaterial(
+        source_title=video_material.source_title,
+        source_description=video_material.source_description,
+        transcript=Transcript(
+            text=video_material.transcript.text,
+            language=video_material.transcript.language,
+            method=TranscriptMethod.TEXT_SUBMISSION,
+        ),
+    )
+    provider = _FakeProvider(
+        [
+            _response(("Video mention", 2001)),
+            _response(("First submitted mention", 2002)),
+            _response(("Second submitted mention", 2003)),
+        ]
+    )
+    service = _service(provider, cache=cache)
+    video_entry = _interpretation_entry_for(service, video_material)
+    video_key = cache._cache_key(video_entry)
+
+    try:
+        video_mentions = await service.interpret(video_material)
+        cache_commands_after_warm = list(redis.command_calls)
+        first_submitted = await service.interpret(submitted_material)
+        second_submitted = await service.interpret(submitted_material)
+
+        assert video_mentions.screen_works.movies == [
+            MovieMention(title="Video mention", year=2001)
+        ]
+        assert first_submitted.screen_works.movies == [
+            MovieMention(title="First submitted mention", year=2002)
+        ]
+        assert second_submitted.screen_works.movies == [
+            MovieMention(title="Second submitted mention", year=2003)
+        ]
+        assert len(provider.calls) == 3
+        assert redis.command_calls == cache_commands_after_warm
+        assert redis.keys == (video_key,)
+    finally:
+        await cache.aclose()
 
 
 def test_deepseek_provider_constructor_uses_configured_client_options(
