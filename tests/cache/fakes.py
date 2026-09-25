@@ -4,6 +4,7 @@ import asyncio
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 
 from redis.exceptions import RedisError
 
@@ -107,10 +108,12 @@ class FakeRedis:
         self._clock = clock
         self._values: dict[str, _StoredValue] = {}
         self._pttl_overrides: dict[str, int] = {}
+        self._scan_snapshots: dict[str, tuple[tuple[str, ...], ...]] = {}
         self.fail_operations: set[str] = set()
         self.command_calls: list[str] = []
         self._blocks: dict[str, asyncio.Event] = {}
         self._started: dict[str, asyncio.Event] = {}
+        self.empty_scan_page_indexes: set[int] = set()
         self.close_calls = 0
 
     @property
@@ -192,6 +195,76 @@ class FakeRedis:
             self._expiry_from_arguments(ex=ex, px=px),
         )
         return True
+
+    async def scan(
+        self,
+        cursor: int,
+        match: str | None = None,
+        count: int | None = None,
+    ) -> tuple[int, tuple[str, ...]]:
+        """Return one snapshot-backed cursor page matching a Redis glob.
+
+        Args:
+            cursor: Opaque page cursor returned by the preceding scan.
+            match: Optional Redis glob pattern limiting returned keys.
+            count: Positive page-size hint.
+
+        Returns:
+            Next cursor and immutable page of raw Redis keys.
+
+        Raises:
+            RedisError: If scan failure injection is enabled.
+            ValueError: If cursor or count is invalid.
+        """
+        await self._before("scan")
+        self._discard_expired()
+        if cursor < 0:
+            raise ValueError("Redis scan cursor cannot be negative")
+        if count is not None and count <= 0:
+            raise ValueError("Redis scan count must be positive")
+        pattern = match or "*"
+        if cursor == 0:
+            page_size = count or max(len(self._values), 1)
+            matching_keys = tuple(key for key in self._values if fnmatchcase(key, pattern))
+            snapshot_pages: list[tuple[str, ...]] = []
+            for page_index, start in enumerate(range(0, len(matching_keys), page_size)):
+                if page_index in self.empty_scan_page_indexes:
+                    snapshot_pages.append(())
+                snapshot_pages.append(matching_keys[start : start + page_size])
+            self._scan_snapshots[pattern] = tuple(snapshot_pages) or ((),)
+        pages = self._scan_snapshots.get(pattern)
+        if pages is None or cursor >= len(pages):
+            raise ValueError("Redis scan cursor is not active")
+        keys = pages[cursor]
+        next_cursor = cursor + 1
+        if next_cursor == len(pages):
+            self._scan_snapshots.pop(pattern, None)
+            return 0, keys
+        return next_cursor, keys
+
+    async def unlink(self, *names: bytes | str) -> int:
+        """Delete unexpired supplied keys and return Redis-compatible delete count.
+
+        Args:
+            names: Raw byte or text Redis keys to remove.
+
+        Returns:
+            Number of keys that existed at deletion time.
+
+        Raises:
+            RedisError: If unlink failure injection is enabled.
+        """
+        await self._before("unlink")
+        self._discard_expired()
+        deleted_count = 0
+        for name in names:
+            key = name.decode() if isinstance(name, bytes) else name
+            if key not in self._values:
+                continue
+            del self._values[key]
+            self._pttl_overrides.pop(key, None)
+            deleted_count += 1
+        return deleted_count
 
     def register_script(
         self,

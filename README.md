@@ -123,6 +123,18 @@ Failures use a stable response shape:
 
 Common failures are invalid or unsupported URLs (`400`), unavailable sources (`404`), duration limits (`413`), provider failures (`502`), and provider timeouts (`504`).
 
+## Shared-cache operations
+
+Provision one dedicated 512 MiB Redis-compatible primary per environment with `maxmemory-policy allkeys-lfu`, `save ""`, and `appendonly no`.
+
+Run provider cleanup only through the CLI:
+
+```bash
+uv run reelio-cache-purge \
+  --provider <spotify|tmdb|open-library|source> \
+  --environment <local|staging|production>
+```
+
 ## Development
 
 Install the development dependency group with `uv sync`, then run:
