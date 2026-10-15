@@ -54,6 +54,7 @@ from reelio.extraction.services.transcription.config import (
 from reelio.extraction.services.transcription.inspection import YtDlpMetadataExtractor
 from reelio.extraction.services.transcription.service import (
     CachedTranscriptionService,
+    LocalSourceTranscriptProvider,
     SourceMetadataService,
     TranscriptionService,
 )
@@ -110,6 +111,10 @@ async def _create_production_pipeline(
             acquirer=uncached_transcription_service,
             cache=cache,
         )
+        source_transcript_provider = LocalSourceTranscriptProvider(
+            source_metadata_inspector=source_metadata_service,
+            transcript_acquirer=transcription_service,
+        )
         interpretation_service = MentionInterpretationService(
             provider=llm_provider,
             settings=interpretation_settings,
@@ -127,8 +132,7 @@ async def _create_production_pipeline(
             book_resolver,
         )
         pipeline = ExtractionPipeline(
-            source_metadata_service=source_metadata_service,
-            transcription_service=transcription_service,
+            source_transcript_provider=source_transcript_provider,
             interpretation_service=interpretation_service,
             result_aggregator=result_aggregator,
             default_market=default_market,

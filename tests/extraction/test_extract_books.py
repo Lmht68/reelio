@@ -23,8 +23,6 @@ from reelio.extraction.services.interpretation.config import (
 )
 from reelio.extraction.services.interpretation.service import MentionInterpretationService
 from reelio.extraction.services.interpretation.types import LLMMessage
-from reelio.extraction.services.transcription.inspection import PreparedAudio
-from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import Platform, Source, Transcript, TranscriptMethod
 from reelio.main import app
 from tests.extraction.fakes import FakeMusicResolver, FakeScreenWorkResolver
@@ -49,14 +47,19 @@ def clear_dependency_overrides() -> Iterator[None]:
     app.dependency_overrides.clear()
 
 
-class _MetadataService:
-    """Return deterministic inspected Source metadata for endpoint coverage."""
+class _SourceTranscriptProvider:
+    """Return deterministic Source and Transcript material for endpoint coverage."""
 
-    async def inspect(self, submitted_url: str) -> InspectedSource:
-        """Return a canonical Source for the submitted endpoint URL."""
+    def __init__(self, text: str, language: str) -> None:
+        """Initialize deterministic Transcript material for one request."""
+        self._text = text
+        self._language = language
+
+    async def acquire(self, submitted_url: str) -> tuple[Source, Transcript]:
+        """Return canonical material for the submitted endpoint URL."""
         assert submitted_url == _CANONICAL_URL
-        return InspectedSource(
-            source=Source(
+        return (
+            Source(
                 platform=Platform.YOUTUBE,
                 video_id="dQw4w9WgXcQ",
                 url=submitted_url,
@@ -64,31 +67,12 @@ class _MetadataService:
                 description="A review of Pride and Prejudice.",
                 channel="Example channel",
                 duration_seconds=42,
-            )
-        )
-
-
-class _TranscriptionService:
-    """Return deterministic transcript material for endpoint coverage."""
-
-    def __init__(self, text: str, language: str) -> None:
-        """Initialize deterministic transcript material for one request."""
-        self._text = text
-        self._language = language
-
-    async def acquire(
-        self,
-        source: Source,
-        submitted_url: str,
-        prepared_audio: PreparedAudio | None = None,
-    ) -> Transcript:
-        """Return the transcript consumed by deterministic interpretation."""
-        assert source.url == submitted_url
-        assert prepared_audio is None
-        return Transcript(
-            text=self._text,
-            language=self._language,
-            method=TranscriptMethod.YOUTUBE_CAPTIONS,
+            ),
+            Transcript(
+                text=self._text,
+                language=self._language,
+                method=TranscriptMethod.YOUTUBE_CAPTIONS,
+            ),
         )
 
 
@@ -213,8 +197,7 @@ async def _post_extract(
     )
     interpretation_provider = _InterpretationProvider(interpretation_response)
     pipeline = ExtractionPipeline(
-        _MetadataService(),
-        _TranscriptionService(transcript_text, transcript_language),
+        _SourceTranscriptProvider(transcript_text, transcript_language),
         MentionInterpretationService(
             interpretation_provider,
             _interpretation_settings(),

@@ -23,6 +23,7 @@ from reelio.extraction.exceptions import (
     TranscriptionError,
     UnsupportedPlatformError,
 )
+from reelio.extraction.service import SourceTranscriptProvider
 from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.types import (
     Platform,
@@ -353,6 +354,65 @@ class InspectedSource:
         """Delete temporary audio created while inspecting the Source."""
         if self.prepared_audio is not None:
             self.prepared_audio.cleanup()
+
+
+class _SourceMetadataInspector(Protocol):
+    """Inspect one submitted URL into a Source and request-scoped resources."""
+
+    async def inspect(self, submitted_url: str) -> InspectedSource:
+        """Return validated Source metadata and temporary inspection resources."""
+        ...
+
+
+class _TranscriptAcquirer(Protocol):
+    """Acquire a Transcript for one validated Source."""
+
+    async def acquire(
+        self,
+        source: Source,
+        submitted_url: str,
+        prepared_audio: inspection.PreparedAudio | None = None,
+    ) -> Transcript:
+        """Return a normalized Transcript using the validated submitted URL."""
+        ...
+
+
+class LocalSourceTranscriptProvider(SourceTranscriptProvider):
+    """Acquire Sources and Transcripts through the local media implementation."""
+
+    def __init__(
+        self,
+        source_metadata_inspector: _SourceMetadataInspector,
+        transcript_acquirer: _TranscriptAcquirer,
+    ) -> None:
+        """Initialize the adapter around local Source and Transcript collaborators.
+
+        Args:
+            source_metadata_inspector: Local Source inspection collaborator.
+            transcript_acquirer: Local Transcript acquisition collaborator.
+        """
+        self._source_metadata_inspector = source_metadata_inspector
+        self._transcript_acquirer = transcript_acquirer
+
+    async def acquire(self, submitted_url: str) -> tuple[Source, Transcript]:
+        """Return a normalized Source and Transcript for one submitted URL.
+
+        Args:
+            submitted_url: URL submitted by the API caller.
+
+        Returns:
+            The normalized Source and acquired Transcript.
+        """
+        inspected_source = await self._source_metadata_inspector.inspect(submitted_url)
+        try:
+            transcript = await self._transcript_acquirer.acquire(
+                inspected_source.source,
+                submitted_url,
+                inspected_source.prepared_audio,
+            )
+        finally:
+            inspected_source.cleanup()
+        return inspected_source.source, transcript
 
 
 @dataclass(slots=True)
@@ -750,23 +810,10 @@ class TranscriptionService:
             raise TranscriptionError(_TRANSCRIPT_UNAVAILABLE_MESSAGE) from exc
 
 
-class _UncachedTranscriptAcquirer(Protocol):
-    """Define the uncached Transcript acquisition contract."""
-
-    async def acquire(
-        self,
-        source: Source,
-        submitted_url: str,
-        prepared_audio: inspection.PreparedAudio | None = None,
-    ) -> Transcript:
-        """Acquire one normalized Transcript for a validated Source."""
-        ...
-
-
 class CachedTranscriptionService:
     """Reuse successful video-derived Transcripts by authoritative Source identity."""
 
-    def __init__(self, acquirer: _UncachedTranscriptAcquirer, cache: AsyncCache) -> None:
+    def __init__(self, acquirer: _TranscriptAcquirer, cache: AsyncCache) -> None:
         """Initialize a cached wrapper around one uncached acquirer.
 
         Args:

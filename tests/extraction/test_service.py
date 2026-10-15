@@ -1,12 +1,7 @@
 """Pipeline orchestration contract tests."""
 
-import logging
-import shutil
-from pathlib import Path
-
 import pytest
 
-import reelio.extraction.services.transcription.inspection as transcription_inspection
 from reelio.extraction.exceptions import (
     DurationLimitExceededError,
     EnrichmentError,
@@ -17,8 +12,6 @@ from reelio.extraction.exceptions import (
 )
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.service import ExtractionPipeline
-from reelio.extraction.services.transcription.inspection import PreparedAudio
-from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
     BookMentions,
     BookResults,
@@ -49,69 +42,50 @@ _VIDEO_ID = "dQw4w9WgXcQ"
 _CANONICAL_URL = f"https://www.youtube.com/watch?v={_VIDEO_ID}"
 
 
-class _FakeSourceMetadataService:
+class _FakeSourceTranscriptProvider:
     def __init__(
         self,
-        source: Source | None = None,
-        error: Exception | None = None,
-        prepared_audio: PreparedAudio | None = None,
-        call_order: list[str] | None = None,
-    ) -> None:
-        self.source = source
-        self.prepared_audio = prepared_audio
-        self.error = error
-        self.call_order = call_order
-        self.calls: list[str] = []
-
-    async def inspect(self, submitted_url: str) -> InspectedSource:
-        self.calls.append(submitted_url)
-        if self.call_order is not None:
-            self.call_order.append("source_inspection")
-        if self.error is not None:
-            raise self.error
-        assert self.source is not None
-        return InspectedSource(self.source, self.prepared_audio)
-
-
-class _FakeTranscriptionService:
-    def __init__(
-        self,
+        source: Source,
         transcript: Transcript,
         error: Exception | None = None,
         call_order: list[str] | None = None,
     ) -> None:
+        self.source = source
         self.transcript = transcript
         self.error = error
         self.call_order = call_order
-        self.calls: list[tuple[Source, str]] = []
+        self.calls: list[str] = []
 
-    async def acquire(
-        self,
-        source: Source,
-        submitted_url: str,
-        prepared_audio: object | None = None,
-    ) -> Transcript:
-        self.calls.append((source, submitted_url))
+    async def acquire(self, submitted_url: str) -> tuple[Source, Transcript]:
+        self.calls.append(submitted_url)
         if self.call_order is not None:
-            self.call_order.append("transcript_acquisition")
+            self.call_order.append("source_transcript_acquisition")
         if self.error is not None:
             raise self.error
-        return self.transcript
+        return self.source, self.transcript
+
+
+class _OrderedInterpretationService(_FakeInterpretationService):
+    def __init__(self, call_order: list[str]) -> None:
+        super().__init__()
+        self._call_order = call_order
+
+    async def interpret(self, material: InterpretationMaterial) -> ExtractionMentions:
+        self._call_order.append("interpretation")
+        return await super().interpret(material)
 
 
 _DEFAULT_MARKET = SpotifyMarket("US")
 
 
 def _pipeline(
-    metadata_service: _FakeSourceMetadataService,
-    transcription_service: _FakeTranscriptionService,
+    source_transcript_provider: _FakeSourceTranscriptProvider,
     interpretation_service: _FakeInterpretationService | None = None,
     result_aggregator: _FakeResultAggregator | None = None,
     default_market: SpotifyMarket = _DEFAULT_MARKET,
 ) -> ExtractionPipeline:
     return ExtractionPipeline(
-        metadata_service,
-        transcription_service,
+        source_transcript_provider,
         interpretation_service or _FakeInterpretationService(),
         result_aggregator or _FakeResultAggregator(),
         default_market,
@@ -138,23 +112,32 @@ def _transcript() -> Transcript:
     )
 
 
-async def test_pipeline_inspects_source_before_acquiring_transcript() -> None:
-    """Inspect one Source before acquiring one Transcript for its submitted URL."""
+async def test_pipeline_acquires_source_and_transcript_before_interpretation() -> None:
+    """Acquire complete material once before invoking interpretation."""
     call_order: list[str] = []
     source = _source()
     transcript = _transcript()
-    metadata_service = _FakeSourceMetadataService(source, call_order=call_order)
-    transcription_service = _FakeTranscriptionService(
+    source_transcript_provider = _FakeSourceTranscriptProvider(
+        source,
         transcript,
         call_order=call_order,
     )
-    pipeline = _pipeline(metadata_service, transcription_service)
+    interpretation_service = _OrderedInterpretationService(call_order)
+    pipeline = _pipeline(source_transcript_provider, interpretation_service)
 
-    await pipeline.run(_CANONICAL_URL)
+    result = await pipeline.run(_CANONICAL_URL)
 
-    assert metadata_service.calls == [_CANONICAL_URL]
-    assert transcription_service.calls == [(source, _CANONICAL_URL)]
-    assert call_order == ["source_inspection", "transcript_acquisition"]
+    assert result.source is source
+    assert result.transcript is transcript
+    assert source_transcript_provider.calls == [_CANONICAL_URL]
+    assert interpretation_service.calls == [
+        InterpretationMaterial(
+            source_title=source.title,
+            source_description=source.description,
+            transcript=transcript,
+        )
+    ]
+    assert call_order == ["source_transcript_acquisition", "interpretation"]
 
 
 async def test_pipeline_runs_submitted_transcript_without_source_stages() -> None:
@@ -174,13 +157,14 @@ async def test_pipeline_runs_submitted_transcript_without_source_stages() -> Non
         music=MusicResults(tracks=[], music_releases=[]),
         books=BookResults(books=[]),
     )
-    metadata_service = _FakeSourceMetadataService(_source())
-    transcription_service = _FakeTranscriptionService(_transcript())
+    source_transcript_provider = _FakeSourceTranscriptProvider(
+        _source(),
+        _transcript(),
+    )
     interpretation_service = _FakeInterpretationService(mentions)
     result_aggregator = _FakeResultAggregator(results=results)
     pipeline = _pipeline(
-        metadata_service,
-        transcription_service,
+        source_transcript_provider,
         interpretation_service,
         result_aggregator,
     )
@@ -196,8 +180,7 @@ async def test_pipeline_runs_submitted_transcript_without_source_stages() -> Non
     assert result.transcript == expected_transcript
     assert result.market == _DEFAULT_MARKET
     assert result.results is results
-    assert metadata_service.calls == []
-    assert transcription_service.calls == []
+    assert source_transcript_provider.calls == []
     assert interpretation_service.calls == [
         InterpretationMaterial(
             source_title="",
@@ -213,8 +196,7 @@ async def test_pipeline_returns_empty_grouped_results_and_aggregates_once() -> N
     """Pass empty generalized mentions to aggregation once and retain empty results."""
     source = _source()
     transcript = _transcript()
-    metadata_service = _FakeSourceMetadataService(source)
-    transcription_service = _FakeTranscriptionService(transcript)
+    source_transcript_provider = _FakeSourceTranscriptProvider(source, transcript)
     screen_work_mentions = ScreenWorkMentions(movies=[], tv_series=[])
     extraction_mentions = ExtractionMentions(
         screen_works=screen_work_mentions,
@@ -224,8 +206,7 @@ async def test_pipeline_returns_empty_grouped_results_and_aggregates_once() -> N
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator()
     pipeline = _pipeline(
-        metadata_service,
-        transcription_service,
+        source_transcript_provider,
         interpretation_service,
         result_aggregator,
     )
@@ -234,8 +215,7 @@ async def test_pipeline_returns_empty_grouped_results_and_aggregates_once() -> N
 
     assert result.source is source
     assert result.transcript is transcript
-    assert metadata_service.calls == [_CANONICAL_URL]
-    assert transcription_service.calls == [(source, _CANONICAL_URL)]
+    assert source_transcript_provider.calls == [_CANONICAL_URL]
     assert interpretation_service.calls == [
         InterpretationMaterial(
             source_title=source.title,
@@ -274,8 +254,7 @@ async def test_pipeline_returns_ordered_movie_results_unchanged() -> None:
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator(results=extraction_results)
     pipeline = _pipeline(
-        _FakeSourceMetadataService(_source()),
-        _FakeTranscriptionService(_transcript()),
+        _FakeSourceTranscriptProvider(_source(), _transcript()),
         interpretation_service,
         result_aggregator,
     )
@@ -305,8 +284,7 @@ async def test_pipeline_returns_tv_only_results_from_aggregator() -> None:
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator()
     pipeline = _pipeline(
-        _FakeSourceMetadataService(_source()),
-        _FakeTranscriptionService(_transcript()),
+        _FakeSourceTranscriptProvider(_source(), _transcript()),
         interpretation_service,
         result_aggregator,
     )
@@ -354,8 +332,7 @@ async def test_pipeline_groups_mixed_interpretation_results() -> None:
     interpretation_service = _FakeInterpretationService(extraction_mentions)
     result_aggregator = _FakeResultAggregator(results=extraction_results)
     pipeline = _pipeline(
-        _FakeSourceMetadataService(_source()),
-        _FakeTranscriptionService(_transcript()),
+        _FakeSourceTranscriptProvider(_source(), _transcript()),
         interpretation_service,
         result_aggregator,
     )
@@ -375,10 +352,7 @@ async def test_pipeline_preserves_whisper_transcript_method() -> None:
         language="en",
         method=TranscriptMethod.WHISPER,
     )
-    pipeline = _pipeline(
-        _FakeSourceMetadataService(_source()),
-        _FakeTranscriptionService(transcript),
-    )
+    pipeline = _pipeline(_FakeSourceTranscriptProvider(_source(), transcript))
 
     result = await pipeline.run(_CANONICAL_URL)
 
@@ -402,61 +376,42 @@ async def test_pipeline_is_platform_agnostic_for_social_whisper_sources() -> Non
         language="en",
         method=TranscriptMethod.WHISPER,
     )
-    metadata_service = _FakeSourceMetadataService(source)
-    transcription_service = _FakeTranscriptionService(transcript)
-    pipeline = _pipeline(metadata_service, transcription_service)
+    source_transcript_provider = _FakeSourceTranscriptProvider(source, transcript)
+    pipeline = _pipeline(source_transcript_provider)
 
     result = await pipeline.run(source.url)
 
     assert result.source is source
     assert result.transcript is transcript
-    assert metadata_service.calls == [source.url]
-    assert transcription_service.calls == [(source, source.url)]
+    assert source_transcript_provider.calls == [source.url]
 
 
 @pytest.mark.parametrize(
-    "source_error",
+    "provider_error",
     [
         InvalidSourceError("invalid source"),
         SourceUnavailableError("source unavailable"),
         DurationLimitExceededError("duration limit exceeded"),
-    ],
-)
-async def test_pipeline_does_not_acquire_transcript_after_source_rejection(
-    source_error: Exception,
-) -> None:
-    """Stop before transcription when Source inspection rejects the input."""
-    metadata_service = _FakeSourceMetadataService(error=source_error)
-    transcription_service = _FakeTranscriptionService(_transcript())
-    pipeline = _pipeline(metadata_service, transcription_service)
-
-    with pytest.raises(type(source_error)) as error:
-        await pipeline.run(_CANONICAL_URL)
-
-    assert error.value is source_error
-    assert transcription_service.calls == []
-
-
-@pytest.mark.parametrize(
-    "transcription_error",
-    [
         TranscriptionError("Transcript is unavailable for this video."),
         PipelineTimeoutError("Transcript acquisition timed out."),
     ],
 )
-async def test_pipeline_propagates_transcription_errors_unchanged(
-    transcription_error: Exception,
+async def test_pipeline_propagates_provider_errors_unchanged(
+    provider_error: Exception,
 ) -> None:
-    """Propagate transcription domain errors without HTTP-layer translation."""
-    metadata_service = _FakeSourceMetadataService(_source())
-    transcription_service = _FakeTranscriptionService(_transcript(), error=transcription_error)
-    pipeline = _pipeline(metadata_service, transcription_service)
+    """Propagate Source-and-Transcript provider errors without translation."""
+    source_transcript_provider = _FakeSourceTranscriptProvider(
+        _source(),
+        _transcript(),
+        error=provider_error,
+    )
+    pipeline = _pipeline(source_transcript_provider)
 
-    with pytest.raises(type(transcription_error)) as error:
+    with pytest.raises(type(provider_error)) as error:
         await pipeline.run(_CANONICAL_URL)
 
-    assert error.value is transcription_error
-    assert transcription_service.calls == [(_source(), _CANONICAL_URL)]
+    assert error.value is provider_error
+    assert source_transcript_provider.calls == [_CANONICAL_URL]
 
 
 async def test_pipeline_propagates_aggregation_errors_unchanged() -> None:
@@ -473,8 +428,7 @@ async def test_pipeline_propagates_aggregation_errors_unchanged() -> None:
     )
     result_aggregator = _FakeResultAggregator(error=aggregation_error)
     pipeline = _pipeline(
-        _FakeSourceMetadataService(_source()),
-        _FakeTranscriptionService(_transcript()),
+        _FakeSourceTranscriptProvider(_source(), _transcript()),
         _FakeInterpretationService(extraction_mentions),
         result_aggregator,
     )
@@ -491,8 +445,7 @@ async def test_pipeline_closes_interpretation_and_aggregation_modules() -> None:
     interpretation_service = _FakeInterpretationService()
     result_aggregator = _FakeResultAggregator()
     pipeline = _pipeline(
-        _FakeSourceMetadataService(_source()),
-        _FakeTranscriptionService(_transcript()),
+        _FakeSourceTranscriptProvider(_source(), _transcript()),
         interpretation_service,
         result_aggregator,
     )
@@ -512,8 +465,7 @@ async def test_pipeline_closes_aggregation_when_interpretation_close_fails() -> 
     """Close aggregation when the first shutdown operation raises."""
     result_aggregator = _FakeResultAggregator()
     pipeline = _pipeline(
-        _FakeSourceMetadataService(_source()),
-        _FakeTranscriptionService(_transcript()),
+        _FakeSourceTranscriptProvider(_source(), _transcript()),
         _FailingCloseInterpretationService(),
         result_aggregator,
     )
@@ -524,81 +476,13 @@ async def test_pipeline_closes_aggregation_when_interpretation_close_fails() -> 
     assert result_aggregator.closed is True
 
 
-@pytest.mark.parametrize(
-    "transcription_error",
-    [None, TranscriptionError("Transcript is unavailable for this video.")],
-)
-async def test_pipeline_cleans_inspection_audio_after_transcript_stage(
-    tmp_path: Path,
-    transcription_error: TranscriptionError | None,
-) -> None:
-    """Remove inspection media after transcript success and failure."""
-    request_directory = tmp_path / "inspection"
-    request_directory.mkdir()
-    audio_path = request_directory / "audio.m4a"
-    audio_path.write_bytes(b"audio")
-    metadata_service = _FakeSourceMetadataService(
-        _source(),
-        prepared_audio=PreparedAudio(audio_path, request_directory),
-    )
-    transcription_service = _FakeTranscriptionService(
-        _transcript(),
-        error=transcription_error,
-    )
-    pipeline = _pipeline(metadata_service, transcription_service)
-
-    if transcription_error is None:
-        await pipeline.run(_CANONICAL_URL)
-    else:
-        with pytest.raises(TranscriptionError):
-            await pipeline.run(_CANONICAL_URL)
-
-    assert not request_directory.exists()
-
-
-async def test_pipeline_preserves_transcription_error_when_cleanup_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    tmp_path: Path,
-) -> None:
-    """Keep the transcript failure when temporary media cleanup also fails."""
-    request_directory = tmp_path / "inspection"
-    request_directory.mkdir()
-    audio_path = request_directory / "audio.m4a"
-    audio_path.write_bytes(b"audio")
-    transcription_error = TranscriptionError("Transcript is unavailable for this video.")
-    pipeline = _pipeline(
-        _FakeSourceMetadataService(
-            _source(),
-            prepared_audio=PreparedAudio(audio_path, request_directory),
-        ),
-        _FakeTranscriptionService(_transcript(), error=transcription_error),
-    )
-
-    def raise_cleanup_error(path: Path) -> None:
-        raise PermissionError("permission denied")
-
-    monkeypatch.setattr(shutil, "rmtree", raise_cleanup_error)
-
-    with (
-        caplog.at_level(logging.ERROR, logger=transcription_inspection.__name__),
-        pytest.raises(TranscriptionError) as error,
-    ):
-        await pipeline.run(_CANONICAL_URL)
-
-    assert error.value is transcription_error
-    assert request_directory.exists()
-    assert any(record.getMessage() == "temporary media cleanup failed" for record in caplog.records)
-
-
 async def test_pipeline_uses_configured_market_until_the_request_overrides_it() -> None:
     """Expose the configured market unless the API supplies an explicit one."""
     source = _source()
     transcript = _transcript()
     result_aggregator = _FakeResultAggregator()
     pipeline = _pipeline(
-        _FakeSourceMetadataService(source),
-        _FakeTranscriptionService(transcript),
+        _FakeSourceTranscriptProvider(source, transcript),
         result_aggregator=result_aggregator,
         default_market=SpotifyMarket("CA"),
     )

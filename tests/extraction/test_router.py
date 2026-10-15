@@ -51,6 +51,7 @@ from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.services.transcription.inspection import ExtractedMetadata
 from reelio.extraction.services.transcription.service import (
     CachedTranscriptionService,
+    LocalSourceTranscriptProvider,
     SourceMetadataService,
     TranscriptionService,
 )
@@ -133,27 +134,13 @@ _CANONICAL_URL = f"https://www.youtube.com/watch?v={_VIDEO_ID}"
 _DEFAULT_MARKET = SpotifyMarket("US")
 
 
-class _RecordingSourceMetadataService:
+class _RecordingSourceTranscriptProvider:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def inspect(self, submitted_url: str) -> NoReturn:
+    async def acquire(self, submitted_url: str) -> NoReturn:
         self.calls.append(submitted_url)
-        raise AssertionError("submitted transcripts must not inspect a Source")
-
-
-class _RecordingTranscriptionService:
-    def __init__(self) -> None:
-        self.calls: list[tuple[Source, str]] = []
-
-    async def acquire(
-        self,
-        source: Source,
-        submitted_url: str,
-        prepared_audio: object | None = None,
-    ) -> NoReturn:
-        self.calls.append((source, submitted_url))
-        raise AssertionError("submitted transcripts must not acquire media")
+        raise AssertionError("submitted transcripts must not acquire a Source or Transcript")
 
 
 class _RecordingLLMProvider:
@@ -525,16 +512,18 @@ def _pipeline(
     )
 
     return ExtractionPipeline(
-        metadata_service,
-        transcript_service,
-        _FakeInterpretationService(
+        source_transcript_provider=LocalSourceTranscriptProvider(
+            metadata_service,
+            transcript_service,
+        ),
+        interpretation_service=_FakeInterpretationService(
             ExtractionMentions(
                 screen_works=interpreted_screen_works,
                 music=interpreted_music,
                 books=interpreted_books,
             )
         ),
-        _FakeResultAggregator(
+        result_aggregator=_FakeResultAggregator(
             ExtractionResults(
                 screen_works=screen_work_results,
                 music=resolved_music,
@@ -553,8 +542,7 @@ async def test_extract_transcript_interprets_normalized_text_without_source(
 ) -> None:
     """Interpret submitted text, enrich its Mention, and omit a fabricated Source."""
     submitted_text = "Dune: Part One (2021) was excellent."
-    source_metadata_service = _RecordingSourceMetadataService()
-    transcription_service = _RecordingTranscriptionService()
+    source_transcript_provider = _RecordingSourceTranscriptProvider()
     llm_provider = _RecordingLLMProvider(
         json.dumps(
             {
@@ -567,8 +555,7 @@ async def test_extract_transcript_interprets_normalized_text_without_source(
         )
     )
     pipeline = ExtractionPipeline(
-        source_metadata_service,
-        transcription_service,
+        source_transcript_provider,
         MentionInterpretationService(
             llm_provider,
             _interpretation_settings(),
@@ -613,8 +600,7 @@ async def test_extract_transcript_interprets_normalized_text_without_source(
     assert payload.results.tracks == []
     assert payload.results.music_releases == []
     assert payload.results.books == []
-    assert source_metadata_service.calls == []
-    assert transcription_service.calls == []
+    assert source_transcript_provider.calls == []
     assert len(llm_provider.calls) == 1
     assert json.loads(llm_provider.calls[0][1].content) == {
         "source_title": "",
@@ -1375,8 +1361,7 @@ async def test_oversized_submitted_transcript_returns_existing_413_contract(
     client: AsyncClient,
 ) -> None:
     """Keep Interpretation Material size enforcement in the interpretation service."""
-    source_metadata_service = _RecordingSourceMetadataService()
-    transcription_service = _RecordingTranscriptionService()
+    source_transcript_provider = _RecordingSourceTranscriptProvider()
     llm_provider = _RecordingLLMProvider(
         json.dumps(
             {
@@ -1389,8 +1374,7 @@ async def test_oversized_submitted_transcript_returns_existing_413_contract(
         )
     )
     pipeline = ExtractionPipeline(
-        source_metadata_service,
-        transcription_service,
+        source_transcript_provider,
         MentionInterpretationService(
             llm_provider,
             _interpretation_settings(max_transcript_chars=5),
@@ -1412,8 +1396,7 @@ async def test_oversized_submitted_transcript_returns_existing_413_contract(
             "message": "Interpretation Material exceeds the configured limit.",
         }
     }
-    assert source_metadata_service.calls == []
-    assert transcription_service.calls == []
+    assert source_transcript_provider.calls == []
     assert llm_provider.calls == []
 
 
@@ -2501,22 +2484,28 @@ async def test_endpoint_reuses_transcript_across_markets_while_enriching_each_ma
     interpretation_service = _FakeInterpretationService()
     result_aggregator = _FakeResultAggregator()
     pipeline = ExtractionPipeline(
-        SourceMetadataService(
-            extractor=extractor,
-            settings=_settings(),
-            cache=cache,
-        ),
-        CachedTranscriptionService(
-            TranscriptionService(
-                provider=provider,
-                audio_downloader=_AudioDownloader(),
-                transcriber=_FixedWhisperTranscriber(
-                    WhisperResult(text="unused Whisper", language="en", segment_count=1)
-                ),
-                temp_media_dir=tmp_path,
-                semaphore=asyncio.Semaphore(1),
+        LocalSourceTranscriptProvider(
+            SourceMetadataService(
+                extractor=extractor,
+                settings=_settings(),
+                cache=cache,
             ),
-            cache,
+            CachedTranscriptionService(
+                TranscriptionService(
+                    provider=provider,
+                    audio_downloader=_AudioDownloader(),
+                    transcriber=_FixedWhisperTranscriber(
+                        WhisperResult(
+                            text="unused Whisper",
+                            language="en",
+                            segment_count=1,
+                        )
+                    ),
+                    temp_media_dir=tmp_path,
+                    semaphore=asyncio.Semaphore(1),
+                ),
+                cache,
+            ),
         ),
         interpretation_service,
         result_aggregator,
@@ -2590,22 +2579,28 @@ async def test_endpoint_reuses_mention_interpretation_across_effective_markets(
     )
     result_aggregator = _FakeResultAggregator()
     pipeline = ExtractionPipeline(
-        SourceMetadataService(
-            extractor=extractor,
-            settings=_settings(),
-            cache=cache,
-        ),
-        CachedTranscriptionService(
-            TranscriptionService(
-                provider=caption_provider,
-                audio_downloader=_AudioDownloader(),
-                transcriber=_FixedWhisperTranscriber(
-                    WhisperResult(text="unused Whisper", language="en", segment_count=1)
-                ),
-                temp_media_dir=tmp_path,
-                semaphore=asyncio.Semaphore(1),
+        LocalSourceTranscriptProvider(
+            SourceMetadataService(
+                extractor=extractor,
+                settings=_settings(),
+                cache=cache,
             ),
-            cache,
+            CachedTranscriptionService(
+                TranscriptionService(
+                    provider=caption_provider,
+                    audio_downloader=_AudioDownloader(),
+                    transcriber=_FixedWhisperTranscriber(
+                        WhisperResult(
+                            text="unused Whisper",
+                            language="en",
+                            segment_count=1,
+                        )
+                    ),
+                    temp_media_dir=tmp_path,
+                    semaphore=asyncio.Semaphore(1),
+                ),
+                cache,
+            ),
         ),
         interpretation_service,
         result_aggregator,

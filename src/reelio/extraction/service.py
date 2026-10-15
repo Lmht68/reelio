@@ -3,8 +3,6 @@
 from typing import Protocol
 
 from reelio.extraction.market import SpotifyMarket
-from reelio.extraction.services.transcription.inspection import PreparedAudio
-from reelio.extraction.services.transcription.service import InspectedSource
 from reelio.extraction.types import (
     ExtractionMentions,
     ExtractionResults,
@@ -65,24 +63,11 @@ class ExtractionPipelineProtocol(Protocol):
         ...
 
 
-class _SourceMetadataInspector(Protocol):
-    """Inspect one submitted URL into a Source and request-scoped resources."""
+class SourceTranscriptProvider(Protocol):
+    """Acquire a Source and Transcript from one submitted URL."""
 
-    async def inspect(self, submitted_url: str) -> InspectedSource:
-        """Return validated Source metadata and temporary inspection resources."""
-        ...
-
-
-class _TranscriptAcquirer(Protocol):
-    """Acquire a Transcript for one validated Source."""
-
-    async def acquire(
-        self,
-        source: Source,
-        submitted_url: str,
-        prepared_audio: PreparedAudio | None = None,
-    ) -> Transcript:
-        """Return a normalized Transcript using the validated submitted URL."""
+    async def acquire(self, submitted_url: str) -> tuple[Source, Transcript]:
+        """Return the normalized Source and Transcript for a submitted URL."""
         ...
 
 
@@ -122,8 +107,7 @@ class ExtractionPipeline:
 
     def __init__(
         self,
-        source_metadata_service: _SourceMetadataInspector,
-        transcription_service: _TranscriptAcquirer,
+        source_transcript_provider: SourceTranscriptProvider,
         interpretation_service: _MentionInterpreter,
         result_aggregator: _ResultAggregator,
         default_market: SpotifyMarket = _DEFAULT_MARKET,
@@ -131,14 +115,12 @@ class ExtractionPipeline:
         """Initialize the pipeline with explicit stage services.
 
         Args:
-            source_metadata_service: Service that validates and inspects Sources.
-            transcription_service: Service that acquires Transcripts.
+            source_transcript_provider: Provider that acquires Sources and Transcripts.
             interpretation_service: Service that interprets grouped mentions.
             result_aggregator: Module that resolves and enriches grouped mentions.
             default_market: Validated fallback Spotify market for omitted requests.
         """
-        self._source_metadata_service = source_metadata_service
-        self._transcription_service = transcription_service
+        self._source_transcript_provider = source_transcript_provider
         self._interpretation_service = interpretation_service
         self._result_aggregator = result_aggregator
         self._default_market = default_market
@@ -160,24 +142,15 @@ class ExtractionPipeline:
         Raises:
             ExtractionError: If any pipeline stage fails with a domain error.
         """
-        inspected = await self._source_metadata_service.inspect(url)
-        try:
-            transcript = await self._transcription_service.acquire(
-                inspected.source,
-                url,
-                inspected.prepared_audio,
-            )
-        finally:
-            inspected.cleanup()
-
+        source, transcript = await self._source_transcript_provider.acquire(url)
         material = InterpretationMaterial(
-            source_title=inspected.source.title,
-            source_description=inspected.source.description,
+            source_title=source.title,
+            source_description=source.description,
             transcript=transcript,
         )
         results, effective_market = await self._interpret_and_aggregate(material, market)
         return PipelineResult(
-            source=inspected.source,
+            source=source,
             transcript=transcript,
             results=results,
             market=effective_market,
