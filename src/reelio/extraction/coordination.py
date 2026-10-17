@@ -114,20 +114,21 @@ class TextifyCoordinationRepository(Protocol):
 
     async def attach_capability(
         self,
-        coordination_id: int,
+        coordination: TextifyCoordination,
         capability_link: str,
     ) -> TextifyCoordination:
-        """Commit Textify's validated bearer Capability Link.
+        """Commit or retrieve Textify's validated bearer Capability Link.
 
         Args:
-            coordination_id: Internal coordination record identifier.
+            coordination: Exact pending record that owns the submitted admission.
             capability_link: Textify's exact relative polling capability.
 
         Returns:
-            The committed accepted Textify coordination record.
+            The accepted Textify coordination record.
 
         Raises:
-            CoordinationError: If the link is invalid or no single record is updated.
+            CoordinationError: If the link is invalid, the record changed, or a
+                different link was already accepted.
         """
         ...
 
@@ -198,35 +199,52 @@ class PostgresTextifyCoordinationRepository:
 
     async def attach_capability(
         self,
-        coordination_id: int,
+        coordination: TextifyCoordination,
         capability_link: str,
     ) -> TextifyCoordination:
-        """Commit Textify's validated bearer Capability Link.
+        """Commit or retrieve Textify's validated bearer Capability Link.
 
         Args:
-            coordination_id: Internal coordination record identifier.
+            coordination: Exact pending record that owns the submitted admission.
             capability_link: Textify's exact relative polling capability.
 
         Returns:
-            The committed accepted Textify coordination record.
+            The accepted Textify coordination record.
 
         Raises:
-            CoordinationError: If the link is invalid or no single record is updated.
+            CoordinationError: If the link is invalid, the record changed, or a
+                different link was already accepted.
         """
         _validate_capability_link(capability_link)
-        updated_at = datetime.now(UTC)
+        immutable_identity = (
+            _COORDINATION_TABLE.c.id == coordination.id,
+            _COORDINATION_TABLE.c.url_identity == coordination.url_identity,
+            _COORDINATION_TABLE.c.idempotency_key == coordination.idempotency_key,
+        )
         async with self._engine.begin() as connection:
             result = await connection.execute(
                 update(_COORDINATION_TABLE)
-                .where(_COORDINATION_TABLE.c.id == coordination_id)
-                .values(capability_link=capability_link, updated_at=updated_at)
+                .where(
+                    *immutable_identity,
+                    _COORDINATION_TABLE.c.capability_link.is_(None),
+                )
+                .values(
+                    capability_link=capability_link,
+                    updated_at=datetime.now(UTC),
+                )
                 .returning(*_COORDINATION_TABLE.c)
             )
-            records = result.mappings().all()
-            if len(records) != 1:
+            row = result.mappings().one_or_none()
+            if row is not None:
+                return _to_coordination(row)
+
+            result = await connection.execute(
+                select(_COORDINATION_TABLE).where(*immutable_identity)
+            )
+            row = result.mappings().one_or_none()
+            if row is None or row["capability_link"] != capability_link:
                 raise CoordinationError("Textify coordination record could not be updated")
-            record = _to_coordination(records[0])
-        return record
+            return _to_coordination(row)
 
     async def aclose(self) -> None:
         """Dispose the repository-owned SQLAlchemy engine."""

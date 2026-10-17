@@ -184,7 +184,7 @@ class TextifySourceTranscriptProvider:
 
             try:
                 accepted = await self._coordination_repository.attach_capability(
-                    coordination.id,
+                    coordination,
                     capability_link,
                 )
             except CoordinationError:

@@ -37,18 +37,18 @@ class _CoordinationRepository:
 
     async def attach_capability(
         self,
-        coordination_id: int,
+        coordination: TextifyCoordination,
         capability_link: str,
     ) -> TextifyCoordination:
-        self.calls.append(("attach_capability", (coordination_id, capability_link)))
+        self.calls.append(("attach_capability", (coordination, capability_link)))
         return TextifyCoordination(
-            id=self.pending.id,
-            url_identity=self.pending.url_identity,
-            idempotency_key=self.pending.idempotency_key,
+            id=coordination.id,
+            url_identity=coordination.url_identity,
+            idempotency_key=coordination.idempotency_key,
             capability_link=capability_link,
-            created_at=self.pending.created_at,
-            updated_at=self.pending.created_at + timedelta(seconds=1),
-            expires_at=self.pending.expires_at,
+            created_at=coordination.created_at,
+            updated_at=coordination.created_at + timedelta(seconds=1),
+            expires_at=coordination.expires_at,
         )
 
     async def aclose(self) -> None:
@@ -86,7 +86,7 @@ async def test_provider_submits_commits_and_polls_the_stored_capability() -> Non
         if len(requests) == 2:
             assert repository.calls == [
                 ("get_or_create", _SUBMITTED_URL),
-                ("attach_capability", (repository.pending.id, _CAPABILITY_LINK)),
+                ("attach_capability", (repository.pending, _CAPABILITY_LINK)),
             ]
             assert request.url.path == _CAPABILITY_LINK
             return httpx.Response(
