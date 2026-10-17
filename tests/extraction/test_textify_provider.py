@@ -1,0 +1,195 @@
+"""Textify source-and-transcript provider HTTP contract tests."""
+
+import json
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+import httpx
+import pytest
+
+from reelio.extraction.coordination import TextifyCoordination
+from reelio.extraction.exceptions import TranscriptionError
+from reelio.extraction.services.textify import TextifySourceTranscriptProvider
+from reelio.extraction.types import Platform, TranscriptMethod
+
+_SUBMITTED_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+_CAPABILITY_LINK = "/api/v1/transcription-jobs/00000000-0000-4000-8000-000000000000"
+
+
+class _CoordinationRepository:
+    def __init__(self) -> None:
+        now = datetime(2026, 10, 14, tzinfo=UTC)
+        self.pending = TextifyCoordination(
+            id=7,
+            url_identity=b"x" * 32,
+            idempotency_key=uuid4(),
+            capability_link=None,
+            created_at=now,
+            updated_at=now,
+            expires_at=now + timedelta(days=1),
+        )
+        self.calls: list[tuple[str, object]] = []
+        self.closed = False
+
+    async def get_or_create(self, submitted_url: str) -> TextifyCoordination:
+        self.calls.append(("get_or_create", submitted_url))
+        return self.pending
+
+    async def attach_capability(
+        self,
+        coordination_id: int,
+        capability_link: str,
+    ) -> TextifyCoordination:
+        self.calls.append(("attach_capability", (coordination_id, capability_link)))
+        return TextifyCoordination(
+            id=self.pending.id,
+            url_identity=self.pending.url_identity,
+            idempotency_key=self.pending.idempotency_key,
+            capability_link=capability_link,
+            created_at=self.pending.created_at,
+            updated_at=self.pending.created_at + timedelta(seconds=1),
+            expires_at=self.pending.expires_at,
+        )
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def test_provider_submits_commits_and_polls_the_stored_capability() -> None:
+    """Acquire Reelio values after durable admission and active polling waits."""
+    repository = _CoordinationRepository()
+    requests: list[httpx.Request] = []
+    waits: list[float] = []
+
+    async def sleeper(seconds: float) -> None:
+        waits.append(seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            assert repository.calls == [("get_or_create", _SUBMITTED_URL)]
+            assert request.url.path == "/api/v1/transcription-jobs"
+            assert json.loads(request.content) == {
+                "url": _SUBMITTED_URL,
+                "exclude": ["transcript.segments"],
+            }
+            assert request.headers["Idempotency-Key"] == str(repository.pending.idempotency_key)
+            return httpx.Response(
+                202,
+                headers={"Location": _CAPABILITY_LINK, "Retry-After": "2"},
+                json={
+                    "status": "queued",
+                    "links": {"self": _CAPABILITY_LINK},
+                    "additive_field": "accepted",
+                },
+            )
+        if len(requests) == 2:
+            assert repository.calls == [
+                ("get_or_create", _SUBMITTED_URL),
+                ("attach_capability", (repository.pending.id, _CAPABILITY_LINK)),
+            ]
+            assert request.url.path == _CAPABILITY_LINK
+            return httpx.Response(
+                200,
+                headers={"Retry-After": "3"},
+                json={
+                    "status": "processing",
+                    "links": {"self": _CAPABILITY_LINK},
+                    "additive_field": "active",
+                },
+            )
+        assert request.url.path == _CAPABILITY_LINK
+        return httpx.Response(
+            200,
+            json={
+                "status": "finished",
+                "outcome": "succeeded",
+                "links": {"self": _CAPABILITY_LINK},
+                "result": {
+                    "source": {
+                        "platform": "youtube",
+                        "video_id": "dQw4w9WgXcQ",
+                        "url": _SUBMITTED_URL,
+                        "title": "Video title",
+                        "description": "Video description",
+                        "channel": "Video channel",
+                        "duration_seconds": 42,
+                    },
+                    "transcript": {
+                        "method": "faster_whisper",
+                        "language": "en",
+                        "text": "Normalized transcript text.",
+                    },
+                },
+                "additive_field": "finished",
+            },
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://textify.test/",
+        follow_redirects=False,
+    )
+    provider = TextifySourceTranscriptProvider(
+        client=client,
+        coordination_repository=repository,
+        sleeper=sleeper,
+    )
+
+    source, transcript = await provider.acquire(_SUBMITTED_URL)
+
+    assert waits == [2, 3]
+    assert [request.url.path for request in requests] == [
+        "/api/v1/transcription-jobs",
+        _CAPABILITY_LINK,
+        _CAPABILITY_LINK,
+    ]
+    assert source.platform is Platform.YOUTUBE
+    assert source.video_id == "dQw4w9WgXcQ"
+    assert transcript.method is TranscriptMethod.WHISPER
+    assert transcript.language == "en"
+    assert transcript.text == "Normalized transcript text."
+
+    await provider.aclose()
+
+    assert repository.closed is True
+    assert client.is_closed is True
+
+
+async def test_provider_rejects_admission_that_does_not_repeat_its_capability() -> None:
+    """Fail safely before polling when Textify admission headers and JSON disagree."""
+    repository = _CoordinationRepository()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        return httpx.Response(
+            202,
+            headers={
+                "Location": _CAPABILITY_LINK,
+                "Retry-After": "2",
+            },
+            json={
+                "status": "queued",
+                "links": {
+                    "self": "/api/v1/transcription-jobs/11111111-1111-4111-8111-111111111111"
+                },
+            },
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://textify.test/",
+        follow_redirects=False,
+    )
+    provider = TextifySourceTranscriptProvider(
+        client=client,
+        coordination_repository=repository,
+        sleeper=lambda seconds: pytest.fail(f"unexpected poll wait: {seconds}"),
+    )
+
+    with pytest.raises(TranscriptionError, match="^Transcript is unavailable for this video\\.$"):
+        await provider.acquire(_SUBMITTED_URL)
+
+    assert repository.calls == [("get_or_create", _SUBMITTED_URL)]
+
+    await provider.aclose()

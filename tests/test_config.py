@@ -11,6 +11,7 @@ from pydantic_settings import BaseSettings
 
 from reelio.cache import CacheConfig
 from reelio.config import AppConfig, Environment
+from reelio.extraction.coordination import CoordinationConfig
 from reelio.extraction.services.enrichment.config import OpenLibraryConfig, TMDBConfig
 from reelio.extraction.services.interpretation.config import (
     DeepSeekConfig,
@@ -19,6 +20,7 @@ from reelio.extraction.services.interpretation.config import (
     LLMProviderSelectionConfig,
     OpenAIConfig,
 )
+from reelio.extraction.services.textify import TextifyConfig
 from reelio.extraction.services.transcription.config import TranscriptionConfig
 
 
@@ -491,3 +493,100 @@ def test_enabled_cache_accepts_secure_managed_endpoint_options() -> None:
     )
 
     assert settings.namespace == "reelio:production"
+
+
+def test_coordination_requires_nonblank_database_url_and_hmac_secret() -> None:
+    """Reject missing or blank coordination credentials at startup."""
+    with pytest.raises(ValidationError):
+        _without_dotenv(CoordinationConfig, hmac_secret="coordination-secret")
+
+    with pytest.raises(ValidationError):
+        _without_dotenv(
+            CoordinationConfig,
+            database_url="postgresql+asyncpg://reelio:password@localhost/reelio",
+            hmac_secret="   ",
+        )
+
+
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql://reelio:password@localhost/reelio",
+        "postgresql+psycopg://reelio:password@localhost/reelio",
+        "mysql+asyncmy://reelio:password@localhost/reelio",
+        "postgresql+asyncpg:///reelio",
+        "postgresql+asyncpg://reelio:password@localhost",
+    ],
+)
+def test_coordination_rejects_non_asyncpg_or_incomplete_database_urls(
+    database_url: str,
+) -> None:
+    """Require a complete asynchronous PostgreSQL coordination endpoint."""
+    with pytest.raises(ValidationError):
+        _without_dotenv(
+            CoordinationConfig,
+            database_url=database_url,
+            hmac_secret="coordination-secret",
+        )
+
+
+@pytest.mark.parametrize("retention_seconds", [0, -1])
+def test_coordination_rejects_nonpositive_retention(retention_seconds: int) -> None:
+    """Require a positive durable coordination retention period."""
+    with pytest.raises(ValidationError):
+        _without_dotenv(
+            CoordinationConfig,
+            database_url="postgresql+asyncpg://reelio:password@localhost/reelio",
+            hmac_secret="coordination-secret",
+            retention_seconds=retention_seconds,
+        )
+
+
+def test_coordination_uses_the_documented_retention_default() -> None:
+    """Retain durable coordination for one day unless configured otherwise."""
+    settings = _without_dotenv(
+        CoordinationConfig,
+        database_url="postgresql+asyncpg://reelio:password@localhost/reelio",
+        hmac_secret="coordination-secret",
+    )
+
+    assert settings.retention_seconds == 86_400
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "textify:8182",
+        "ftp://textify:8182",
+        "http://user:password@textify:8182",
+        "http://textify:8182/api/v1",
+        "http://textify:8182?debug=true",
+        "http://textify:8182#fragment",
+        "http://textify:0",
+        "https://textify:99999",
+    ],
+)
+def test_textify_rejects_non_origin_endpoints(origin: str) -> None:
+    """Accept only credential-free HTTP origins for Textify requests."""
+    with pytest.raises(ValidationError):
+        _without_dotenv(TextifyConfig, origin=origin)
+
+
+@pytest.mark.parametrize("request_timeout_seconds", [0, -1])
+def test_textify_rejects_nonpositive_attempt_timeouts(
+    request_timeout_seconds: float,
+) -> None:
+    """Require a positive per-request Textify timeout."""
+    with pytest.raises(ValidationError):
+        _without_dotenv(
+            TextifyConfig,
+            request_timeout_seconds=request_timeout_seconds,
+        )
+
+
+def test_textify_uses_documented_origin_and_timeout_defaults() -> None:
+    """Use the private Textify HTTP endpoint with a short attempt timeout."""
+    settings = _without_dotenv(TextifyConfig)
+
+    assert settings.origin == "http://textify:8182"
+    assert settings.request_timeout_seconds == 5.0

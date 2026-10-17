@@ -1,6 +1,5 @@
 """Application composition root and entry point."""
 
-import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from typing import cast
@@ -10,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from reelio.cache import AsyncCache, CacheConfig, create_cache
 from reelio.config import Environment, app_settings
+from reelio.extraction.coordination import CoordinationConfig
 from reelio.extraction.exceptions import (
     ExtractionError,
     extraction_error_handler,
@@ -43,20 +43,9 @@ from reelio.extraction.services.interpretation.factory import (
 from reelio.extraction.services.interpretation.service import (
     MentionInterpretationService,
 )
-from reelio.extraction.services.transcription.acquisition import (
-    YouTubeCaptionProvider,
-    YtDlpAudioDownloader,
-    load_whisper_transcriber,
-)
-from reelio.extraction.services.transcription.config import (
-    transcription_settings as _transcription_settings,
-)
-from reelio.extraction.services.transcription.inspection import YtDlpMetadataExtractor
-from reelio.extraction.services.transcription.service import (
-    CachedTranscriptionService,
-    LocalSourceTranscriptProvider,
-    SourceMetadataService,
-    TranscriptionService,
+from reelio.extraction.services.textify import (
+    TextifyConfig,
+    create_textify_source_transcript_provider,
 )
 from reelio.logging import configure_logging
 from reelio.ops import router as ops_router
@@ -80,41 +69,21 @@ async def _create_production_pipeline(
     Args:
         default_market: Validated Spotify market used when an API request omits it.
         spotify_catalog: Lifespan-owned Spotify catalog used without transferring ownership.
-        cache: Lifespan-owned shared cache borrowed by Source metadata, Transcript and
-            Mention interpretation reuse, TMDB, Spotify, and Open Library.
+        cache: Lifespan-owned shared cache borrowed by Mention interpretation, TMDB,
+            Spotify, and Open Library.
     """
     interpretation_settings = InterpretationConfig()
     llm_provider_selection = LLMProviderSelectionConfig()  # type: ignore[call-arg]
     async with AsyncExitStack() as cleanup:
         llm_provider = create_mention_interpretation_provider(llm_provider_selection)
         cleanup.push_async_callback(llm_provider.aclose)
-        transcriber = await asyncio.to_thread(
-            load_whisper_transcriber,
-            _transcription_settings,
+        textify_settings = TextifyConfig()
+        coordination_settings = CoordinationConfig()  # type: ignore[call-arg]
+        source_transcript_provider = await create_textify_source_transcript_provider(
+            textify_settings,
+            coordination_settings,
         )
-        source_metadata_service = SourceMetadataService(
-            extractor=YtDlpMetadataExtractor(
-                max_duration_seconds=_transcription_settings.max_video_duration_seconds,
-                temp_media_dir=_transcription_settings.temp_media_dir,
-            ),
-            settings=_transcription_settings,
-            cache=cache,
-        )
-        uncached_transcription_service = TranscriptionService(
-            provider=YouTubeCaptionProvider(),
-            audio_downloader=YtDlpAudioDownloader(),
-            transcriber=transcriber,
-            temp_media_dir=_transcription_settings.temp_media_dir,
-            semaphore=asyncio.Semaphore(_transcription_settings.whisper_max_concurrent),
-        )
-        transcription_service = CachedTranscriptionService(
-            acquirer=uncached_transcription_service,
-            cache=cache,
-        )
-        source_transcript_provider = LocalSourceTranscriptProvider(
-            source_metadata_inspector=source_metadata_service,
-            transcript_acquirer=transcription_service,
-        )
+        cleanup.push_async_callback(source_transcript_provider.aclose)
         interpretation_service = MentionInterpretationService(
             provider=llm_provider,
             settings=interpretation_settings,

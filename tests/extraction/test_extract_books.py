@@ -75,6 +75,9 @@ class _SourceTranscriptProvider:
             ),
         )
 
+    async def aclose(self) -> None:
+        """Satisfy the Source-and-Transcript provider lifecycle."""
+
 
 class _AbsentPreferredEditionTransport(httpx.AsyncBaseTransport):
     """Return nullable Edition Search data around existing resolver fixtures."""

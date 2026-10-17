@@ -142,6 +142,9 @@ class _RecordingSourceTranscriptProvider:
         self.calls.append(submitted_url)
         raise AssertionError("submitted transcripts must not acquire a Source or Transcript")
 
+    async def aclose(self) -> None:
+        """Satisfy the Source-and-Transcript provider lifecycle."""
+
 
 class _RecordingLLMProvider:
     def __init__(self, response: str) -> None:

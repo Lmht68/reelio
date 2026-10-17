@@ -414,6 +414,9 @@ class LocalSourceTranscriptProvider(SourceTranscriptProvider):
             inspected_source.cleanup()
         return inspected_source.source, transcript
 
+    async def aclose(self) -> None:
+        """Release provider-owned resources."""
+
 
 @dataclass(slots=True)
 class _InspectionOwnership:

@@ -55,6 +55,7 @@ class _FakeSourceTranscriptProvider:
         self.error = error
         self.call_order = call_order
         self.calls: list[str] = []
+        self.closed = False
 
     async def acquire(self, submitted_url: str) -> tuple[Source, Transcript]:
         self.calls.append(submitted_url)
@@ -63,6 +64,9 @@ class _FakeSourceTranscriptProvider:
         if self.error is not None:
             raise self.error
         return self.source, self.transcript
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class _OrderedInterpretationService(_FakeInterpretationService):
@@ -440,18 +444,20 @@ async def test_pipeline_propagates_aggregation_errors_unchanged() -> None:
     assert result_aggregator.calls == [extraction_mentions]
 
 
-async def test_pipeline_closes_interpretation_and_aggregation_modules() -> None:
-    """Delegate lifespan cleanup to interpretation and aggregation modules."""
+async def test_pipeline_closes_source_provider_interpretation_and_aggregation_modules() -> None:
+    """Delegate lifespan cleanup to every pipeline-owned module."""
+    source_transcript_provider = _FakeSourceTranscriptProvider(_source(), _transcript())
     interpretation_service = _FakeInterpretationService()
     result_aggregator = _FakeResultAggregator()
     pipeline = _pipeline(
-        _FakeSourceTranscriptProvider(_source(), _transcript()),
+        source_transcript_provider,
         interpretation_service,
         result_aggregator,
     )
 
     await pipeline.aclose()
 
+    assert source_transcript_provider.closed is True
     assert interpretation_service.closed is True
     assert result_aggregator.closed is True
 
@@ -473,6 +479,28 @@ async def test_pipeline_closes_aggregation_when_interpretation_close_fails() -> 
     with pytest.raises(RuntimeError, match="interpretation close failed"):
         await pipeline.aclose()
 
+    assert result_aggregator.closed is True
+
+
+class _FailingCloseSourceTranscriptProvider(_FakeSourceTranscriptProvider):
+    async def aclose(self) -> None:
+        raise RuntimeError("source provider close failed")
+
+
+async def test_pipeline_closes_later_modules_when_provider_close_fails() -> None:
+    """Close later modules when Source-and-Transcript cleanup raises."""
+    interpretation_service = _FakeInterpretationService()
+    result_aggregator = _FakeResultAggregator()
+    pipeline = _pipeline(
+        _FailingCloseSourceTranscriptProvider(_source(), _transcript()),
+        interpretation_service,
+        result_aggregator,
+    )
+
+    with pytest.raises(RuntimeError, match="source provider close failed"):
+        await pipeline.aclose()
+
+    assert interpretation_service.closed is True
     assert result_aggregator.closed is True
 
 

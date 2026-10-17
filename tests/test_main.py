@@ -83,6 +83,25 @@ class _FakeProvider:
         self.close_calls += 1
 
 
+class _FakeTextifySourceTranscriptProvider:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def acquire(self, submitted_url: str) -> NoReturn:
+        raise AssertionError(f"unexpected source acquisition: {submitted_url}")
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+class _FakeTextifyConfig:
+    pass
+
+
+class _FakeCoordinationConfig:
+    pass
+
+
 class _FakeScreenWorkResolver:
     def __init__(self) -> None:
         self.close_calls = 0
@@ -284,24 +303,36 @@ async def test_pipeline_factory_failure_aborts_lifespan() -> None:
     assert not hasattr(application.state, "extraction_pipeline")
 
 
-async def test_production_lifespan_closes_one_selected_provider(
+async def test_production_lifespan_owns_one_textify_source_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Construct one selected provider and close it when production stops."""
+    """Construct and close one Textify Source-and-Transcript provider."""
     monkeypatch.setenv("REELIO_LLM_PROVIDER", "openai")
-    provider = _FakeProvider()
     monkeypatch.setenv("REELIO_OPEN_LIBRARY_CONTACT_EMAIL", "test@example.invalid")
+    provider = _FakeProvider()
+    source_transcript_provider = _FakeTextifySourceTranscriptProvider()
     resolver = _FakeScreenWorkResolver()
     book_resolver = _FakeBookResolver()
     book_resolver_factory_calls = 0
     provider_factory_calls = 0
     resolver_factory_calls = 0
+    textify_factory_calls = 0
 
     def create_provider(selection: LLMProviderSelectionConfig) -> _FakeProvider:
         nonlocal provider_factory_calls
         provider_factory_calls += 1
         assert selection.llm_provider is LLMProvider.OPENAI
         return provider
+
+    async def create_textify_provider(
+        textify_settings: object,
+        coordination_settings: object,
+    ) -> _FakeTextifySourceTranscriptProvider:
+        nonlocal textify_factory_calls
+        assert isinstance(textify_settings, _FakeTextifyConfig)
+        assert isinstance(coordination_settings, _FakeCoordinationConfig)
+        textify_factory_calls += 1
+        return source_transcript_provider
 
     def create_resolver(
         settings: object,
@@ -314,11 +345,38 @@ async def test_production_lifespan_closes_one_selected_provider(
 
     def create_book_resolver(settings: object, cache: object) -> _FakeBookResolver:
         nonlocal book_resolver_factory_calls
+        del settings, cache
         book_resolver_factory_calls += 1
         return book_resolver
 
-    monkeypatch.setattr(main_module, "create_mention_interpretation_provider", create_provider)
-    monkeypatch.setattr(main_module, "load_whisper_transcriber", lambda settings: object())
+    def unexpected_local_transcription(*args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        raise AssertionError("production must not construct local transcription")
+
+    monkeypatch.setattr(main_module, "TextifyConfig", _FakeTextifyConfig, raising=False)
+    monkeypatch.setattr(
+        main_module,
+        "CoordinationConfig",
+        _FakeCoordinationConfig,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "create_textify_source_transcript_provider",
+        create_textify_provider,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "create_mention_interpretation_provider",
+        create_provider,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "load_whisper_transcriber",
+        unexpected_local_transcription,
+        raising=False,
+    )
     monkeypatch.setattr(main_module, "create_tmdb_screen_work_resolver", create_resolver)
     monkeypatch.setattr(
         main_module,
@@ -329,18 +387,20 @@ async def test_production_lifespan_closes_one_selected_provider(
 
     async with application.router.lifespan_context(application):
         assert provider_factory_calls == 1
+        assert textify_factory_calls == 1
         assert resolver_factory_calls == 1
         assert book_resolver_factory_calls == 1
 
+    assert source_transcript_provider.close_calls == 1
     assert provider.close_calls == 1
     assert resolver.close_calls == 1
     assert book_resolver.close_calls == 1
 
 
-async def test_production_lifespan_closes_provider_after_partial_startup_failure(
+async def test_production_lifespan_closes_llm_provider_after_textify_startup_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Close a selected provider when a later production dependency fails."""
+    """Close acquired resources when Textify provider construction aborts startup."""
     monkeypatch.setenv("REELIO_LLM_PROVIDER", "openai")
     provider = _FakeProvider()
 
@@ -348,19 +408,45 @@ async def test_production_lifespan_closes_provider_after_partial_startup_failure
         assert selection.llm_provider is LLMProvider.OPENAI
         return provider
 
-    def fail_whisper_load(settings: TranscriptionConfig) -> NoReturn:
-        raise RuntimeError("Whisper load failed")
+    async def fail_textify_provider(
+        textify_settings: object,
+        coordination_settings: object,
+    ) -> NoReturn:
+        del textify_settings, coordination_settings
+        raise RuntimeError("Textify provider construction failed")
 
+    def unexpected_local_transcription(*args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        raise AssertionError("production must not construct local transcription")
+
+    monkeypatch.setattr(main_module, "TextifyConfig", _FakeTextifyConfig, raising=False)
+    monkeypatch.setattr(
+        main_module,
+        "CoordinationConfig",
+        _FakeCoordinationConfig,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "create_textify_source_transcript_provider",
+        fail_textify_provider,
+        raising=False,
+    )
     monkeypatch.setattr(
         main_module,
         "create_mention_interpretation_provider",
         create_provider,
     )
-    monkeypatch.setattr(main_module, "load_whisper_transcriber", fail_whisper_load)
+    monkeypatch.setattr(
+        main_module,
+        "load_whisper_transcriber",
+        unexpected_local_transcription,
+        raising=False,
+    )
     application = create_app()
     context = application.router.lifespan_context(application)
 
-    with pytest.raises(RuntimeError, match="Whisper load failed"):
+    with pytest.raises(RuntimeError, match="Textify provider construction failed"):
         await context.__aenter__()
     assert provider.close_calls == 1
     assert not hasattr(application.state, "extraction_pipeline")
@@ -373,6 +459,7 @@ async def test_production_lifespan_closes_resolver_after_aggregation_setup_failu
     monkeypatch.setenv("REELIO_LLM_PROVIDER", "openai")
     monkeypatch.setenv("REELIO_OPEN_LIBRARY_CONTACT_EMAIL", "test@example.invalid")
     provider = _FakeProvider()
+    source_transcript_provider = _FakeTextifySourceTranscriptProvider()
     resolver = _FakeScreenWorkResolver()
     book_resolver = _FakeBookResolver()
     resolver_factory_calls = 0
@@ -380,6 +467,14 @@ async def test_production_lifespan_closes_resolver_after_aggregation_setup_failu
     def create_provider(selection: LLMProviderSelectionConfig) -> _FakeProvider:
         assert selection.llm_provider is LLMProvider.OPENAI
         return provider
+
+    async def create_textify_provider(
+        textify_settings: object,
+        coordination_settings: object,
+    ) -> _FakeTextifySourceTranscriptProvider:
+        assert isinstance(textify_settings, _FakeTextifyConfig)
+        assert isinstance(coordination_settings, _FakeCoordinationConfig)
+        return source_transcript_provider
 
     def create_resolver(
         settings: object,
@@ -400,8 +495,20 @@ async def test_production_lifespan_closes_resolver_after_aggregation_setup_failu
         assert configured_book_resolver is book_resolver
         raise RuntimeError("aggregation setup failed")
 
+    monkeypatch.setattr(main_module, "TextifyConfig", _FakeTextifyConfig, raising=False)
+    monkeypatch.setattr(
+        main_module,
+        "CoordinationConfig",
+        _FakeCoordinationConfig,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "create_textify_source_transcript_provider",
+        create_textify_provider,
+        raising=False,
+    )
     monkeypatch.setattr(main_module, "create_mention_interpretation_provider", create_provider)
-    monkeypatch.setattr(main_module, "load_whisper_transcriber", lambda settings: object())
     monkeypatch.setattr(main_module, "create_tmdb_screen_work_resolver", create_resolver)
     monkeypatch.setattr(
         main_module,
@@ -421,6 +528,7 @@ async def test_production_lifespan_closes_resolver_after_aggregation_setup_failu
 
     assert resolver_factory_calls == 1
     assert provider.close_calls == 1
+    assert source_transcript_provider.close_calls == 1
     assert resolver.close_calls == 1
     assert book_resolver.close_calls == 1
     assert not hasattr(application.state, "extraction_pipeline")
@@ -543,6 +651,7 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
     events: list[str] = []
     cache = _FakeCache(events)
     provider = _FakeProvider()
+    source_transcript_provider = _FakeTextifySourceTranscriptProvider()
     screen_work_resolver = _FakeScreenWorkResolver()
 
     class _RecordingBookResolver(_FakeBookResolver):
@@ -585,6 +694,14 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
         received_book_caches.append(configured_cache)
         return book_resolver
 
+    async def create_textify_provider(
+        textify_settings: object,
+        coordination_settings: object,
+    ) -> _FakeTextifySourceTranscriptProvider:
+        assert isinstance(textify_settings, _FakeTextifyConfig)
+        assert isinstance(coordination_settings, _FakeCoordinationConfig)
+        return source_transcript_provider
+
     monkeypatch.setattr(main_module, "SpotifyConfig", _FakeSpotifySettings)
     monkeypatch.setattr(main_module, "create_spotify_catalog", spotify_catalog_factory)
     monkeypatch.setattr(main_module, "create_cache", create_configured_cache)
@@ -593,7 +710,19 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
         "create_mention_interpretation_provider",
         lambda selection: provider,
     )
-    monkeypatch.setattr(main_module, "load_whisper_transcriber", lambda settings: object())
+    monkeypatch.setattr(main_module, "TextifyConfig", _FakeTextifyConfig, raising=False)
+    monkeypatch.setattr(
+        main_module,
+        "CoordinationConfig",
+        _FakeCoordinationConfig,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "create_textify_source_transcript_provider",
+        create_textify_provider,
+        raising=False,
+    )
     monkeypatch.setattr(
         main_module,
         "create_tmdb_screen_work_resolver",

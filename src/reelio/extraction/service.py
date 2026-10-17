@@ -70,6 +70,10 @@ class SourceTranscriptProvider(Protocol):
         """Return the normalized Source and Transcript for a submitted URL."""
         ...
 
+    async def aclose(self) -> None:
+        """Release provider-owned resources."""
+        ...
+
 
 class _MentionInterpreter(Protocol):
     """Interpret grouped mentions from complete Interpretation Material."""
@@ -201,8 +205,11 @@ class ExtractionPipeline:
         return results, effective_market
 
     async def aclose(self) -> None:
-        """Release lifespan-owned interpretation and aggregation resources."""
+        """Release every lifespan-owned pipeline resource."""
         try:
-            await self._interpretation_service.aclose()
+            await self._source_transcript_provider.aclose()
         finally:
-            await self._result_aggregator.aclose()
+            try:
+                await self._interpretation_service.aclose()
+            finally:
+                await self._result_aggregator.aclose()

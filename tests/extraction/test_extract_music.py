@@ -66,6 +66,9 @@ class _SourceTranscriptProvider:
             ),
         )
 
+    async def aclose(self) -> None:
+        """Satisfy the Source-and-Transcript provider lifecycle."""
+
 
 class _InterpretationProvider:
     """Return one configured strict interpretation response without network I/O."""
