@@ -29,6 +29,7 @@ from reelio.extraction.exceptions import (
     PipelineTimeoutError,
     SourceUnavailableError,
     TranscriptionError,
+    TranscriptionUnavailableError,
     UnsupportedPlatformError,
 )
 from reelio.extraction.market import SpotifyMarket
@@ -1308,6 +1309,11 @@ async def test_concurrent_whisper_http_requests_queue_and_succeed(
             "catalog_provider_failed",
         ),
         (PipelineTimeoutError("pipeline timed out"), 504, "pipeline_timeout"),
+        (
+            TranscriptionUnavailableError("Transcription is temporarily unavailable."),
+            503,
+            "transcription_unavailable",
+        ),
     ],
 )
 async def test_extraction_errors_map_to_contract(
@@ -1326,6 +1332,32 @@ async def test_extraction_errors_map_to_contract(
 
     assert response.status_code == expected_status
     assert response.json() == {"error": {"code": expected_code, "message": str(exception)}}
+
+
+async def test_temporary_transcription_unavailability_includes_retry_after(
+    client: AsyncClient,
+) -> None:
+    """Return the fixed public retry instruction for temporary transcription loss."""
+    _install_pipeline(
+        app,
+        _RaisingPipeline(
+            TranscriptionUnavailableError("Transcription is temporarily unavailable.")
+        ),
+    )
+
+    response = await client.post(
+        "/api/extractions",
+        json={"url": "https://www.youtube.com/watch?v=anything"},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "2"
+    assert response.json() == {
+        "error": {
+            "code": "transcription_unavailable",
+            "message": "Transcription is temporarily unavailable.",
+        }
+    }
 
 
 @pytest.mark.parametrize("payload", [{}, {"url": 123}, {"url": ""}])
@@ -1462,10 +1494,12 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert "90 percent" not in description.lower()
     assert "every ordered Artist Credit" not in description
     assert "release year must match" not in description.lower()
-    assert {"200", "400", "404", "413", "500", "502", "504", "422"} <= set(responses)
-    for status_code in ("400", "404", "413", "500", "502", "504"):
+    assert {"200", "400", "404", "413", "500", "502", "503", "504", "422"} <= set(responses)
+    for status_code in ("400", "404", "413", "500", "502", "503", "504"):
         schema = responses[status_code]["content"]["application/json"]["schema"]
         assert schema == {"$ref": "#/components/schemas/ErrorResponse"}
+    retry_after_header = responses["503"]["headers"]["Retry-After"]
+    assert retry_after_header["schema"] == {"type": "integer"}
     assert "catalog_provider_failed" in responses["502"]["description"]
     assert "Open Library catalog request failed." in responses["502"]["description"]
     assert "pipeline_timeout" in responses["504"]["description"]

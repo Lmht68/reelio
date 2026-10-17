@@ -530,9 +530,9 @@ def test_coordination_rejects_non_asyncpg_or_incomplete_database_urls(
         )
 
 
-@pytest.mark.parametrize("retention_seconds", [0, -1])
-def test_coordination_rejects_nonpositive_retention(retention_seconds: int) -> None:
-    """Require a positive durable coordination retention period."""
+@pytest.mark.parametrize("retention_seconds", [0, -1, 86_401])
+def test_coordination_rejects_retention_outside_one_day(retention_seconds: int) -> None:
+    """Reject a durable coordination retention period outside one day."""
     with pytest.raises(ValidationError):
         _without_dotenv(
             CoordinationConfig,

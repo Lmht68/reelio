@@ -669,6 +669,19 @@ def _to_transcript_response(
                 "failed."
             ),
         },
+        503: {
+            "model": extraction_schemas.ErrorResponse,
+            "description": "Textify coordination is temporarily unavailable.",
+            "headers": {
+                "Retry-After": {
+                    "description": (
+                        "Whole seconds to wait before retrying temporary Textify "
+                        "coordination unavailability."
+                    ),
+                    "schema": {"type": "integer"},
+                },
+            },
+        },
         504: {
             "model": extraction_schemas.ErrorResponse,
             "description": (

@@ -42,6 +42,20 @@ def _settings(database_url: str) -> CoordinationConfig:
     )
 
 
+@pytest.mark.parametrize(
+    "retention",
+    [timedelta(), timedelta(microseconds=999_999), timedelta(seconds=86_401)],
+)
+def test_repository_rejects_retention_outside_one_day(retention: timedelta) -> None:
+    """Reject direct repository retention values outside the configuration range."""
+    with pytest.raises(ValueError):
+        PostgresTextifyCoordinationRepository(
+            engine=cast(AsyncEngine, _CloseRecordingEngine()),
+            hmac_secret=_HMAC_SECRET.encode("utf-8"),
+            retention=retention,
+        )
+
+
 async def test_repository_commits_pending_coordination_before_returning(
     migrated_coordination_database: str,
 ) -> None:
@@ -232,6 +246,107 @@ async def test_repository_rejects_conflicting_or_replaced_capability_attachment(
 
         assert replacement.id != pending.id
         assert replacement.capability_link is None
+    finally:
+        await repository.aclose()
+
+
+async def test_repository_deletes_only_matching_accepted_coordination(
+    migrated_coordination_database: str,
+) -> None:
+    """Remove one exact accepted coordination record."""
+    repository = await create_postgres_textify_coordination(
+        _settings(migrated_coordination_database)
+    )
+    try:
+        pending = await repository.get_or_create(_SUBMITTED_URL)
+        accepted = await repository.attach_capability(pending, _CAPABILITY_LINK)
+
+        assert await repository.delete(accepted) is True
+
+        verification_engine = create_async_engine(migrated_coordination_database)
+        try:
+            async with verification_engine.connect() as connection:
+                remaining = await connection.scalar(
+                    text("SELECT count(*) FROM textify_coordination WHERE id = :coordination_id"),
+                    {"coordination_id": accepted.id},
+                )
+        finally:
+            await verification_engine.dispose()
+
+        assert remaining == 0
+    finally:
+        await repository.aclose()
+
+
+async def test_repository_preserves_replacement_when_deleting_stale_snapshot(
+    migrated_coordination_database: str,
+) -> None:
+    """Refuse to delete replacement coordination through an old snapshot."""
+    repository = await create_postgres_textify_coordination(
+        _settings(migrated_coordination_database)
+    )
+    try:
+        stale_coordination = await repository.get_or_create(_SUBMITTED_URL)
+        assert await repository.delete(stale_coordination) is True
+        replacement = await repository.get_or_create(_SUBMITTED_URL)
+
+        assert await repository.delete(stale_coordination) is False
+
+        verification_engine = create_async_engine(migrated_coordination_database)
+        try:
+            async with verification_engine.connect() as connection:
+                stored_replacement = (
+                    await connection.execute(
+                        text(
+                            "SELECT id, idempotency_key FROM textify_coordination "
+                            "WHERE url_identity = :url_identity"
+                        ),
+                        {"url_identity": replacement.url_identity},
+                    )
+                ).one()
+        finally:
+            await verification_engine.dispose()
+
+        assert stored_replacement == (replacement.id, replacement.idempotency_key)
+    finally:
+        await repository.aclose()
+
+
+async def test_repository_removes_expired_pending_coordination_before_attachment(
+    migrated_coordination_database: str,
+) -> None:
+    """Reject capability attachment and remove the exact expired pending record."""
+    repository = await create_postgres_textify_coordination(
+        _settings(migrated_coordination_database)
+    )
+    try:
+        pending = await repository.get_or_create(_SUBMITTED_URL)
+        verification_engine = create_async_engine(migrated_coordination_database)
+        try:
+            async with verification_engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE textify_coordination "
+                        "SET created_at = CURRENT_TIMESTAMP - INTERVAL '2 seconds', "
+                        "updated_at = CURRENT_TIMESTAMP - INTERVAL '2 seconds', "
+                        "expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' "
+                        "WHERE id = :coordination_id"
+                    ),
+                    {"coordination_id": pending.id},
+                )
+
+            with pytest.raises(CoordinationError):
+                await repository.attach_capability(pending, _CAPABILITY_LINK)
+
+            async with verification_engine.connect() as connection:
+                remaining = await connection.scalar(
+                    text("SELECT count(*) FROM textify_coordination WHERE id = :coordination_id"),
+                    {"coordination_id": pending.id},
+                )
+        finally:
+            await verification_engine.dispose()
+
+        assert remaining == 0
     finally:
         await repository.aclose()
 

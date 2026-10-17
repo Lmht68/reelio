@@ -12,10 +12,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from reelio.extraction.coordination import (
     CoordinationConfig,
     CoordinationError,
+    CoordinationUnavailableError,
+    TextifyCoordination,
     TextifyCoordinationRepository,
     create_postgres_textify_coordination,
 )
-from reelio.extraction.exceptions import TranscriptionError
+from reelio.extraction.exceptions import (
+    TranscriptionError,
+    TranscriptionUnavailableError,
+)
 from reelio.extraction.types import (
     Platform,
     Source,
@@ -26,6 +31,7 @@ from reelio.extraction.types import (
 
 _TRANSCRIPTION_JOBS_PATH = "/api/v1/transcription-jobs"
 _TRANSCRIPTION_FAILURE_MESSAGE = "Transcript is unavailable for this video."
+_TRANSCRIPTION_UNAVAILABLE_MESSAGE = "Transcription is temporarily unavailable."
 
 
 class TextifyConfig(BaseSettings):
@@ -105,6 +111,27 @@ class _JobStatusResponse(_TextifyModel):
     links: _TextifyLinks
 
 
+class _FinishedJobResponse(_TextifyModel):
+    """Read one terminal Textify job outcome."""
+
+    status: Literal["finished"]
+    outcome: Literal["succeeded", "failed", "cancelled"]
+    links: _TextifyLinks
+
+
+class _TextifyError(_TextifyModel):
+    """Read one Textify error without exposing it to Reelio callers."""
+
+    code: str
+    message: str
+
+
+class _TextifyErrorResponse(_TextifyModel):
+    """Read a Textify error envelope."""
+
+    error: _TextifyError
+
+
 class _TextifySource(_TextifyModel):
     """Read the complete Source projection required by Reelio."""
 
@@ -172,8 +199,12 @@ class TextifySourceTranscriptProvider:
 
         Raises:
             TranscriptionError: If Textify does not follow its successful job contract.
+            TranscriptionUnavailableError: If durable coordination is unavailable or stale.
         """
-        coordination = await self._coordination_repository.get_or_create(submitted_url)
+        try:
+            coordination = await self._coordination_repository.get_or_create(submitted_url)
+        except CoordinationUnavailableError:
+            raise _transcription_unavailable() from None
         capability_link = coordination.capability_link
         if capability_link is None:
             admission = await self._submit(submitted_url, str(coordination.idempotency_key))
@@ -187,9 +218,12 @@ class TextifySourceTranscriptProvider:
                     coordination,
                     capability_link,
                 )
+            except CoordinationUnavailableError:
+                raise _transcription_unavailable() from None
             except CoordinationError:
                 raise _transcription_failure() from None
-            stored_capability_link = accepted.capability_link
+            coordination = accepted
+            stored_capability_link = coordination.capability_link
             if stored_capability_link is None or stored_capability_link != capability_link:
                 raise _transcription_failure()
             capability_link = stored_capability_link
@@ -199,6 +233,12 @@ class TextifySourceTranscriptProvider:
         while True:
             await self._sleeper(retry_after)
             response = await self._get(capability_link)
+            if response.status_code == httpx.codes.NOT_FOUND:
+                textify_error = _parse_error_response(response)
+                if textify_error.error.code == "job_not_found":
+                    await self._retire(coordination)
+                    raise _transcription_unavailable()
+                raise _transcription_failure()
             job_status = _parse_job_status(response)
             if job_status.links.self != capability_link:
                 raise _transcription_failure()
@@ -206,6 +246,10 @@ class TextifySourceTranscriptProvider:
                 retry_after = _retry_after(response)
                 continue
 
+            finished = _parse_finished_job(response)
+            if finished.outcome in {"failed", "cancelled"}:
+                await self._retire(coordination)
+                raise _transcription_failure()
             succeeded = _parse_succeeded_job(response)
             return _to_reelio_result(succeeded.result)
 
@@ -215,6 +259,23 @@ class TextifySourceTranscriptProvider:
             await self._client.aclose()
         finally:
             await self._coordination_repository.aclose()
+
+    async def _retire(self, coordination: TextifyCoordination) -> None:
+        """Retire observed unusable coordination without creating replacement work.
+
+        Args:
+            coordination: Accepted coordination snapshot observed as unusable.
+
+        Raises:
+            TranscriptionError: If retirement violates coordination invariants.
+            TranscriptionUnavailableError: If PostgreSQL cannot retire coordination.
+        """
+        try:
+            await self._coordination_repository.delete(coordination)
+        except CoordinationUnavailableError:
+            raise _transcription_unavailable() from None
+        except CoordinationError:
+            raise _transcription_failure() from None
 
     async def _submit(
         self,
@@ -255,16 +316,16 @@ class TextifySourceTranscriptProvider:
             capability_link: Validated relative polling capability stored by Reelio.
 
         Returns:
-            Successful Textify job inspection response.
+            A successful or stale-capability Textify inspection response.
 
         Raises:
-            TranscriptionError: If inspection cannot return the expected HTTP status.
+            TranscriptionError: If inspection cannot return an expected HTTP status.
         """
         try:
             response = await self._client.get(capability_link)
         except httpx.HTTPError:
             raise _transcription_failure() from None
-        if response.status_code != httpx.codes.OK:
+        if response.status_code not in {httpx.codes.OK, httpx.codes.NOT_FOUND}:
             raise _transcription_failure()
         return response
 
@@ -315,6 +376,42 @@ def _parse_job_status(response: httpx.Response) -> _JobStatusResponse:
     """
     try:
         return _JobStatusResponse.model_validate(response.json())
+    except (ValidationError, ValueError):
+        raise _transcription_failure() from None
+
+
+def _parse_finished_job(response: httpx.Response) -> _FinishedJobResponse:
+    """Parse one finished Textify job outcome.
+
+    Args:
+        response: Finished Textify job inspection response.
+
+    Returns:
+        Parsed terminal job status and outcome.
+
+    Raises:
+        TranscriptionError: If the terminal response is malformed.
+    """
+    try:
+        return _FinishedJobResponse.model_validate(response.json())
+    except (ValidationError, ValueError):
+        raise _transcription_failure() from None
+
+
+def _parse_error_response(response: httpx.Response) -> _TextifyErrorResponse:
+    """Parse one Textify error envelope.
+
+    Args:
+        response: Textify error response to validate before branching.
+
+    Returns:
+        Parsed Textify error details.
+
+    Raises:
+        TranscriptionError: If the error response is malformed.
+    """
+    try:
+        return _TextifyErrorResponse.model_validate(response.json())
     except (ValidationError, ValueError):
         raise _transcription_failure() from None
 
@@ -410,6 +507,11 @@ def _to_reelio_result(result: _TextifyResult) -> tuple[Source, Transcript]:
 def _transcription_failure() -> TranscriptionError:
     """Create the existing safe public Transcript failure without provider details."""
     return TranscriptionError(_TRANSCRIPTION_FAILURE_MESSAGE)
+
+
+def _transcription_unavailable() -> TranscriptionUnavailableError:
+    """Create the stable temporary-unavailability response for coordination loss."""
+    return TranscriptionUnavailableError(_TRANSCRIPTION_UNAVAILABLE_MESSAGE)
 
 
 async def create_textify_source_transcript_provider(

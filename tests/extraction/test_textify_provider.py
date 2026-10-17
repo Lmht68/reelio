@@ -51,6 +51,11 @@ class _CoordinationRepository:
             expires_at=coordination.expires_at,
         )
 
+    async def delete(self, coordination: TextifyCoordination) -> bool:
+        """Record retirement of one exact Textify coordination snapshot."""
+        self.calls.append(("delete", coordination))
+        return True
+
     async def aclose(self) -> None:
         self.closed = True
 

@@ -17,15 +17,19 @@ from sqlalchemy import (
     MetaData,
     Table,
     Text,
+    delete,
     select,
     text,
     update,
 )
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import RowMapping, make_url
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-_COORDINATION_REVISION = "0001_textify_coordination"
+_MAX_COORDINATION_RETENTION_SECONDS = 86_400
+_EXPIRATION_CLEANUP_BATCH_SIZE = 100
+_COORDINATION_REVISION = "0002_coordination_expiration"
 _CAPABILITY_LINK_PATTERN = re.compile(
     r"/api/v1/transcription-jobs/"
     r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
@@ -56,7 +60,11 @@ class CoordinationConfig(BaseSettings):
 
     database_url: SecretStr
     hmac_secret: SecretStr
-    retention_seconds: int = Field(default=86_400, gt=0)
+    retention_seconds: int = Field(
+        default=_MAX_COORDINATION_RETENTION_SECONDS,
+        ge=1,
+        le=_MAX_COORDINATION_RETENTION_SECONDS,
+    )
 
     @model_validator(mode="after")
     def _validate_database_and_hmac_secret(self) -> "CoordinationConfig":
@@ -83,6 +91,10 @@ class CoordinationConfig(BaseSettings):
 
 class CoordinationError(RuntimeError):
     """Indicate that durable Textify coordination could not preserve its contract."""
+
+
+class CoordinationUnavailableError(CoordinationError):
+    """Indicate that PostgreSQL coordination cannot safely complete an operation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +144,17 @@ class TextifyCoordinationRepository(Protocol):
         """
         ...
 
+    async def delete(self, coordination: TextifyCoordination) -> bool:
+        """Remove one exact coordination snapshot.
+
+        Args:
+            coordination: Exact pending or accepted record to retire.
+
+        Returns:
+            True if the supplied snapshot was removed, otherwise false.
+        """
+        ...
+
     async def aclose(self) -> None:
         """Release repository-owned database resources."""
         ...
@@ -151,8 +174,18 @@ class PostgresTextifyCoordinationRepository:
         Args:
             engine: Engine exclusively owned by this coordination repository.
             hmac_secret: Dedicated secret bytes used to derive URL identity.
-            retention: Positive duration during which coordination may remain durable.
+            retention: Positive duration no longer than one day during which
+                coordination may remain durable.
+
+        Raises:
+            ValueError: If retention is outside the configured one-day bound.
         """
+        if (
+            not timedelta(seconds=1)
+            <= retention
+            <= timedelta(seconds=_MAX_COORDINATION_RETENTION_SECONDS)
+        ):
+            raise ValueError("coordination retention must be between 1 and 86400 seconds")
         self._engine = engine
         self._hmac_secret = hmac_secret
         self._retention = retention
@@ -165,6 +198,9 @@ class PostgresTextifyCoordinationRepository:
 
         Returns:
             The existing coordination record or newly committed pending record.
+
+        Raises:
+            CoordinationUnavailableError: If PostgreSQL cannot complete coordination.
         """
         created_at = datetime.now(UTC)
         url_identity = hmac.digest(
@@ -180,21 +216,47 @@ class PostgresTextifyCoordinationRepository:
             "updated_at": created_at,
             "expires_at": created_at + self._retention,
         }
-        async with self._engine.begin() as connection:
-            result = await connection.execute(
-                postgresql.insert(_COORDINATION_TABLE)
-                .values(values)
-                .on_conflict_do_nothing(index_elements=[_COORDINATION_TABLE.c.url_identity])
-                .returning(*_COORDINATION_TABLE.c)
-            )
-            row = result.mappings().one_or_none()
-            if row is None:
-                result = await connection.execute(
-                    select(_COORDINATION_TABLE).where(
-                        _COORDINATION_TABLE.c.url_identity == url_identity
+        try:
+            async with self._engine.begin() as connection:
+                expired_coordination_ids = (
+                    select(_COORDINATION_TABLE.c.id)
+                    .where(_COORDINATION_TABLE.c.expires_at <= created_at)
+                    .order_by(
+                        _COORDINATION_TABLE.c.expires_at,
+                        _COORDINATION_TABLE.c.id,
+                    )
+                    .limit(_EXPIRATION_CLEANUP_BATCH_SIZE)
+                    .subquery()
+                )
+                await connection.execute(
+                    delete(_COORDINATION_TABLE).where(
+                        _COORDINATION_TABLE.c.id.in_(select(expired_coordination_ids.c.id))
                     )
                 )
-                row = result.mappings().one()
+                await connection.execute(
+                    delete(_COORDINATION_TABLE).where(
+                        _COORDINATION_TABLE.c.url_identity == url_identity,
+                        _COORDINATION_TABLE.c.expires_at <= created_at,
+                    )
+                )
+                result = await connection.execute(
+                    postgresql.insert(_COORDINATION_TABLE)
+                    .values(values)
+                    .on_conflict_do_nothing(index_elements=[_COORDINATION_TABLE.c.url_identity])
+                    .returning(*_COORDINATION_TABLE.c)
+                )
+                row = result.mappings().one_or_none()
+                if row is None:
+                    result = await connection.execute(
+                        select(_COORDINATION_TABLE).where(
+                            _COORDINATION_TABLE.c.url_identity == url_identity
+                        )
+                    )
+                    row = result.mappings().one()
+        except SQLAlchemyError as exc:
+            raise CoordinationUnavailableError(
+                "Textify coordination is temporarily unavailable"
+            ) from exc
         return _to_coordination(row)
 
     async def attach_capability(
@@ -214,37 +276,99 @@ class PostgresTextifyCoordinationRepository:
         Raises:
             CoordinationError: If the link is invalid, the record changed, or a
                 different link was already accepted.
+            CoordinationUnavailableError: If PostgreSQL cannot complete coordination.
         """
         _validate_capability_link(capability_link)
+        update_time = datetime.now(UTC)
         immutable_identity = (
             _COORDINATION_TABLE.c.id == coordination.id,
             _COORDINATION_TABLE.c.url_identity == coordination.url_identity,
             _COORDINATION_TABLE.c.idempotency_key == coordination.idempotency_key,
         )
-        async with self._engine.begin() as connection:
-            result = await connection.execute(
-                update(_COORDINATION_TABLE)
-                .where(
-                    *immutable_identity,
-                    _COORDINATION_TABLE.c.capability_link.is_(None),
+        try:
+            async with self._engine.begin() as connection:
+                result = await connection.execute(
+                    update(_COORDINATION_TABLE)
+                    .where(
+                        *immutable_identity,
+                        _COORDINATION_TABLE.c.capability_link.is_(None),
+                        _COORDINATION_TABLE.c.expires_at > update_time,
+                    )
+                    .values(
+                        capability_link=capability_link,
+                        updated_at=update_time,
+                    )
+                    .returning(*_COORDINATION_TABLE.c)
                 )
-                .values(
-                    capability_link=capability_link,
-                    updated_at=datetime.now(UTC),
-                )
-                .returning(*_COORDINATION_TABLE.c)
-            )
-            row = result.mappings().one_or_none()
-            if row is not None:
-                return _to_coordination(row)
+                row = result.mappings().one_or_none()
+                if row is not None:
+                    return _to_coordination(row)
 
-            result = await connection.execute(
-                select(_COORDINATION_TABLE).where(*immutable_identity)
-            )
-            row = result.mappings().one_or_none()
-            if row is None or row["capability_link"] != capability_link:
-                raise CoordinationError("Textify coordination record could not be updated")
-            return _to_coordination(row)
+                result = await connection.execute(
+                    select(_COORDINATION_TABLE).where(*immutable_identity)
+                )
+                row = result.mappings().one_or_none()
+                if row is None:
+                    raise CoordinationError("Textify coordination record could not be updated")
+                stored_coordination = _to_coordination(row)
+                if stored_coordination.expires_at <= update_time:
+                    stored_capability_link = stored_coordination.capability_link
+                    capability_matches = (
+                        _COORDINATION_TABLE.c.capability_link.is_(None)
+                        if stored_capability_link is None
+                        else _COORDINATION_TABLE.c.capability_link == stored_capability_link
+                    )
+                    await connection.execute(
+                        delete(_COORDINATION_TABLE).where(
+                            *immutable_identity,
+                            capability_matches,
+                            _COORDINATION_TABLE.c.expires_at <= update_time,
+                        )
+                    )
+                else:
+                    if stored_coordination.capability_link != capability_link:
+                        raise CoordinationError("Textify coordination record could not be updated")
+                    return stored_coordination
+        except SQLAlchemyError as exc:
+            raise CoordinationUnavailableError(
+                "Textify coordination is temporarily unavailable"
+            ) from exc
+        raise CoordinationError("Textify coordination record could not be updated")
+
+    async def delete(self, coordination: TextifyCoordination) -> bool:
+        """Remove one exact coordination snapshot without deleting a replacement.
+
+        Args:
+            coordination: Exact pending or accepted record to retire.
+
+        Returns:
+            True if the supplied snapshot was removed, otherwise false.
+
+        Raises:
+            CoordinationUnavailableError: If PostgreSQL cannot complete coordination.
+        """
+        capability_matches = (
+            _COORDINATION_TABLE.c.capability_link.is_(None)
+            if coordination.capability_link is None
+            else _COORDINATION_TABLE.c.capability_link == coordination.capability_link
+        )
+        try:
+            async with self._engine.begin() as connection:
+                result = await connection.execute(
+                    delete(_COORDINATION_TABLE)
+                    .where(
+                        _COORDINATION_TABLE.c.id == coordination.id,
+                        _COORDINATION_TABLE.c.url_identity == coordination.url_identity,
+                        _COORDINATION_TABLE.c.idempotency_key == coordination.idempotency_key,
+                        capability_matches,
+                    )
+                    .returning(_COORDINATION_TABLE.c.id)
+                )
+                return result.scalar_one_or_none() is not None
+        except SQLAlchemyError as exc:
+            raise CoordinationUnavailableError(
+                "Textify coordination is temporarily unavailable"
+            ) from exc
 
     async def aclose(self) -> None:
         """Dispose the repository-owned SQLAlchemy engine."""
@@ -255,22 +379,28 @@ class PostgresTextifyCoordinationRepository:
 
         Raises:
             CoordinationError: If the database revision does not match this application.
+            CoordinationUnavailableError: If PostgreSQL cannot complete verification.
         """
-        async with self._engine.begin() as connection:
-            await connection.execute(
-                text(
-                    "CREATE TEMPORARY TABLE _reelio_coordination_write_probe "
-                    "(id integer) ON COMMIT DROP"
+        try:
+            async with self._engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "CREATE TEMPORARY TABLE _reelio_coordination_write_probe "
+                        "(id integer) ON COMMIT DROP"
+                    )
                 )
-            )
-            await connection.execute(
-                text("INSERT INTO _reelio_coordination_write_probe (id) VALUES (1)")
-            )
-            revisions = (
-                await connection.scalars(text("SELECT version_num FROM alembic_version"))
-            ).all()
-            if revisions != [_COORDINATION_REVISION]:
-                raise CoordinationError("Textify coordination schema revision is unavailable")
+                await connection.execute(
+                    text("INSERT INTO _reelio_coordination_write_probe (id) VALUES (1)")
+                )
+                revisions = (
+                    await connection.scalars(text("SELECT version_num FROM alembic_version"))
+                ).all()
+                if revisions != [_COORDINATION_REVISION]:
+                    raise CoordinationError("Textify coordination schema revision is unavailable")
+        except SQLAlchemyError as exc:
+            raise CoordinationUnavailableError(
+                "Textify coordination is temporarily unavailable"
+            ) from exc
 
 
 def _to_coordination(row: RowMapping) -> TextifyCoordination:

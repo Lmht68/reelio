@@ -12,8 +12,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-_REVISION = "0001_textify_coordination"
+_REVISION = "0002_coordination_expiration"
 _TABLE_NAME = "textify_coordination"
+_EXPIRATION_INDEX = "textify_coordination_expires_at_id_idx"
 _CAPABILITY_PATH_PREFIX = "/api/v1/transcription-jobs/"
 
 
@@ -107,8 +108,12 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
                     "AND contype IN ('p', 'u', 'c')"
                 )
             )
+            expiration_index = await connection.scalar(
+                text(f"SELECT to_regclass('public.{_EXPIRATION_INDEX}')")
+            )
 
         assert revision == _REVISION
+        assert expiration_index == _EXPIRATION_INDEX
         assert columns.all() == [
             ("id", "bigint", "NO", "ALWAYS"),
             ("url_identity", "bytea", "NO", None),
@@ -135,9 +140,13 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
                 text("SELECT to_regclass('public.textify_coordination')")
             )
             revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
+            expiration_index = await connection.scalar(
+                text(f"SELECT to_regclass('public.{_EXPIRATION_INDEX}')")
+            )
 
         assert table is None
         assert revision is None
+        assert expiration_index is None
 
         await asyncio.to_thread(_upgrade_head)
 
@@ -146,9 +155,13 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             table = await connection.scalar(
                 text("SELECT to_regclass('public.textify_coordination')")
             )
+            expiration_index = await connection.scalar(
+                text(f"SELECT to_regclass('public.{_EXPIRATION_INDEX}')")
+            )
 
         assert revision == _REVISION
         assert table == _TABLE_NAME
+        assert expiration_index == _EXPIRATION_INDEX
     finally:
         await engine.dispose()
 

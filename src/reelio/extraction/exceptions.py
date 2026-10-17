@@ -15,10 +15,12 @@ class ExtractionError(Exception):
     Attributes:
         code: Stable machine-readable error code for the API response.
         status_code: HTTP status code associated with the error.
+        retry_after_seconds: Optional client retry delay included in ``Retry-After``.
     """
 
     code: ClassVar[str]
     status_code: ClassVar[int]
+    retry_after_seconds: ClassVar[int | None] = None
 
 
 class InvalidSourceError(ExtractionError):
@@ -70,6 +72,14 @@ class TranscriptionError(ExtractionError):
     status_code = 502
 
 
+class TranscriptionUnavailableError(ExtractionError):
+    """Indicate that Textify coordination is temporarily unavailable."""
+
+    code = "transcription_unavailable"
+    status_code = 503
+    retry_after_seconds = 2
+
+
 class MentionInterpretationError(ExtractionError):
     """Indicate that mention interpretation failed."""
 
@@ -115,9 +125,15 @@ async def extraction_error_handler(request: Request, exc: Exception) -> JSONResp
         JSONResponse: Error body and status defined by the domain exception.
     """
     error = cast(ExtractionError, exc)
+    headers = (
+        {"Retry-After": str(error.retry_after_seconds)}
+        if error.retry_after_seconds is not None
+        else None
+    )
     return JSONResponse(
         status_code=error.status_code,
         content={"error": {"code": error.code, "message": str(error)}},
+        headers=headers,
     )
 
 

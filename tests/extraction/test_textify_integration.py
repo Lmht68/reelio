@@ -2,9 +2,11 @@
 
 import asyncio
 import hmac
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import cast
+from datetime import UTC, datetime, timedelta
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 import httpx
@@ -12,6 +14,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from reelio.config import Environment, app_settings
@@ -28,6 +31,8 @@ from tests.extraction.fakes import FakeInterpretationService, FakeResultAggregat
 _SUBMITTED_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 _HMAC_SECRET = "test-coordination-hmac-secret"
 
+_TextifyTerminalBehavior = Literal["succeeded", "failed", "cancelled", "job_not_found"]
+
 _StoredCoordination = tuple[bytes, UUID, str | None]
 
 
@@ -38,6 +43,7 @@ class _TextifyJob:
     request_body: object
     capability_link: str
     active_polls_remaining: int
+    terminal_behavior: _TextifyTerminalBehavior
 
 
 class _TextifyContractServer:
@@ -48,18 +54,21 @@ class _TextifyContractServer:
         transcript_method: str,
         active_polls: int = 0,
         concurrent_admissions: int = 0,
+        terminal_behaviors: tuple[_TextifyTerminalBehavior, ...] = (),
     ) -> None:
-        """Configure one successful idempotent Textify job lifecycle.
+        """Configure ordered idempotent Textify job lifecycles.
 
         Args:
             transcript_method: Textify transcript acquisition method to return.
-            active_polls: Per-job processing responses before successful completion.
+            active_polls: Per-job processing responses before terminal completion.
             concurrent_admissions: Number of admissions to release together.
+            terminal_behaviors: Terminal behavior for each newly admitted job.
         """
         self.application = FastAPI()
         self.transcript_method = transcript_method
         self.active_polls = active_polls
         self.concurrent_admissions = concurrent_admissions
+        self.terminal_behaviors = terminal_behaviors
         self.request_paths: list[str] = []
         self.admission_bodies: list[object] = []
         self.idempotency_keys: list[str] = []
@@ -105,10 +114,16 @@ class _TextifyContractServer:
         job = self._jobs_by_idempotency_key.get(idempotency_key)
         if job is None:
             capability_link = f"/api/v1/transcription-jobs/{uuid4()}"
+            terminal_behavior = (
+                self.terminal_behaviors[len(self._jobs_by_idempotency_key)]
+                if len(self._jobs_by_idempotency_key) < len(self.terminal_behaviors)
+                else "succeeded"
+            )
             job = _TextifyJob(
                 request_body=request_body,
                 capability_link=capability_link,
                 active_polls_remaining=self.active_polls,
+                terminal_behavior=terminal_behavior,
             )
             self._jobs_by_idempotency_key[idempotency_key] = job
             self._jobs_by_capability_link[capability_link] = job
@@ -127,7 +142,7 @@ class _TextifyContractServer:
         )
 
     async def _inspect(self, request: Request, job_id: str) -> JSONResponse:
-        """Return an active or completed job for the admitted capability."""
+        """Return an active, terminal, or missing job for the admitted capability."""
         capability_link = request.url.path
         assert job_id == capability_link.rsplit("/", maxsplit=1)[1]
         job = self._jobs_by_capability_link[capability_link]
@@ -142,7 +157,30 @@ class _TextifyContractServer:
                 },
                 headers={"Retry-After": "0"},
             )
+        if job.terminal_behavior == "job_not_found":
+            self.inspection_statuses.append("job_not_found")
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "code": "job_not_found",
+                        "message": "The transcription job was not found.",
+                    }
+                },
+            )
         self.inspection_statuses.append("finished")
+        if job.terminal_behavior in {"failed", "cancelled"}:
+            return JSONResponse(
+                content={
+                    "status": "finished",
+                    "outcome": job.terminal_behavior,
+                    "links": self._links(capability_link),
+                    "error": {
+                        "code": f"job_{job.terminal_behavior}",
+                        "message": f"The transcription job {job.terminal_behavior}.",
+                    },
+                }
+            )
         return JSONResponse(
             content={
                 "status": "finished",
@@ -680,3 +718,271 @@ async def test_distinct_exact_urls_receive_distinct_textify_coordination_identit
     assert server.job_count == 2
     assert len(set(server.idempotency_keys)) == 2
     assert server.cancellation_paths == []
+
+
+@pytest.mark.parametrize("terminal_behavior", ["failed", "cancelled"])
+async def test_public_extraction_retires_terminal_textify_coordination(
+    migrated_coordination_database: str,
+    terminal_behavior: Literal["failed", "cancelled"],
+) -> None:
+    """Retire failed or cancelled Textify coordination before a later admission."""
+    server = _TextifyContractServer(
+        "faster_whisper",
+        terminal_behaviors=(terminal_behavior,),
+    )
+
+    async def sleeper(seconds: int) -> None:
+        assert seconds == 0
+
+    pipeline = await _create_pipeline(migrated_coordination_database, server, sleeper)
+    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://reelio.test",
+        ) as client:
+            first_response = await client.post("/api/extractions", json={"url": _SUBMITTED_URL})
+            stored_after_terminal = await _stored_coordinations(migrated_coordination_database)
+            second_response = await client.post("/api/extractions", json={"url": _SUBMITTED_URL})
+
+    assert first_response.status_code == 502
+    assert first_response.json() == {
+        "error": {
+            "code": "transcription_failed",
+            "message": "Transcript is unavailable for this video.",
+        }
+    }
+    assert stored_after_terminal == []
+    assert second_response.status_code == 200
+    assert server.job_count == 2
+    assert len(server.idempotency_keys) == 2
+    assert UUID(server.idempotency_keys[0]).version == 4
+    assert UUID(server.idempotency_keys[1]).version == 4
+    assert server.idempotency_keys[0] != server.idempotency_keys[1]
+
+
+async def test_public_extraction_retires_stale_capability_without_resubmitting(
+    migrated_coordination_database: str,
+) -> None:
+    """Return temporary unavailability before a later request admits replacement work."""
+    server = _TextifyContractServer(
+        "faster_whisper",
+        terminal_behaviors=("job_not_found",),
+    )
+
+    async def sleeper(seconds: int) -> None:
+        assert seconds == 0
+
+    pipeline = await _create_pipeline(migrated_coordination_database, server, sleeper)
+    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://reelio.test",
+        ) as client:
+            stale_response = await client.post("/api/extractions", json={"url": _SUBMITTED_URL})
+            stored_after_stale_response = await _stored_coordinations(
+                migrated_coordination_database
+            )
+            first_capability_link = server.capability_links[0]
+            replacement_response = await client.post(
+                "/api/extractions",
+                json={"url": _SUBMITTED_URL},
+            )
+
+    assert stale_response.status_code == 503
+    assert stale_response.headers["Retry-After"] == "2"
+    assert stale_response.json() == {
+        "error": {
+            "code": "transcription_unavailable",
+            "message": "Transcription is temporarily unavailable.",
+        }
+    }
+    assert stored_after_stale_response == []
+    assert server.request_paths[:2] == [
+        "/api/v1/transcription-jobs",
+        first_capability_link,
+    ]
+    assert server.admission_bodies[:1] == [
+        {"url": _SUBMITTED_URL, "exclude": ["transcript.segments"]}
+    ]
+    assert replacement_response.status_code == 200
+    assert server.job_count == 2
+    assert len(server.idempotency_keys) == 2
+    assert UUID(server.idempotency_keys[0]).version == 4
+    assert UUID(server.idempotency_keys[1]).version == 4
+    assert server.idempotency_keys[0] != server.idempotency_keys[1]
+
+
+async def _insert_coordination_records(
+    database_url: str,
+    coordination_records: list[dict[str, object]],
+) -> None:
+    """Insert test-only durable coordination records with explicit expiration."""
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO textify_coordination "
+                    "(url_identity, idempotency_key, capability_link, created_at, "
+                    "updated_at, expires_at) "
+                    "VALUES (:url_identity, :idempotency_key, :capability_link, "
+                    ":created_at, :updated_at, :expires_at)"
+                ),
+                coordination_records,
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_public_extraction_replaces_expired_matching_coordination_after_bounded_cleanup(
+    migrated_coordination_database: str,
+) -> None:
+    """Clear one targeted expired record without draining more than one cleanup batch."""
+    server = _TextifyContractServer("faster_whisper")
+
+    async def sleeper(seconds: int) -> None:
+        assert seconds == 0
+
+    expiration_start = datetime.now(UTC) - timedelta(hours=1)
+    unrelated_records: list[dict[str, object]] = []
+    for index in range(101):
+        expires_at = expiration_start + timedelta(seconds=index)
+        created_at = expires_at - timedelta(seconds=1)
+        unrelated_url = f"https://example.invalid/expired/{index}"
+        unrelated_records.append(
+            {
+                "url_identity": hmac.digest(
+                    _HMAC_SECRET.encode("utf-8"),
+                    unrelated_url.encode("utf-8"),
+                    "sha256",
+                ),
+                "idempotency_key": uuid4(),
+                "capability_link": None,
+                "created_at": created_at,
+                "updated_at": created_at,
+                "expires_at": expires_at,
+            }
+        )
+    stale_idempotency_key = uuid4()
+    stale_expires_at = expiration_start + timedelta(seconds=102)
+    stale_created_at = stale_expires_at - timedelta(seconds=1)
+    target_identity = hmac.digest(
+        _HMAC_SECRET.encode("utf-8"),
+        _SUBMITTED_URL.encode("utf-8"),
+        "sha256",
+    )
+    await _insert_coordination_records(
+        migrated_coordination_database,
+        [
+            *unrelated_records,
+            {
+                "url_identity": target_identity,
+                "idempotency_key": stale_idempotency_key,
+                "capability_link": None,
+                "created_at": stale_created_at,
+                "updated_at": stale_created_at,
+                "expires_at": stale_expires_at,
+            },
+        ],
+    )
+
+    pipeline = await _create_pipeline(migrated_coordination_database, server, sleeper)
+    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://reelio.test",
+        ) as client:
+            response = await client.post("/api/extractions", json={"url": _SUBMITTED_URL})
+
+    verification_engine = create_async_engine(migrated_coordination_database)
+    try:
+        async with verification_engine.connect() as connection:
+            expired_count = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM textify_coordination "
+                    "WHERE expires_at <= CURRENT_TIMESTAMP"
+                )
+            )
+            replacement = cast(
+                tuple[UUID, datetime, datetime],
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT idempotency_key, created_at, expires_at "
+                            "FROM textify_coordination WHERE url_identity = :url_identity"
+                        ),
+                        {"url_identity": target_identity},
+                    )
+                ).one(),
+            )
+    finally:
+        await verification_engine.dispose()
+
+    replacement_idempotency_key, replacement_created_at, replacement_expires_at = replacement
+    assert response.status_code == 200
+    assert expired_count == 1
+    assert replacement_idempotency_key != stale_idempotency_key
+    assert replacement_idempotency_key.version == 4
+    assert replacement_expires_at == replacement_created_at + timedelta(days=1)
+    assert replacement_expires_at - replacement_created_at <= timedelta(days=1)
+    assert server.idempotency_keys == [str(replacement_idempotency_key)]
+
+
+async def test_public_extraction_returns_unavailable_before_textify_when_postgres_is_lost(
+    migrated_coordination_database: str,
+) -> None:
+    """Fail closed when the verified coordination database disappears at runtime."""
+    server = _TextifyContractServer("faster_whisper")
+
+    async def sleeper(seconds: int) -> None:
+        assert seconds == 0
+
+    pipeline = await _create_pipeline(migrated_coordination_database, server, sleeper)
+    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+    coordination_url = make_url(migrated_coordination_database)
+    database_name = coordination_url.database
+    assert database_name is not None
+    admin_url = make_url(os.environ["REELIO_TEST_DATABASE_URL"])
+    admin_engine = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        async with application.router.lifespan_context(application):
+            async with admin_engine.connect() as connection:
+                await connection.execute(
+                    text(
+                        "SELECT pg_terminate_backend(pid) "
+                        "FROM pg_stat_activity "
+                        "WHERE datname = :database_name "
+                        "AND pid <> pg_backend_pid()"
+                    ),
+                    {"database_name": database_name},
+                )
+                await connection.execute(text(f'DROP DATABASE "{database_name}"'))
+
+            transport = httpx.ASGITransport(app=application)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://reelio.test",
+            ) as client:
+                response = await client.post("/api/extractions", json={"url": _SUBMITTED_URL})
+    finally:
+        await admin_engine.dispose()
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "2"
+    assert response.json() == {
+        "error": {
+            "code": "transcription_unavailable",
+            "message": "Transcription is temporarily unavailable.",
+        }
+    }
+    assert server.request_paths == []
+    assert server.idempotency_keys == []
