@@ -1502,7 +1502,9 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert retry_after_header["schema"] == {"type": "integer"}
     assert "catalog_provider_failed" in responses["502"]["description"]
     assert "Open Library catalog request failed." in responses["502"]["description"]
-    assert "pipeline_timeout" in responses["504"]["description"]
+    assert "Textify transport or contract failure" in responses["502"]["description"]
+    assert "Textify capacity, job-store, or durable coordination" in responses["503"]["description"]
+    assert "exhausted Textify transport retries" in responses["504"]["description"]
     assert "Open Library catalog request timed out." in responses["504"]["description"]
 
     request_schema = operation["requestBody"]["content"]["application/json"]["schema"]

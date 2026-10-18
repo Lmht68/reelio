@@ -1,7 +1,9 @@
 """Textify source-and-transcript provider HTTP contract tests."""
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import uuid4
 
 import httpx
@@ -9,11 +11,23 @@ import pytest
 
 from reelio.extraction.coordination import TextifyCoordination
 from reelio.extraction.exceptions import TranscriptionError
-from reelio.extraction.services.textify import TextifySourceTranscriptProvider
+from reelio.extraction.services.textify import (
+    TextifyConfig,
+    TextifySourceTranscriptProvider,
+)
 from reelio.extraction.types import Platform, TranscriptMethod
 
 _SUBMITTED_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 _CAPABILITY_LINK = "/api/v1/transcription-jobs/00000000-0000-4000-8000-000000000000"
+_SUBMITTED_AT = "2026-10-14T00:00:00Z"
+_STARTED_AT = "2026-10-14T00:00:01Z"
+_FINISHED_AT = "2026-10-14T00:00:02Z"
+
+
+def _textify_settings(**values: object) -> TextifyConfig:
+    """Create Textify settings without reading environment files."""
+    constructor = cast(Callable[..., TextifyConfig], TextifyConfig)
+    return constructor(_env_file=None, **values)
 
 
 class _CoordinationRepository:
@@ -83,8 +97,13 @@ async def test_provider_submits_commits_and_polls_the_stored_capability() -> Non
                 202,
                 headers={"Location": _CAPABILITY_LINK, "Retry-After": "2"},
                 json={
+                    "id": "00000000-0000-4000-8000-000000000000",
                     "status": "queued",
-                    "links": {"self": _CAPABILITY_LINK},
+                    "submitted_at": _SUBMITTED_AT,
+                    "links": {
+                        "self": _CAPABILITY_LINK,
+                        "cancel": f"{_CAPABILITY_LINK}/cancellation",
+                    },
                     "additive_field": "accepted",
                 },
             )
@@ -98,8 +117,15 @@ async def test_provider_submits_commits_and_polls_the_stored_capability() -> Non
                 200,
                 headers={"Retry-After": "3"},
                 json={
+                    "id": "00000000-0000-4000-8000-000000000000",
                     "status": "processing",
-                    "links": {"self": _CAPABILITY_LINK},
+                    "submitted_at": _SUBMITTED_AT,
+                    "started_at": _STARTED_AT,
+                    "cancellation_requested": False,
+                    "links": {
+                        "self": _CAPABILITY_LINK,
+                        "cancel": f"{_CAPABILITY_LINK}/cancellation",
+                    },
                     "additive_field": "active",
                 },
             )
@@ -107,8 +133,12 @@ async def test_provider_submits_commits_and_polls_the_stored_capability() -> Non
         return httpx.Response(
             200,
             json={
+                "id": "00000000-0000-4000-8000-000000000000",
                 "status": "finished",
                 "outcome": "succeeded",
+                "submitted_at": _SUBMITTED_AT,
+                "started_at": _STARTED_AT,
+                "finished_at": _FINISHED_AT,
                 "links": {"self": _CAPABILITY_LINK},
                 "result": {
                     "source": {
@@ -138,12 +168,13 @@ async def test_provider_submits_commits_and_polls_the_stored_capability() -> Non
     provider = TextifySourceTranscriptProvider(
         client=client,
         coordination_repository=repository,
+        settings=_textify_settings(),
         sleeper=sleeper,
     )
 
     source, transcript = await provider.acquire(_SUBMITTED_URL)
 
-    assert waits == [2, 3]
+    assert waits == [2.0, 3.0]
     assert [request.url.path for request in requests] == [
         "/api/v1/transcription-jobs",
         _CAPABILITY_LINK,
@@ -174,9 +205,13 @@ async def test_provider_rejects_admission_that_does_not_repeat_its_capability() 
                 "Retry-After": "2",
             },
             json={
+                "id": "11111111-1111-4111-8111-111111111111",
                 "status": "queued",
+                "submitted_at": _SUBMITTED_AT,
                 "links": {
-                    "self": "/api/v1/transcription-jobs/11111111-1111-4111-8111-111111111111"
+                    "self": "/api/v1/transcription-jobs/11111111-1111-4111-8111-111111111111",
+                    "cancel": "/api/v1/transcription-jobs/"
+                    "11111111-1111-4111-8111-111111111111/cancellation",
                 },
             },
         )
@@ -189,6 +224,7 @@ async def test_provider_rejects_admission_that_does_not_repeat_its_capability() 
     provider = TextifySourceTranscriptProvider(
         client=client,
         coordination_repository=repository,
+        settings=_textify_settings(),
         sleeper=lambda seconds: pytest.fail(f"unexpected poll wait: {seconds}"),
     )
 

@@ -1,12 +1,27 @@
 """Textify HTTP adapter and settings."""
 
 import asyncio
+import logging
+import re
+import time
 from collections.abc import Awaitable, Callable
-from typing import Literal
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal, NoReturn
 from urllib.parse import urlparse
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    UUID4,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+    field_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from reelio.extraction.coordination import (
@@ -18,8 +33,14 @@ from reelio.extraction.coordination import (
     create_postgres_textify_coordination,
 )
 from reelio.extraction.exceptions import (
+    DurationLimitExceededError,
+    InvalidSourceError,
+    MetadataProviderError,
+    PipelineTimeoutError,
+    SourceUnavailableError,
     TranscriptionError,
     TranscriptionUnavailableError,
+    UnsupportedPlatformError,
 )
 from reelio.extraction.types import (
     Platform,
@@ -29,13 +50,30 @@ from reelio.extraction.types import (
     normalize_transcript_segments,
 )
 
+logger = logging.getLogger(__name__)
+
 _TRANSCRIPTION_JOBS_PATH = "/api/v1/transcription-jobs"
+_CAPABILITY_LINK_PATTERN = re.compile(
+    r"/api/v1/transcription-jobs/"
+    r"(?P<job_id>[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-"
+    r"[0-9a-f]{12})"
+)
+_TRANSPORT_RETRY_DELAY_SECONDS = 1.0
 _TRANSCRIPTION_FAILURE_MESSAGE = "Transcript is unavailable for this video."
 _TRANSCRIPTION_UNAVAILABLE_MESSAGE = "Transcription is temporarily unavailable."
+_INVALID_SOURCE_MESSAGE = "Invalid source URL."
+_UNSUPPORTED_PLATFORM_MESSAGE = (
+    "Only YouTube, Instagram, Facebook, TikTok, and X URLs are supported."
+)
+_SOURCE_UNAVAILABLE_MESSAGE = "Source is unavailable."
+_DURATION_LIMIT_MESSAGE = "Video exceeds the configured duration limit."
+_METADATA_FAILURE_MESSAGE = "Unable to retrieve source metadata."
+_METADATA_TIMEOUT_MESSAGE = "Source metadata acquisition timed out."
+_TRANSCRIPT_TIMEOUT_MESSAGE = "Transcript acquisition timed out."
 
 
 class TextifyConfig(BaseSettings):
-    """Validate the private HTTP origin and timeout used for Textify requests."""
+    """Validate private Textify HTTP and bounded retry settings."""
 
     model_config = SettingsConfigDict(
         env_prefix="REELIO_TEXTIFY_",
@@ -46,7 +84,17 @@ class TextifyConfig(BaseSettings):
     )
 
     origin: str = "http://textify:8182"
-    request_timeout_seconds: float = Field(default=5.0, gt=0)
+    request_timeout_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    admission_capacity_retry_budget_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    transport_retry_budget_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
 
     @field_validator("origin")
     @classmethod
@@ -85,49 +133,115 @@ class TextifyConfig(BaseSettings):
         return origin
 
 
+type _TextifyErrorCode = Literal[
+    "invalid_url",
+    "unsupported_platform",
+    "invalid_request",
+    "unsupported_content",
+    "video_too_long",
+    "invalid_media_duration",
+    "unsupported_media",
+    "no_usable_transcript",
+    "metadata_retrieval_failed",
+    "audio_download_failed",
+    "transcription_failed",
+    "transcription_capacity_exceeded",
+    "idempotency_conflict",
+    "job_not_found",
+    "job_already_finished",
+    "job_store_unavailable",
+    "queue_timeout",
+    "worker_interrupted",
+    "metadata_timeout",
+    "audio_download_timeout",
+    "transcription_timeout",
+    "internal_error",
+]
+
+
 class _TextifyModel(BaseModel):
-    """Accept only known type-correct Textify fields while ignoring additions."""
+    """Validate required Textify fields while ignoring additive version-one fields."""
 
-    model_config = ConfigDict(extra="ignore", strict=True)
+    model_config = ConfigDict(extra="ignore")
+
+    @field_validator("id", mode="before", check_fields=False)
+    @classmethod
+    def _require_uuid_string(cls, value: object) -> object:
+        """Reject non-string job identifiers before UUID version validation."""
+        if not isinstance(value, str):
+            raise ValueError("Textify job identifier must be a string")
+        return value
+
+    @field_validator(
+        "submitted_at",
+        "started_at",
+        "finished_at",
+        mode="before",
+        check_fields=False,
+    )
+    @classmethod
+    def _require_timestamp_string(cls, value: object) -> object:
+        """Reject non-string timestamps before ISO 8601 validation."""
+        if value is not None and not isinstance(value, str):
+            raise ValueError("Textify timestamp must be a string")
+        return value
+
+    @field_validator(
+        "submitted_at",
+        "started_at",
+        "finished_at",
+        check_fields=False,
+    )
+    @classmethod
+    def _require_aware_timestamp(cls, value: datetime | None) -> datetime | None:
+        """Require timezone-aware Textify lifecycle timestamps."""
+        if value is not None and value.tzinfo is None:
+            raise ValueError("Textify timestamp must include a timezone")
+        return value
 
 
-class _TextifyLinks(_TextifyModel):
-    """Read the polling bearer capability from a Textify response."""
+class _ActiveTextifyLinks(_TextifyModel):
+    """Read active polling and cancellation capabilities."""
 
-    self: str
+    self: StrictStr
+    cancel: StrictStr
+
+
+class _FinishedTextifyLinks(_TextifyModel):
+    """Read a retained terminal polling capability."""
+
+    self: StrictStr
 
 
 class _QueuedJobResponse(_TextifyModel):
-    """Read a queued admission response."""
+    """Read one queued Textify job."""
 
+    id: UUID4
     status: Literal["queued"]
-    links: _TextifyLinks
+    submitted_at: datetime
+    links: _ActiveTextifyLinks
 
 
-class _JobStatusResponse(_TextifyModel):
-    """Read the common status and capability from any polling response."""
+class _ProcessingJobResponse(_TextifyModel):
+    """Read one processing Textify job."""
 
-    status: Literal["queued", "processing", "finished"]
-    links: _TextifyLinks
-
-
-class _FinishedJobResponse(_TextifyModel):
-    """Read one terminal Textify job outcome."""
-
-    status: Literal["finished"]
-    outcome: Literal["succeeded", "failed", "cancelled"]
-    links: _TextifyLinks
+    id: UUID4
+    status: Literal["processing"]
+    submitted_at: datetime
+    started_at: datetime
+    cancellation_requested: StrictBool
+    links: _ActiveTextifyLinks
 
 
 class _TextifyError(_TextifyModel):
-    """Read one Textify error without exposing it to Reelio callers."""
+    """Read one documented Textify error without exposing its message."""
 
-    code: str
-    message: str
+    code: _TextifyErrorCode
+    message: StrictStr = Field(min_length=1)
 
 
 class _TextifyErrorResponse(_TextifyModel):
-    """Read a Textify error envelope."""
+    """Read one Textify error envelope."""
 
     error: _TextifyError
 
@@ -135,21 +249,21 @@ class _TextifyErrorResponse(_TextifyModel):
 class _TextifySource(_TextifyModel):
     """Read the complete Source projection required by Reelio."""
 
-    platform: str
-    video_id: str
-    url: str
-    title: str
-    description: str
-    channel: str
-    duration_seconds: int
+    platform: StrictStr
+    video_id: StrictStr
+    url: StrictStr
+    title: StrictStr
+    description: StrictStr
+    channel: StrictStr
+    duration_seconds: StrictInt
 
 
 class _TextifyTranscript(_TextifyModel):
     """Read the compact Transcript projection required by Reelio."""
 
     method: Literal["youtube_captions", "faster_whisper"]
-    language: str
-    text: str
+    language: StrictStr
+    text: StrictStr
 
 
 class _TextifyResult(_TextifyModel):
@@ -162,10 +276,48 @@ class _TextifyResult(_TextifyModel):
 class _SucceededJobResponse(_TextifyModel):
     """Read a completed successful Textify job."""
 
+    id: UUID4
     status: Literal["finished"]
     outcome: Literal["succeeded"]
-    links: _TextifyLinks
+    submitted_at: datetime
+    started_at: datetime
+    finished_at: datetime
     result: _TextifyResult
+    links: _FinishedTextifyLinks
+
+
+class _FailedJobResponse(_TextifyModel):
+    """Read a completed failed Textify job."""
+
+    id: UUID4
+    status: Literal["finished"]
+    outcome: Literal["failed"]
+    submitted_at: datetime
+    started_at: datetime | None
+    finished_at: datetime
+    error: _TextifyError
+    links: _FinishedTextifyLinks
+
+
+class _CancelledJobResponse(_TextifyModel):
+    """Read a completed cancelled Textify job."""
+
+    id: UUID4
+    status: Literal["finished"]
+    outcome: Literal["cancelled"]
+    submitted_at: datetime
+    started_at: datetime | None
+    finished_at: datetime
+    links: _FinishedTextifyLinks
+
+
+type _TextifyJobResponse = (
+    _QueuedJobResponse
+    | _ProcessingJobResponse
+    | _SucceededJobResponse
+    | _FailedJobResponse
+    | _CancelledJobResponse
+)
 
 
 class TextifySourceTranscriptProvider:
@@ -175,17 +327,24 @@ class TextifySourceTranscriptProvider:
         self,
         client: httpx.AsyncClient,
         coordination_repository: TextifyCoordinationRepository,
-        sleeper: Callable[[int], Awaitable[None]] = asyncio.sleep,
+        settings: TextifyConfig,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         """Initialize the provider with owned HTTP and coordination resources.
 
         Args:
             client: No-redirect Textify HTTP client resolved against the configured origin.
             coordination_repository: Durable admission state owner.
-            sleeper: Awaitable delay used to honor active Textify polling instructions.
+            settings: Validated Textify request and retry policy.
+            clock: Monotonic clock used to bound retry sequences.
+            sleeper: Awaitable delay used for Textify and transport retry instructions.
         """
         self._client = client
         self._coordination_repository = coordination_repository
+        self._settings = settings
+        self._clock = clock
         self._sleeper = sleeper
 
     async def acquire(self, submitted_url: str) -> tuple[Source, Transcript]:
@@ -198,21 +357,20 @@ class TextifySourceTranscriptProvider:
             Reelio-owned normalized Source and Transcript values.
 
         Raises:
-            TranscriptionError: If Textify does not follow its successful job contract.
-            TranscriptionUnavailableError: If durable coordination is unavailable or stale.
+            TranscriptionError: If Textify returns invalid or unusable job data.
+            TranscriptionUnavailableError: If coordination, admission, or job storage
+                is temporarily unavailable.
+            PipelineTimeoutError: If Textify communication exhausts its timeout budget.
         """
         try:
             coordination = await self._coordination_repository.get_or_create(submitted_url)
         except CoordinationUnavailableError:
             raise _transcription_unavailable() from None
+
         capability_link = coordination.capability_link
         if capability_link is None:
             admission = await self._submit(submitted_url, str(coordination.idempotency_key))
             capability_link = admission.links.self
-            location = admission.response.headers.get("Location")
-            if location != capability_link:
-                raise _transcription_failure()
-
             try:
                 accepted = await self._coordination_repository.attach_capability(
                     coordination,
@@ -222,36 +380,49 @@ class TextifySourceTranscriptProvider:
                 raise _transcription_unavailable() from None
             except CoordinationError:
                 raise _transcription_failure() from None
+
             coordination = accepted
             stored_capability_link = coordination.capability_link
             if stored_capability_link is None or stored_capability_link != capability_link:
-                raise _transcription_failure()
+                _invalid_textify_response("coordination_capability_mismatch")
             capability_link = stored_capability_link
-            retry_after = _retry_after(admission.response)
+            retry_after: float = float(admission.retry_after)
         else:
-            retry_after = 0
+            retry_after = 0.0
+
         while True:
             await self._sleeper(retry_after)
-            response = await self._get(capability_link)
-            if response.status_code == httpx.codes.NOT_FOUND:
-                textify_error = _parse_error_response(response)
-                if textify_error.error.code == "job_not_found":
+            response, inspection = await self._get(capability_link)
+            if isinstance(inspection, _TextifyError):
+                if (
+                    response.status_code == httpx.codes.NOT_FOUND
+                    and inspection.code == "job_not_found"
+                ):
                     await self._retire(coordination)
-                    raise _transcription_unavailable()
-                raise _transcription_failure()
-            job_status = _parse_job_status(response)
-            if job_status.links.self != capability_link:
-                raise _transcription_failure()
-            if job_status.status in {"queued", "processing"}:
-                retry_after = _retry_after(response)
-                continue
+                    raise _transcription_unavailable() from None
+                if (
+                    response.status_code == httpx.codes.SERVICE_UNAVAILABLE
+                    and inspection.code == "job_store_unavailable"
+                ):
+                    raise _transcription_unavailable() from None
+                _invalid_textify_response("incompatible_polling_error")
 
-            finished = _parse_finished_job(response)
-            if finished.outcome in {"failed", "cancelled"}:
+            if inspection.links.self != capability_link:
+                _invalid_textify_response("stored_capability_mismatch")
+            if isinstance(inspection, (_QueuedJobResponse, _ProcessingJobResponse)):
+                retry_after = float(_retry_after(response))
+                continue
+            if isinstance(inspection, _FailedJobResponse):
+                if not _is_terminal_failure_code(inspection.error.code):
+                    _invalid_textify_response("incompatible_terminal_error")
+                terminal_error = _terminal_exception(inspection.error.code)
+                _log_adapter_event("terminal_job_failed", inspection.error.code)
                 await self._retire(coordination)
-                raise _transcription_failure()
-            succeeded = _parse_succeeded_job(response)
-            return _to_reelio_result(succeeded.result)
+                raise terminal_error from None
+            if isinstance(inspection, _CancelledJobResponse):
+                await self._retire(coordination)
+                raise _transcription_failure() from None
+            return _to_reelio_result(inspection.result)
 
     async def aclose(self) -> None:
         """Close the owned HTTP client and coordination repository."""
@@ -277,6 +448,68 @@ class TextifySourceTranscriptProvider:
         except CoordinationError:
             raise _transcription_failure() from None
 
+    async def _request_with_transport_retries(
+        self,
+        send: Callable[[float], Awaitable[httpx.Response]],
+        capacity_deadline: float | None = None,
+    ) -> httpx.Response:
+        """Send one logical Textify request within bounded transport retries.
+
+        Args:
+            send: Sends one request with its capped per-attempt timeout.
+            capacity_deadline: Optional admission-capacity deadline that also bounds
+                transport retries.
+
+        Returns:
+            The first Textify HTTP response received.
+
+        Raises:
+            TranscriptionError: If non-timeout communication retries exhaust.
+            TranscriptionUnavailableError: If capacity retry time expires first.
+            PipelineTimeoutError: If timeout communication retries exhaust.
+        """
+        transport_deadline = self._clock() + self._settings.transport_retry_budget_seconds
+        last_error: httpx.TransportError | None = None
+        while True:
+            now = self._clock()
+            if capacity_deadline is not None and now >= capacity_deadline:
+                raise _capacity_exhausted() from None
+            deadline = (
+                min(transport_deadline, capacity_deadline)
+                if capacity_deadline is not None
+                else transport_deadline
+            )
+            remaining_seconds = deadline - now
+            if remaining_seconds <= 0:
+                if capacity_deadline is not None and deadline == capacity_deadline:
+                    raise _capacity_exhausted() from None
+                _raise_transport_exhausted(last_error)
+
+            try:
+                return await send(min(self._settings.request_timeout_seconds, remaining_seconds))
+            except asyncio.CancelledError:
+                raise
+            except httpx.TransportError as exc:
+                last_error = exc
+
+            now = self._clock()
+            if capacity_deadline is not None and now >= capacity_deadline:
+                raise _capacity_exhausted() from None
+            if now >= transport_deadline:
+                _raise_transport_exhausted(last_error)
+
+            deadline = (
+                min(transport_deadline, capacity_deadline)
+                if capacity_deadline is not None
+                else transport_deadline
+            )
+            remaining_seconds = deadline - now
+            if remaining_seconds <= 0:
+                if capacity_deadline is not None and deadline == capacity_deadline:
+                    raise _capacity_exhausted() from None
+                _raise_transport_exhausted(last_error)
+            await self._sleeper(min(_TRANSPORT_RETRY_DELAY_SECONDS, remaining_seconds))
+
     async def _submit(
         self,
         submitted_url: str,
@@ -289,166 +522,274 @@ class TextifySourceTranscriptProvider:
             idempotency_key: Canonical UUIDv4 committed before admission.
 
         Returns:
-            Validated accepted Textify admission response and its retry instruction.
+            Validated accepted Textify admission response and retry instruction.
 
         Raises:
-            TranscriptionError: If Textify does not return the accepted contract.
+            TranscriptionError: If Textify rejects or violates its admission contract.
+            TranscriptionUnavailableError: If capacity or job storage is unavailable.
+            PipelineTimeoutError: If communication retries exhaust after timeouts.
         """
-        try:
-            response = await self._client.post(
-                _TRANSCRIPTION_JOBS_PATH,
-                json={"url": submitted_url, "exclude": ["transcript.segments"]},
-                headers={"Idempotency-Key": idempotency_key},
-            )
-        except httpx.HTTPError:
-            raise _transcription_failure() from None
-        if response.status_code != httpx.codes.ACCEPTED:
-            raise _transcription_failure()
-        return _Admission(
-            response=response,
-            links=_parse_admission(response),
-        )
+        request_body = {
+            "url": submitted_url,
+            "exclude": ["transcript.segments"],
+        }
+        headers = {"Idempotency-Key": idempotency_key}
 
-    async def _get(self, capability_link: str) -> httpx.Response:
+        async def send(timeout: float) -> httpx.Response:
+            """Send an unchanged admission attempt with a capped timeout."""
+            return await self._client.post(
+                _TRANSCRIPTION_JOBS_PATH,
+                json=request_body,
+                headers=headers,
+                timeout=timeout,
+            )
+
+        capacity_deadline: float | None = None
+        while True:
+            if capacity_deadline is not None and self._clock() >= capacity_deadline:
+                raise _capacity_exhausted() from None
+            response = await self._request_with_transport_retries(
+                send,
+                capacity_deadline,
+            )
+            if response.status_code == httpx.codes.ACCEPTED:
+                return _parse_admission(response)
+
+            textify_error = _parse_error_response(response)
+            if (
+                response.status_code == httpx.codes.SERVICE_UNAVAILABLE
+                and textify_error.code == "transcription_capacity_exceeded"
+            ):
+                _log_adapter_event("admission_rejected", textify_error.code)
+                retry_after = _retry_after(response)
+                now = self._clock()
+                if capacity_deadline is None:
+                    capacity_deadline = now + self._settings.admission_capacity_retry_budget_seconds
+                remaining_seconds = capacity_deadline - now
+                if remaining_seconds <= 0 or float(retry_after) > remaining_seconds:
+                    raise _capacity_exhausted() from None
+                await self._sleeper(float(retry_after))
+                continue
+
+            if not _is_admission_error_pair(
+                response.status_code,
+                textify_error.code,
+            ):
+                _invalid_textify_response("unexpected_admission_error")
+            _log_adapter_event("admission_rejected", textify_error.code)
+            raise _admission_exception(textify_error.code) from None
+
+    async def _get(
+        self,
+        capability_link: str,
+    ) -> tuple[httpx.Response, _TextifyJobResponse | _TextifyError]:
         """Inspect one stored relative Textify bearer capability.
 
         Args:
             capability_link: Validated relative polling capability stored by Reelio.
 
         Returns:
-            A successful or stale-capability Textify inspection response.
+            The received response and its validated lifecycle or error projection.
 
         Raises:
-            TranscriptionError: If inspection cannot return an expected HTTP status.
+            TranscriptionError: If inspection violates Textify's documented contract.
+            PipelineTimeoutError: If communication retries exhaust after timeouts.
         """
-        try:
-            response = await self._client.get(capability_link)
-        except httpx.HTTPError:
-            raise _transcription_failure() from None
-        if response.status_code not in {httpx.codes.OK, httpx.codes.NOT_FOUND}:
-            raise _transcription_failure()
-        return response
+
+        async def send(timeout: float) -> httpx.Response:
+            """Send one polling request with a capped timeout."""
+            return await self._client.get(capability_link, timeout=timeout)
+
+        response = await self._request_with_transport_retries(send)
+        if response.status_code == httpx.codes.OK:
+            return response, _parse_job_response(response)
+
+        textify_error = _parse_error_response(response)
+        if not _is_polling_error_pair(response.status_code, textify_error.code):
+            _invalid_textify_response("unexpected_polling_error")
+        _log_adapter_event("polling_rejected", textify_error.code)
+        return response, textify_error
 
 
+@dataclass(frozen=True, slots=True)
 class _Admission:
-    """Pair an accepted HTTP response with its parsed Textify capability link."""
+    """Contain one validated accepted Textify admission."""
 
-    def __init__(self, response: httpx.Response, links: _TextifyLinks) -> None:
-        """Initialize one accepted admission response.
-
-        Args:
-            response: HTTP acceptance response containing the retry instruction.
-            links: Validated JSON links representation.
-        """
-        self.response = response
-        self.links = links
+    links: _ActiveTextifyLinks
+    retry_after: int
 
 
-def _parse_admission(response: httpx.Response) -> _TextifyLinks:
-    """Parse a strict queued admission body without preserving provider data.
+def _parse_admission(response: httpx.Response) -> _Admission:
+    """Parse one complete queued admission response.
 
     Args:
         response: Accepted Textify admission response.
 
     Returns:
-        Parsed relative polling capability links.
-
-    Raises:
-        TranscriptionError: If the body is absent or malformed.
+        Validated admission links and the initial polling instruction.
     """
-    try:
-        return _QueuedJobResponse.model_validate(response.json()).links
-    except (ValidationError, ValueError):
-        raise _transcription_failure() from None
+    job = _parse_job_response(response)
+    if not isinstance(job, _QueuedJobResponse):
+        _invalid_textify_response("admission_lifecycle_mismatch")
+    if response.headers.get("Location") != job.links.self:
+        _invalid_textify_response("admission_location_mismatch")
+    return _Admission(links=job.links, retry_after=_retry_after(response))
 
 
-def _parse_job_status(response: httpx.Response) -> _JobStatusResponse:
-    """Parse common strict status fields without retaining raw provider data.
+def _parse_job_response(response: httpx.Response) -> _TextifyJobResponse:
+    """Parse exactly one known complete Textify job response variant.
 
     Args:
-        response: Successful Textify job inspection response.
+        response: Successful Textify job lifecycle response.
 
     Returns:
-        Parsed status and polling capability link.
-
-    Raises:
-        TranscriptionError: If the body is absent or malformed.
+        One validated queued, processing, succeeded, failed, or cancelled job.
     """
     try:
-        return _JobStatusResponse.model_validate(response.json())
-    except (ValidationError, ValueError):
-        raise _transcription_failure() from None
+        body: object = response.json()
+    except ValueError:
+        _invalid_textify_response("malformed_job_response")
+    if not isinstance(body, dict):
+        _invalid_textify_response("job_response_not_object")
+
+    status = body.get("status")
+    job: _TextifyJobResponse
+    try:
+        if status == "queued":
+            job = _QueuedJobResponse.model_validate(body)
+        elif status == "processing":
+            job = _ProcessingJobResponse.model_validate(body)
+        elif status != "finished":
+            _invalid_textify_response("unknown_job_status")
+        else:
+            outcome = body.get("outcome")
+            if outcome == "succeeded":
+                job = _SucceededJobResponse.model_validate(body)
+            elif outcome == "failed":
+                job = _FailedJobResponse.model_validate(body)
+            elif outcome == "cancelled":
+                job = _CancelledJobResponse.model_validate(body)
+            else:
+                _invalid_textify_response("unknown_job_outcome")
+    except ValidationError:
+        _invalid_textify_response("invalid_job_response")
+
+    _validate_job_links(job)
+    return job
 
 
-def _parse_finished_job(response: httpx.Response) -> _FinishedJobResponse:
-    """Parse one finished Textify job outcome.
+def _validate_job_links(job: _TextifyJobResponse) -> None:
+    """Validate one job's exact capability links against its public identifier.
 
     Args:
-        response: Finished Textify job inspection response.
-
-    Returns:
-        Parsed terminal job status and outcome.
-
-    Raises:
-        TranscriptionError: If the terminal response is malformed.
+        job: Parsed lifecycle response with version-one links.
     """
-    try:
-        return _FinishedJobResponse.model_validate(response.json())
-    except (ValidationError, ValueError):
-        raise _transcription_failure() from None
+    self_link = job.links.self
+    match = _CAPABILITY_LINK_PATTERN.fullmatch(self_link)
+    if match is None or match.group("job_id") != str(job.id):
+        _invalid_textify_response("unsafe_job_self_link")
+    if isinstance(job, (_QueuedJobResponse, _ProcessingJobResponse)):
+        if job.links.cancel != f"{self_link}/cancellation":
+            _invalid_textify_response("unsafe_job_cancellation_link")
 
 
-def _parse_error_response(response: httpx.Response) -> _TextifyErrorResponse:
-    """Parse one Textify error envelope.
+def _parse_error_response(response: httpx.Response) -> _TextifyError:
+    """Parse one documented Textify error envelope without retaining its message.
 
     Args:
         response: Textify error response to validate before branching.
 
     Returns:
-        Parsed Textify error details.
-
-    Raises:
-        TranscriptionError: If the error response is malformed.
+        Validated machine-readable provider error.
     """
     try:
-        return _TextifyErrorResponse.model_validate(response.json())
+        return _TextifyErrorResponse.model_validate(response.json()).error
     except (ValidationError, ValueError):
-        raise _transcription_failure() from None
+        _invalid_textify_response("invalid_error_response")
 
 
-def _parse_succeeded_job(response: httpx.Response) -> _SucceededJobResponse:
-    """Parse a strict successful Textify completion body.
+def _is_admission_error_pair(status_code: int, code: _TextifyErrorCode) -> bool:
+    """Return whether a documented admission HTTP status permits one error code."""
+    return (
+        (status_code == httpx.codes.BAD_REQUEST and code in {"invalid_url", "unsupported_platform"})
+        or (status_code == httpx.codes.UNPROCESSABLE_ENTITY and code == "invalid_request")
+        or (status_code == httpx.codes.CONFLICT and code == "idempotency_conflict")
+        or (
+            status_code == httpx.codes.SERVICE_UNAVAILABLE
+            and code in {"transcription_capacity_exceeded", "job_store_unavailable"}
+        )
+        or (status_code == httpx.codes.INTERNAL_SERVER_ERROR and code == "internal_error")
+    )
 
-    Args:
-        response: Finished Textify job inspection response.
 
-    Returns:
-        Parsed successful Source-and-Transcript result.
+def _is_polling_error_pair(status_code: int, code: _TextifyErrorCode) -> bool:
+    """Return whether a documented polling HTTP status permits one error code."""
+    return (
+        (status_code == httpx.codes.NOT_FOUND and code == "job_not_found")
+        or (status_code == httpx.codes.UNPROCESSABLE_ENTITY and code == "invalid_request")
+        or (status_code == httpx.codes.SERVICE_UNAVAILABLE and code == "job_store_unavailable")
+        or (status_code == httpx.codes.INTERNAL_SERVER_ERROR and code == "internal_error")
+    )
 
-    Raises:
-        TranscriptionError: If the job is not a successful valid completion.
-    """
-    try:
-        return _SucceededJobResponse.model_validate(response.json())
-    except (ValidationError, ValueError):
-        raise _transcription_failure() from None
+
+def _admission_exception(code: _TextifyErrorCode) -> Exception:
+    """Translate one documented admission rejection into a Reelio exception."""
+    if code == "invalid_url":
+        return InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+    if code == "unsupported_platform":
+        return UnsupportedPlatformError(_UNSUPPORTED_PLATFORM_MESSAGE)
+    if code == "job_store_unavailable":
+        return _transcription_unavailable()
+    return _transcription_failure()
+
+
+def _is_terminal_failure_code(code: _TextifyErrorCode) -> bool:
+    """Return whether one Textify error code is valid in a failed job response."""
+    return code not in {
+        "invalid_request",
+        "idempotency_conflict",
+        "job_not_found",
+        "job_already_finished",
+    }
+
+
+def _terminal_exception(code: _TextifyErrorCode) -> Exception:
+    """Translate one documented terminal Textify failure into Reelio's contract."""
+    if code in {"invalid_url", "unsupported_media"}:
+        return InvalidSourceError(_INVALID_SOURCE_MESSAGE)
+    if code == "unsupported_platform":
+        return UnsupportedPlatformError(_UNSUPPORTED_PLATFORM_MESSAGE)
+    if code == "unsupported_content":
+        return SourceUnavailableError(_SOURCE_UNAVAILABLE_MESSAGE)
+    if code == "video_too_long":
+        return DurationLimitExceededError(_DURATION_LIMIT_MESSAGE)
+    if code in {"invalid_media_duration", "metadata_retrieval_failed"}:
+        return MetadataProviderError(_METADATA_FAILURE_MESSAGE)
+    if code == "metadata_timeout":
+        return PipelineTimeoutError(_METADATA_TIMEOUT_MESSAGE)
+    if code in {
+        "queue_timeout",
+        "audio_download_timeout",
+        "transcription_timeout",
+    }:
+        return PipelineTimeoutError(_TRANSCRIPT_TIMEOUT_MESSAGE)
+    if code in {"transcription_capacity_exceeded", "job_store_unavailable"}:
+        return _transcription_unavailable()
+    return _transcription_failure()
 
 
 def _retry_after(response: httpx.Response) -> int:
     """Read one nonnegative integer Textify retry instruction.
 
     Args:
-        response: Active Textify response carrying the retry header.
+        response: Active or capacity Textify response carrying the retry header.
 
     Returns:
         Exact integer retry delay for the injected sleeper.
-
-    Raises:
-        TranscriptionError: If the retry header is missing or malformed.
     """
     retry_after = response.headers.get("Retry-After")
     if retry_after is None or not retry_after.isascii() or not retry_after.isdecimal():
-        raise _transcription_failure()
+        _invalid_textify_response("invalid_retry_after")
     return int(retry_after)
 
 
@@ -460,9 +801,6 @@ def _to_reelio_result(result: _TextifyResult) -> tuple[Source, Transcript]:
 
     Returns:
         Reelio-owned Source and Transcript values.
-
-    Raises:
-        TranscriptionError: If required Reelio values are invalid or unnormalized.
     """
     source = result.source
     transcript = result.transcript
@@ -473,35 +811,68 @@ def _to_reelio_result(result: _TextifyResult) -> tuple[Source, Transcript]:
         or not transcript.language.strip()
         or transcript.language != transcript.language.strip()
     ):
-        raise _transcription_failure()
+        _invalid_textify_response("invalid_result_projection")
     normalized_text = normalize_transcript_segments([transcript.text])
     if not normalized_text or normalized_text != transcript.text:
-        raise _transcription_failure()
+        _invalid_textify_response("unnormalized_result_transcript")
     try:
         platform = Platform(source.platform)
-    except ValueError:
-        raise _transcription_failure() from None
-    method = (
-        TranscriptMethod.WHISPER
-        if transcript.method == "faster_whisper"
-        else TranscriptMethod.YOUTUBE_CAPTIONS
-    )
-    return (
-        Source(
-            platform=platform,
-            video_id=source.video_id,
-            url=source.url,
-            title=source.title,
-            description=source.description,
-            channel=source.channel,
-            duration_seconds=source.duration_seconds,
-        ),
-        Transcript(
-            text=transcript.text,
-            language=transcript.language,
-            method=method,
-        ),
-    )
+        transcript_method = (
+            TranscriptMethod.WHISPER
+            if transcript.method == "faster_whisper"
+            else TranscriptMethod.YOUTUBE_CAPTIONS
+        )
+        return (
+            Source(
+                platform=platform,
+                video_id=source.video_id,
+                url=source.url,
+                title=source.title,
+                description=source.description,
+                channel=source.channel,
+                duration_seconds=source.duration_seconds,
+            ),
+            Transcript(
+                text=transcript.text,
+                language=transcript.language,
+                method=transcript_method,
+            ),
+        )
+    except (ValidationError, ValueError):
+        _invalid_textify_response("invalid_result_projection")
+
+
+def _log_adapter_event(reason: str, code: _TextifyErrorCode | None = None) -> None:
+    """Record a controlled Textify adapter event without provider data."""
+    extra = {
+        "operation": "textify_adapter",
+        "stage": "transcription",
+        "reason": reason,
+    }
+    if code is not None:
+        extra["code"] = code
+    logger.warning("textify_adapter_event", extra=extra)
+
+
+def _invalid_textify_response(reason: str) -> NoReturn:
+    """Log one controlled contract-validation failure and raise a safe error."""
+    _log_adapter_event(reason)
+    raise _transcription_failure() from None
+
+
+def _capacity_exhausted() -> TranscriptionUnavailableError:
+    """Create safe temporary unavailability after capacity retry expiration."""
+    _log_adapter_event("admission_capacity_retry_exhausted")
+    return _transcription_unavailable()
+
+
+def _raise_transport_exhausted(error: httpx.TransportError | None) -> NoReturn:
+    """Raise the public transport failure contract without exception chaining."""
+    if isinstance(error, httpx.TimeoutException):
+        _log_adapter_event("transport_timeout_retry_exhausted")
+        raise PipelineTimeoutError(_TRANSCRIPT_TIMEOUT_MESSAGE) from None
+    _log_adapter_event("transport_retry_exhausted")
+    raise _transcription_failure() from None
 
 
 def _transcription_failure() -> TranscriptionError:
@@ -510,7 +881,7 @@ def _transcription_failure() -> TranscriptionError:
 
 
 def _transcription_unavailable() -> TranscriptionUnavailableError:
-    """Create the stable temporary-unavailability response for coordination loss."""
+    """Create the stable temporary-unavailability response."""
     return TranscriptionUnavailableError(_TRANSCRIPTION_UNAVAILABLE_MESSAGE)
 
 
@@ -521,7 +892,7 @@ async def create_textify_source_transcript_provider(
     """Construct one verified durable Textify Source-and-Transcript provider.
 
     Args:
-        textify_settings: Validated Textify origin and per-attempt timeout.
+        textify_settings: Validated Textify origin, timeout, and retry policy.
         coordination_settings: Validated dedicated coordination database settings.
 
     Returns:
@@ -541,4 +912,5 @@ async def create_textify_source_transcript_provider(
     return TextifySourceTranscriptProvider(
         client=client,
         coordination_repository=coordination_repository,
+        settings=textify_settings,
     )

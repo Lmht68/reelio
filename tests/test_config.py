@@ -584,9 +584,28 @@ def test_textify_rejects_nonpositive_attempt_timeouts(
         )
 
 
-def test_textify_uses_documented_origin_and_timeout_defaults() -> None:
-    """Use the private Textify HTTP endpoint with a short attempt timeout."""
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "admission_capacity_retry_budget_seconds",
+        "transport_retry_budget_seconds",
+    ],
+)
+@pytest.mark.parametrize("budget_seconds", [0, -1, float("inf"), "not-a-number"])
+def test_textify_rejects_nonpositive_or_nonfinite_retry_budgets(
+    field_name: str,
+    budget_seconds: object,
+) -> None:
+    """Require finite positive Textify retry budgets."""
+    with pytest.raises(ValidationError):
+        _without_dotenv(TextifyConfig, **{field_name: budget_seconds})
+
+
+def test_textify_uses_documented_origin_timeout_and_retry_budget_defaults() -> None:
+    """Use the private Textify HTTP endpoint with bounded retry defaults."""
     settings = _without_dotenv(TextifyConfig)
 
     assert settings.origin == "http://textify:8182"
     assert settings.request_timeout_seconds == 5.0
+    assert settings.admission_capacity_retry_budget_seconds == 10.0
+    assert settings.transport_retry_budget_seconds == 30.0

@@ -73,7 +73,7 @@ class TranscriptionError(ExtractionError):
 
 
 class TranscriptionUnavailableError(ExtractionError):
-    """Indicate that Textify coordination is temporarily unavailable."""
+    """Indicate temporary Textify capacity, job-store, or coordination unavailability."""
 
     code = "transcription_unavailable"
     status_code = 503

@@ -662,21 +662,23 @@ def _to_transcript_response(
         502: {
             "model": extraction_schemas.ErrorResponse,
             "description": (
-                "Metadata, transcript, LLM, TMDB, Spotify, or Open Library provider "
-                "failure. Any TMDB, Spotify, or Open Library provider failure fails "
-                "the complete request. Open Library failures are atomic with "
-                "catalog_provider_failed and message Open Library catalog request "
-                "failed."
+                "Metadata, transcript, LLM, TMDB, Spotify, Open Library, or Textify "
+                "transport or contract failure. Any TMDB, Spotify, or Open Library "
+                "provider failure fails the complete request. Open Library failures are "
+                "atomic with catalog_provider_failed and message Open Library catalog "
+                "request failed."
             ),
         },
         503: {
             "model": extraction_schemas.ErrorResponse,
-            "description": "Textify coordination is temporarily unavailable.",
+            "description": (
+                "Textify capacity, job-store, or durable coordination is temporarily unavailable."
+            ),
             "headers": {
                 "Retry-After": {
                     "description": (
-                        "Whole seconds to wait before retrying temporary Textify "
-                        "coordination unavailability."
+                        "Whole seconds to wait before retrying temporary Textify capacity, "
+                        "job-store, or coordination unavailability."
                     ),
                     "schema": {"type": "integer"},
                 },
@@ -685,8 +687,9 @@ def _to_transcript_response(
         504: {
             "model": extraction_schemas.ErrorResponse,
             "description": (
-                "External provider timeout. Open Library timeouts are atomic with "
-                "pipeline_timeout and message Open Library catalog request timed out."
+                "External provider timeout, including exhausted Textify transport retries. "
+                "Open Library timeouts are atomic with pipeline_timeout and message Open "
+                "Library catalog request timed out."
             ),
         },
     },
