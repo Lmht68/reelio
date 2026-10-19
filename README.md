@@ -5,10 +5,11 @@ Submit a video URL and receive the source details, its transcript, and catalog-e
 
 ## How it works
 
-1. Reelio validates the URL and retrieves source metadata with `yt-dlp`.
-2. It uses YouTube captions when available and Faster-Whisper for local transcription when needed.
-3. The selected LLM identifies structured media mentions in the transcript.
-4. Reelio resolves movies and TV series through TMDB, music through Spotify, and books through Open Library.
+1. Textify inspects the public Source and acquires its Transcript.
+2. Reelio keeps `POST /api/extractions` synchronous and returns Reelio-owned Source, Transcript, result, and error contracts.
+3. Reelio coordinates active Textify work in dedicated PostgreSQL and represents exact submitted-URL identities with its environment-scoped HMAC.
+4. An optional shared Redis cache stores successful Textify results and Mention interpretation results without becoming an availability dependency.
+5. The selected LLM identifies structured media mentions, then Reelio resolves movies and TV series through TMDB, music through Spotify, and books through Open Library.
 
 Each category is returned independently.
 An item is `resolved` when catalog metadata is found or `unresolved` when the original mention could not be matched.
@@ -19,6 +20,9 @@ Requirements:
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
+- A reachable Textify service
+- Dedicated PostgreSQL 17 for Reelio's active-work coordination
+- An optional Redis-compatible cache for successful results and Mention interpretation reuse
 - An OpenAI or DeepSeek API key
 - A TMDB v4 read access token
 - Spotify Client Credentials
@@ -29,7 +33,7 @@ uv sync
 cp .env.example .env
 ```
 
-Configure `.env` with the selected LLM provider and catalog credentials:
+Configure `.env` with the selected LLM provider and catalog credentials.
 
 ```dotenv
 REELIO_LLM_PROVIDER=openai
@@ -41,8 +45,7 @@ REELIO_OPEN_LIBRARY_CONTACT_EMAIL=you@example.com
 ```
 
 Use `REELIO_LLM_PROVIDER=deepseek` with `REELIO_DEEPSEEK_API_KEY` to select DeepSeek.
-Set `REELIO_WHISPER_DEVICE=cpu` on machines without CUDA.
-See [`.env.example`](.env.example) for all available settings and defaults.
+See [`.env.example`](.env.example) for the exact Textify origin, admission and transport retry budgets, result and coordination retention, PostgreSQL coordination, HMAC, cache, LLM, and catalog settings.
 
 ```bash
 uv run uvicorn reelio.main:app --reload
@@ -74,6 +77,7 @@ curl -X POST http://127.0.0.1:8000/api/extractions \
 `POST /api/extractions` accepts a public video `url`.
 It also accepts an optional two-letter Spotify `market`, such as `US` or `JP`.
 The market changes Spotify lookups only.
+Textify backs Source inspection and Transcript acquisition while Reelio preserves the synchronous public response and Reelio-owned errors.
 
 The response contains:
 
@@ -122,10 +126,18 @@ Failures use a stable response shape:
 ```
 
 Common failures are invalid or unsupported URLs (`400`), unavailable sources (`404`), duration limits (`413`), provider failures (`502`), and provider timeouts (`504`).
+Temporary Source-and-Transcript acquisition or durable coordination unavailability returns `503` with `transcription_unavailable` and `Retry-After: 2`.
+
+### Direct Transcript Submission
+
+`POST /api/internal/extractions` is available only in local and staging environments.
+It accepts directly submitted normalized Transcript text and the optional `market`.
+Its response has `transcript.method` set to `text_submission`, omits `source`, and otherwise returns the same market, statistics, and grouped results contract.
+Direct Transcript Submission bypasses Textify.
 
 ## Shared-cache operations
 
-Provision one dedicated 512 MiB Redis-compatible primary per environment with `maxmemory-policy allkeys-lfu`, `save ""`, and `appendonly no`.
+Provision the optional Redis-compatible cache per environment with `maxmemory-policy allkeys-lfu`, `save ""`, and `appendonly no`.
 
 Run provider cleanup only through the CLI:
 
@@ -134,6 +146,8 @@ uv run reelio-cache-purge \
   --provider <spotify|tmdb|open-library|source> \
   --environment <local|staging|production>
 ```
+
+A `source` purge removes successful Textify results and Mention interpretation cache entries without touching active PostgreSQL coordination.
 
 ## Development
 

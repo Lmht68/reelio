@@ -1,8 +1,6 @@
 """Behavioral tests for environment-backed configuration."""
 
-import tempfile
 from collections.abc import Callable
-from pathlib import Path
 from typing import cast
 
 import pytest
@@ -21,7 +19,6 @@ from reelio.extraction.services.interpretation.config import (
     OpenAIConfig,
 )
 from reelio.extraction.services.textify import TextifyConfig
-from reelio.extraction.services.transcription.config import TranscriptionConfig
 
 
 def _without_dotenv[SettingsType: BaseSettings](
@@ -212,11 +209,6 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     for variable in (
         "REELIO_ENVIRONMENT",
         "REELIO_LOG_LEVEL",
-        "REELIO_MAX_VIDEO_DURATION_SECONDS",
-        "REELIO_TEMP_MEDIA_DIR",
-        "REELIO_WHISPER_MODEL",
-        "REELIO_WHISPER_DEVICE",
-        "REELIO_WHISPER_COMPUTE_TYPE",
         "REELIO_OPENAI_MODEL",
         "REELIO_OPENAI_REASONING_EFFORT",
         "REELIO_OPENAI_REQUEST_TIMEOUT_SECONDS",
@@ -239,7 +231,6 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(variable, raising=False)
 
     app_settings = _without_dotenv(AppConfig)
-    transcription_settings = _without_dotenv(TranscriptionConfig)
     interpretation_settings = _without_dotenv(InterpretationConfig)
     openai_settings = _without_dotenv(OpenAIConfig, api_key="openai-key")
     deepseek_settings = _without_dotenv(DeepSeekConfig, api_key="deepseek-key")
@@ -247,20 +238,6 @@ def test_configuration_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert app_settings.environment is Environment.LOCAL
     assert app_settings.log_level == "INFO"
-    assert transcription_settings.max_video_duration_seconds == 1800
-    assert transcription_settings.temp_media_dir == Path(tempfile.gettempdir()) / "reelio"
-    assert transcription_settings.whisper_model == "large-v3-turbo"
-    assert transcription_settings.whisper_device == "cuda"
-    assert transcription_settings.whisper_compute_type == "float16"
-    assert transcription_settings.whisper_beam_size == 1
-    assert transcription_settings.whisper_vad_filter is True
-    assert transcription_settings.whisper_temperature == 0.0
-    assert transcription_settings.whisper_cond_on_prev_txt is True
-    assert (
-        transcription_settings.whisper_initial_prompt
-        == "This transcript may mention movies, TV shows, directors, actors, songs, albums, artists, bands, books, and authors. Transcribe proper names accurately."
-    )
-    assert transcription_settings.whisper_max_concurrent == 1
     assert openai_settings.model == "gpt-5-nano"
     assert openai_settings.reasoning_effort == "low"
     assert openai_settings.request_timeout_seconds == 60.0
@@ -292,36 +269,6 @@ def test_tmdb_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.base_url == "https://tmdb.test/3"
     assert settings.image_base_url == "https://images.test/w342"
     assert settings.request_timeout_seconds == 4.5
-
-
-def test_video_duration_environment_override(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Respect a positive duration supplied by the process environment."""
-    monkeypatch.setenv("REELIO_MAX_VIDEO_DURATION_SECONDS", "60")
-
-    settings = _without_dotenv(TranscriptionConfig)
-
-    assert settings.max_video_duration_seconds == 60
-
-
-def test_whisper_transcription_environment_overrides(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Parse Whisper inference options from environment variables."""
-    monkeypatch.setenv("REELIO_WHISPER_BEAM_SIZE", "7")
-    monkeypatch.setenv("REELIO_WHISPER_VAD_FILTER", "false")
-    monkeypatch.setenv("REELIO_WHISPER_TEMPERATURE", "0.25")
-    monkeypatch.setenv("REELIO_WHISPER_COND_ON_PREV_TXT", "false")
-    monkeypatch.setenv("REELIO_WHISPER_MAX_CONCURRENT", "3")
-
-    settings = _without_dotenv(TranscriptionConfig)
-
-    assert settings.whisper_beam_size == 7
-    assert settings.whisper_vad_filter is False
-    assert settings.whisper_temperature == 0.25
-    assert settings.whisper_cond_on_prev_txt is False
-    assert settings.whisper_max_concurrent == 3
 
 
 def test_openai_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:

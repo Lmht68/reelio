@@ -1,16 +1,14 @@
 """Application composition and documentation lifecycle tests."""
 
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import NoReturn, cast
+from typing import NoReturn
 
-import ctranslate2
 import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 from redis.asyncio import Redis
 
-import reelio.extraction.services.transcription.acquisition as transcription_service
 import reelio.main as main_module
 from reelio.cache import CacheConfig, DisabledCache
 from reelio.config import Environment, app_settings
@@ -20,7 +18,6 @@ from reelio.extraction.services.interpretation.config import (
     LLMProvider,
     LLMProviderSelectionConfig,
 )
-from reelio.extraction.services.transcription.config import TranscriptionConfig
 from reelio.extraction.types import (
     BookResults,
     ExtractionResults,
@@ -133,16 +130,6 @@ class _FakeCache:
             self._events.append("cache")
 
 
-def _transcription_settings(device: str) -> TranscriptionConfig:
-    settings_type = cast(Callable[..., TranscriptionConfig], TranscriptionConfig)
-    return settings_type(
-        _env_file=None,
-        whisper_device=device,
-        whisper_model="test-model",
-        whisper_compute_type="test-type",
-    )
-
-
 @pytest.mark.parametrize(
     ("environment", "expected_status"),
     [(Environment.PRODUCTION, 404), (Environment.LOCAL, 200)],
@@ -228,76 +215,16 @@ async def test_injected_pipeline_factory_owns_one_pipeline_per_lifespan() -> Non
     assert pipeline.close_calls == 2
 
 
-def test_cuda_preflight_fails_before_model_construction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reject unavailable explicit CUDA before constructing WhisperModel."""
-    constructor_calls: list[tuple[str, str, str]] = []
-
-    def fake_model(
-        model_size_or_path: str,
-        *,
-        device: str,
-        compute_type: str,
-    ) -> object:
-        constructor_calls.append((model_size_or_path, device, compute_type))
-        return object()
-
-    monkeypatch.setattr(
-        ctranslate2,
-        "get_cuda_device_count",
-        lambda: 0,
-    )
-    monkeypatch.setattr(transcription_service, "WhisperModel", fake_model)
-
-    with pytest.raises(
-        RuntimeError,
-        match=r"^REELIO_WHISPER_DEVICE is 'cuda', but no CUDA device is available\.$",
-    ):
-        transcription_service.load_whisper_transcriber(_transcription_settings("cuda"))
-
-    assert constructor_calls == []
-
-
-@pytest.mark.parametrize("device", ["cpu", "auto"])
-def test_non_cuda_devices_skip_cuda_preflight(
-    monkeypatch: pytest.MonkeyPatch,
-    device: str,
-) -> None:
-    """Pass CPU and auto settings directly to the model constructor."""
-    constructor_calls: list[tuple[str, str, str]] = []
-
-    def fake_model(
-        model_size_or_path: str,
-        *,
-        device: str,
-        compute_type: str,
-    ) -> object:
-        constructor_calls.append((model_size_or_path, device, compute_type))
-        return object()
-
-    monkeypatch.setattr(
-        ctranslate2,
-        "get_cuda_device_count",
-        lambda: pytest.fail("CPU and auto must skip CUDA preflight"),
-    )
-    monkeypatch.setattr(transcription_service, "WhisperModel", fake_model)
-
-    transcription_service.load_whisper_transcriber(_transcription_settings(device))
-
-    assert constructor_calls == [("test-model", device, "test-type")]
-
-
 async def test_pipeline_factory_failure_aborts_lifespan() -> None:
-    """Propagate model or dependency construction failures during startup."""
+    """Propagate provider construction failures during startup."""
 
     async def failing_factory() -> _FakePipeline:
-        raise RuntimeError("model load failed")
+        raise RuntimeError("provider construction failed")
 
     application = create_app(pipeline_factory=failing_factory)
     context = application.router.lifespan_context(application)
 
-    with pytest.raises(RuntimeError, match="model load failed"):
+    with pytest.raises(RuntimeError, match="provider construction failed"):
         await context.__aenter__()
 
     assert not hasattr(application.state, "extraction_pipeline")
@@ -351,10 +278,6 @@ async def test_production_lifespan_owns_one_textify_source_provider(
         book_resolver_factory_calls += 1
         return book_resolver
 
-    def unexpected_local_transcription(*args: object, **kwargs: object) -> NoReturn:
-        del args, kwargs
-        raise AssertionError("production must not construct local transcription")
-
     monkeypatch.setattr(main_module, "TextifyConfig", _FakeTextifyConfig, raising=False)
     monkeypatch.setattr(
         main_module,
@@ -372,12 +295,6 @@ async def test_production_lifespan_owns_one_textify_source_provider(
         main_module,
         "create_mention_interpretation_provider",
         create_provider,
-    )
-    monkeypatch.setattr(
-        main_module,
-        "load_whisper_transcriber",
-        unexpected_local_transcription,
-        raising=False,
     )
     monkeypatch.setattr(main_module, "create_tmdb_screen_work_resolver", create_resolver)
     monkeypatch.setattr(
@@ -418,10 +335,6 @@ async def test_production_lifespan_closes_llm_provider_after_textify_startup_fai
         del textify_settings, coordination_settings, configured_cache
         raise RuntimeError("Textify provider construction failed")
 
-    def unexpected_local_transcription(*args: object, **kwargs: object) -> NoReturn:
-        del args, kwargs
-        raise AssertionError("production must not construct local transcription")
-
     monkeypatch.setattr(main_module, "TextifyConfig", _FakeTextifyConfig, raising=False)
     monkeypatch.setattr(
         main_module,
@@ -439,12 +352,6 @@ async def test_production_lifespan_closes_llm_provider_after_textify_startup_fai
         main_module,
         "create_mention_interpretation_provider",
         create_provider,
-    )
-    monkeypatch.setattr(
-        main_module,
-        "load_whisper_transcriber",
-        unexpected_local_transcription,
-        raising=False,
     )
     application = create_app()
     context = application.router.lifespan_context(application)

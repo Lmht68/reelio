@@ -1,21 +1,14 @@
 """HTTP contract tests for the extraction endpoint."""
 
-import asyncio
 import json
-import threading
 from collections.abc import Callable, Iterator, Sequence
-from itertools import count
-from pathlib import Path
-from typing import NoReturn, cast
+from typing import cast
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from yt_dlp.utils import YoutubeDLError
 
-import reelio.extraction.services.transcription.service as transcription_service_module
-from reelio.cache import DisabledCache, RedisCache
-from reelio.cache.redis import _CacheRuntime
+from reelio.cache import DisabledCache
 from reelio.extraction.exceptions import (
     CatalogProviderError,
     DurationLimitExceededError,
@@ -44,18 +37,6 @@ from reelio.extraction.services.interpretation.service import (
     MentionInterpretationService,
 )
 from reelio.extraction.services.interpretation.types import LLMMessage
-from reelio.extraction.services.transcription.acquisition import (
-    WhisperResult,
-    _WhisperProviderFailure,
-)
-from reelio.extraction.services.transcription.config import TranscriptionConfig
-from reelio.extraction.services.transcription.inspection import ExtractedMetadata
-from reelio.extraction.services.transcription.service import (
-    CachedTranscriptionService,
-    LocalSourceTranscriptProvider,
-    SourceMetadataService,
-    TranscriptionService,
-)
 from reelio.extraction.types import (
     ArtistCredit,
     AuthorCredit,
@@ -93,7 +74,6 @@ from reelio.extraction.types import (
     TVSeriesResult,
 )
 from reelio.main import app
-from tests.cache.fakes import FakeRedis, ManualClock
 from tests.extraction.fakes import (
     FakeInterpretationService as _FakeInterpretationService,
 )
@@ -139,9 +119,23 @@ class _RecordingSourceTranscriptProvider:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def acquire(self, submitted_url: str) -> NoReturn:
+    async def acquire(self, submitted_url: str) -> tuple[Source, Transcript]:
         self.calls.append(submitted_url)
         raise AssertionError("submitted transcripts must not acquire a Source or Transcript")
+
+    async def aclose(self) -> None:
+        """Satisfy the Source-and-Transcript provider lifecycle."""
+
+
+class _StaticSourceTranscriptProvider:
+    def __init__(self, source: Source, transcript: Transcript) -> None:
+        self._source = source
+        self._transcript = transcript
+        self.calls: list[str] = []
+
+    async def acquire(self, submitted_url: str) -> tuple[Source, Transcript]:
+        self.calls.append(submitted_url)
+        return self._source, self._transcript
 
     async def aclose(self) -> None:
         """Satisfy the Source-and-Transcript provider lifecycle."""
@@ -163,159 +157,9 @@ class _RecordingLLMProvider:
         self.closed = True
 
 
-class _MetadataExtractor:
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    def extract(self, canonical_url: str) -> ExtractedMetadata:
-        self.calls.append(canonical_url)
-        return ExtractedMetadata(
-            {
-                "id": _VIDEO_ID,
-                "title": "Router test video",
-                "description": "A complete router test description.",
-                "channel": "Router test channel",
-                "duration": 42.2,
-            }
-        )
-
-
-class _SocialMetadataExtractor:
-    def __init__(
-        self,
-        metadata: dict[str, object],
-    ) -> None:
-        self.metadata = metadata
-        self.calls: list[str] = []
-
-    def extract(self, canonical_url: str) -> ExtractedMetadata:
-        self.calls.append(canonical_url)
-        return ExtractedMetadata(self.metadata)
-
-
-class _OutcomeMetadataExtractor:
-    def __init__(self, outcomes: list[object]) -> None:
-        self._outcomes = outcomes
-        self.calls: list[str] = []
-
-    def extract(self, canonical_url: str) -> ExtractedMetadata:
-        self.calls.append(canonical_url)
-        if not self._outcomes:
-            raise AssertionError("Unexpected metadata extraction")
-        outcome = self._outcomes.pop(0)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return ExtractedMetadata(cast(dict[str, object], outcome))
-
-
-def _router_cache(clock: ManualClock) -> tuple[RedisCache, FakeRedis]:
-    tokens = count()
-    redis = FakeRedis(clock)
-    cache = RedisCache(
-        redis,
-        "reelio:test",
-        b"router-source-cache-test-key",
-        runtime=_CacheRuntime(clock, asyncio.sleep, lambda: f"router-{next(tokens)}"),
-    )
-    return cache, redis
-
-
-def _social_transcription_service(tmp_path: Path) -> TranscriptionService:
-    return TranscriptionService(
-        provider=_CaptionProvider([]),
-        audio_downloader=_AudioDownloader(),
-        transcriber=_FixedWhisperTranscriber(
-            WhisperResult(
-                text="Social cache transcript.",
-                language="en",
-                segment_count=1,
-            )
-        ),
-        temp_media_dir=tmp_path,
-        semaphore=asyncio.Semaphore(1),
-    )
-
-
-def _settings() -> TranscriptionConfig:
-    settings_type = cast(Callable[..., TranscriptionConfig], TranscriptionConfig)
-    return settings_type(_env_file=None)
-
-
 def _interpretation_settings(**values: object) -> InterpretationConfig:
     settings_type = cast(Callable[..., InterpretationConfig], InterpretationConfig)
     return settings_type(_env_file=None, **values)
-
-
-class _CaptionTrack:
-    def __init__(self, language_code: str, segments: Sequence[str]) -> None:
-        self.language_code = language_code
-        self.is_generated = False
-        self._segments = segments
-        self.fetch_calls = 0
-
-    def fetch_segments(self) -> Sequence[str]:
-        self.fetch_calls += 1
-        return self._segments
-
-
-class _CaptionProvider:
-    def __init__(self, tracks: Sequence[_CaptionTrack]) -> None:
-        self._tracks = tracks
-        self.calls: list[str] = []
-
-    def list_tracks(self, video_id: str) -> Sequence[_CaptionTrack]:
-        self.calls.append(video_id)
-        return self._tracks
-
-
-class _AudioDownloader:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, Path]] = []
-
-    def download(self, source_url: str, destination: Path) -> Path:
-        self.calls.append((source_url, destination))
-        audio_path = destination / "audio.webm"
-        audio_path.write_bytes(b"audio")
-        return audio_path
-
-
-class _FailingWhisperTranscriber:
-    def transcribe(self, audio_path: Path) -> NoReturn:
-        raise _WhisperProviderFailure("model failure")
-
-
-class _FixedWhisperTranscriber:
-    def __init__(self, result: WhisperResult) -> None:
-        self.result = result
-        self.calls: list[Path] = []
-
-    def transcribe(self, audio_path: Path) -> WhisperResult:
-        self.calls.append(audio_path)
-        return self.result
-
-
-class _BlockingWhisperTranscriber:
-    def __init__(self) -> None:
-        self.started = threading.Event()
-        self.release = threading.Event()
-        self.calls = 0
-
-    def transcribe(self, audio_path: Path) -> WhisperResult:
-        self.calls += 1
-        self.started.set()
-        if not self.release.wait(timeout=5):
-            raise RuntimeError("test worker was not released")
-        return WhisperResult(text="concurrent speech", language="en", segment_count=1)
-
-
-def _transcription_service(provider: _CaptionProvider) -> TranscriptionService:
-    return TranscriptionService(
-        provider=provider,
-        audio_downloader=_AudioDownloader(),
-        transcriber=_FailingWhisperTranscriber(),
-        temp_media_dir=_settings().temp_media_dir,
-        semaphore=asyncio.Semaphore(1),
-    )
 
 
 def _enriched_movie(movie_mention: MovieMention) -> EnrichedMovie:
@@ -435,8 +279,7 @@ def _enriched_music_release(
 
 
 def _pipeline(
-    metadata_service: SourceMetadataService,
-    transcript_service: TranscriptionService | CachedTranscriptionService,
+    source_transcript_provider: _StaticSourceTranscriptProvider,
     mentions: ScreenWorkMentions | None = None,
     results: ScreenWorkResults | None = None,
     music_mentions: MusicMentions | None = None,
@@ -516,10 +359,7 @@ def _pipeline(
     )
 
     return ExtractionPipeline(
-        source_transcript_provider=LocalSourceTranscriptProvider(
-            metadata_service,
-            transcript_service,
-        ),
+        source_transcript_provider=source_transcript_provider,
         interpretation_service=_FakeInterpretationService(
             ExtractionMentions(
                 screen_works=interpreted_screen_works,
@@ -618,7 +458,22 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
     client: AsyncClient,
 ) -> None:
     """Return grouped results and their complete resolution statistics."""
-    metadata_extractor = _MetadataExtractor()
+    source_transcript_provider = _StaticSourceTranscriptProvider(
+        Source(
+            platform=Platform.YOUTUBE,
+            video_id=_VIDEO_ID,
+            url=_CANONICAL_URL,
+            title="Router test video",
+            description="A complete router test description.",
+            channel="Router test channel",
+            duration_seconds=43,
+        ),
+        Transcript(
+            text="Router caption text.",
+            language="en-GB",
+            method=TranscriptMethod.YOUTUBE_CAPTIONS,
+        ),
+    )
     resolved_movie_mention = MovieMention(title="Dune: Part One", year=2021)
     unresolved_movie_mention = MovieMention(title="Unknown Movie", year=2024)
     resolved_tv_series_mention = TVSeriesMention(title="The Last of Us", year=2023)
@@ -732,14 +587,7 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
         ]
     )
     pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=metadata_extractor,
-            settings=_settings(),
-            cache=DisabledCache(),
-        ),
-        _transcription_service(
-            _CaptionProvider([_CaptionTrack("en-GB", ["Router", "caption text."])])
-        ),
+        source_transcript_provider,
         mentions,
         results,
         music_mentions=music_mentions,
@@ -763,7 +611,7 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
     assert payload.source.description == "A complete router test description."
     assert payload.source.channel == "Router test channel"
     assert payload.source.duration_seconds == 43
-    assert metadata_extractor.calls == [_CANONICAL_URL]
+    assert source_transcript_provider.calls == [_CANONICAL_URL]
     assert payload.transcript.language == "en-GB"
     assert payload.transcript.method == "youtube_captions"
     assert payload.transcript.text == "Router caption text."
@@ -983,34 +831,6 @@ async def test_extract_returns_resolved_and_unresolved_screen_work_and_music_res
     assert payload.results.books[1].book is None
 
 
-async def test_extract_maps_unavailable_captions_to_502(
-    client: AsyncClient,
-) -> None:
-    """Map a valid Source with no usable captions to Transcript Unavailable."""
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=_MetadataExtractor(),
-            settings=_settings(),
-            cache=DisabledCache(),
-        ),
-        _transcription_service(_CaptionProvider([])),
-    )
-    _install_pipeline(app, pipeline)
-
-    response = await client.post(
-        "/api/extractions",
-        json={"url": _CANONICAL_URL},
-    )
-
-    assert response.status_code == 502
-    assert response.json() == {
-        "error": {
-            "code": "transcription_failed",
-            "message": "Transcript is unavailable for this video.",
-        }
-    }
-
-
 @pytest.mark.parametrize(
     ("mentions", "expected_movies", "expected_tv_series"),
     [
@@ -1055,15 +875,23 @@ async def test_extract_groups_screen_work_results(
     expected_tv_series: list[str],
 ) -> None:
     """Serialize always-present independently ordered result lists, including Tracks."""
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=_MetadataExtractor(),
-            settings=_settings(),
-            cache=DisabledCache(),
+    source_transcript_provider = _StaticSourceTranscriptProvider(
+        Source(
+            platform=Platform.YOUTUBE,
+            video_id=_VIDEO_ID,
+            url=_CANONICAL_URL,
+            title="Grouped results video",
+            description="Grouped results description",
+            channel="Grouped results channel",
+            duration_seconds=43,
         ),
-        _transcription_service(_CaptionProvider([_CaptionTrack("en", ["Grouped", "results."])])),
-        mentions,
+        Transcript(
+            text="Grouped results.",
+            language="en",
+            method=TranscriptMethod.YOUTUBE_CAPTIONS,
+        ),
     )
+    pipeline = _pipeline(source_transcript_provider, mentions)
     _install_pipeline(app, pipeline)
 
     response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
@@ -1083,85 +911,33 @@ async def test_extract_groups_screen_work_results(
         set(item) == {"status", "tv_series_mention", "tv_series"} for item in results["tv_series"]
     )
     assert all(item["tv_series"] is None for item in results["tv_series"])
-
-
-async def test_extract_returns_whisper_transcript(
-    client: AsyncClient,
-    tmp_path: Path,
-) -> None:
-    """Serialize a successful Whisper Transcript through the unchanged schema."""
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=_MetadataExtractor(),
-            settings=_settings(),
-            cache=DisabledCache(),
-        ),
-        TranscriptionService(
-            provider=_CaptionProvider([]),
-            audio_downloader=_AudioDownloader(),
-            transcriber=_FixedWhisperTranscriber(
-                WhisperResult(
-                    text="Spoken audio text.",
-                    language="en",
-                    segment_count=2,
-                )
-            ),
-            temp_media_dir=tmp_path,
-            semaphore=asyncio.Semaphore(1),
-        ),
-    )
-    _install_pipeline(app, pipeline)
-    response = await client.post(
-        "/api/extractions",
-        json={"url": _CANONICAL_URL},
-    )
-
-    assert response.status_code == 200
-    payload = ExtractResponse.model_validate(response.json())
-    assert payload.transcript.text == "Spoken audio text."
-    assert payload.transcript.language == "en"
-    assert payload.transcript.method == "whisper"
+    assert source_transcript_provider.calls == [_CANONICAL_URL]
 
 
 @pytest.mark.parametrize(
-    (
-        "submitted_url",
-        "provider_url",
-        "canonical_url",
-        "extractor_key",
-        "video_id",
-        "platform",
-    ),
+    ("submitted_url", "canonical_url", "video_id", "platform"),
     [
         (
             "https://www.instagram.com/reel/ABC123",
             "https://www.instagram.com/reel/ABC123",
-            "https://www.instagram.com/reel/ABC123",
-            "Instagram",
             "ABC123",
             "instagram",
         ),
         (
             "https://www.facebook.com/reel/123456789",
             "https://www.facebook.com/reel/123456789",
-            "https://www.facebook.com/reel/123456789",
-            "FacebookReel",
             "123456789",
             "facebook",
         ),
         (
             "https://www.tiktok.com/@creator/video/1234567890123456789",
             "https://www.tiktok.com/@creator/video/1234567890123456789",
-            "https://www.tiktok.com/@creator/video/1234567890123456789",
-            "TikTok",
             "1234567890123456789",
             "tiktok",
         ),
         (
             "https://twitter.com/creator/status/1234567890123456789",
             "https://twitter.com/creator/status/1234567890123456789",
-            "https://twitter.com/creator/status/1234567890123456789",
-            "Twitter",
             "1234567890123456789",
             "x",
         ),
@@ -1169,47 +945,29 @@ async def test_extract_returns_whisper_transcript(
 )
 async def test_social_sources_serialize_unchanged_response_schema(
     client: AsyncClient,
-    tmp_path: Path,
     submitted_url: str,
-    provider_url: str,
     canonical_url: str,
-    extractor_key: str,
     video_id: str,
     platform: str,
 ) -> None:
-    """Serialize every social Source with a direct Whisper Transcript."""
-    extractor = _SocialMetadataExtractor(
-        {
-            "id": video_id,
-            "extractor_key": extractor_key,
-            "webpage_url": canonical_url,
-            "title": "Social router video",
-            "description": "Social router description",
-            "channel": "Social router channel",
-            "duration": 42.2,
-            "formats": [{"vcodec": "avc1"}],
-        }
-    )
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=extractor,
-            settings=_settings(),
-            cache=DisabledCache(),
+    """Serialize every social Source with a provider-supplied Whisper Transcript."""
+    source_transcript_provider = _StaticSourceTranscriptProvider(
+        Source(
+            platform=Platform(platform),
+            video_id=video_id,
+            url=canonical_url,
+            title="Social router video",
+            description="Social router description",
+            channel="Social router channel",
+            duration_seconds=43,
         ),
-        TranscriptionService(
-            provider=_CaptionProvider([_CaptionTrack("en", ["must", "not", "run"])]),
-            audio_downloader=_AudioDownloader(),
-            transcriber=_FixedWhisperTranscriber(
-                WhisperResult(
-                    text="Social router speech.",
-                    language="en",
-                    segment_count=1,
-                )
-            ),
-            temp_media_dir=tmp_path,
-            semaphore=asyncio.Semaphore(1),
+        Transcript(
+            text="Social router speech.",
+            language="en",
+            method=TranscriptMethod.WHISPER,
         ),
     )
+    pipeline = _pipeline(source_transcript_provider)
     _install_pipeline(app, pipeline)
 
     response = await client.post("/api/extractions", json={"url": submitted_url})
@@ -1225,45 +983,7 @@ async def test_social_sources_serialize_unchanged_response_schema(
     assert payload.source.duration_seconds == 43
     assert payload.transcript.method == "whisper"
     assert payload.transcript.text == "Social router speech."
-    assert extractor.calls == [provider_url]
-
-
-async def test_concurrent_whisper_http_requests_queue_and_succeed(
-    client: AsyncClient,
-    tmp_path: Path,
-) -> None:
-    """Queue concurrent endpoint fallbacks behind one shared service semaphore."""
-    transcriber = _BlockingWhisperTranscriber()
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=_MetadataExtractor(),
-            settings=_settings(),
-            cache=DisabledCache(),
-        ),
-        TranscriptionService(
-            provider=_CaptionProvider([]),
-            audio_downloader=_AudioDownloader(),
-            transcriber=transcriber,
-            temp_media_dir=tmp_path,
-            semaphore=asyncio.Semaphore(1),
-        ),
-    )
-    _install_pipeline(app, pipeline)
-
-    first = asyncio.create_task(client.post("/api/extractions", json={"url": _CANONICAL_URL}))
-    assert await asyncio.to_thread(transcriber.started.wait, 5)
-    second = asyncio.create_task(client.post("/api/extractions", json={"url": _CANONICAL_URL}))
-    await asyncio.sleep(0)
-
-    assert transcriber.calls == 1
-
-    transcriber.release.set()
-    first_response, second_response = await asyncio.gather(first, second)
-
-    assert first_response.status_code == 200
-    assert second_response.status_code == 200
-    assert transcriber.calls == 2
-    assert list(tmp_path.iterdir()) == []
+    assert source_transcript_provider.calls == [submitted_url]
 
 
 @pytest.mark.parametrize(
@@ -1468,6 +1188,10 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     operation = document["paths"]["/api/extractions"]["post"]
     responses = operation["responses"]
     description = operation["description"]
+    assert (
+        "Textify backs Source inspection and Transcript acquisition; callers still receive "
+        "Reelio's synchronous response and Reelio-owned errors." in description
+    )
     assert "offset zero and limit three" in description
     assert "first ordered Artist Credit only" in description
     assert "at least one Artist Credit matches any Mention Artist Credit" in description
@@ -1502,9 +1226,26 @@ async def test_extract_is_documented_in_openapi(client: AsyncClient) -> None:
     assert retry_after_header["schema"] == {"type": "integer"}
     assert "catalog_provider_failed" in responses["502"]["description"]
     assert "Open Library catalog request failed." in responses["502"]["description"]
-    assert "Textify transport or contract failure" in responses["502"]["description"]
-    assert "Textify capacity, job-store, or durable coordination" in responses["503"]["description"]
-    assert "exhausted Textify transport retries" in responses["504"]["description"]
+    assert (
+        "Source or Transcript provider transport or contract failure"
+        in responses["502"]["description"]
+    )
+    assert (
+        "Source-and-Transcript acquisition or durable coordination is temporarily unavailable"
+        in responses["503"]["description"]
+    )
+    assert (
+        "exhausted Source-and-Transcript provider transport retries"
+        in responses["504"]["description"]
+    )
+    serialized_operation = json.dumps(operation)
+    for excluded_term in (
+        "capability",
+        "idempotency",
+        "/api/v1/transcription-jobs",
+        "job-store",
+    ):
+        assert excluded_term not in serialized_operation
     assert "Open Library catalog request timed out." in responses["504"]["description"]
 
     request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
@@ -2144,655 +1885,3 @@ async def test_extract_validates_forwards_and_exposes_the_effective_market(
     assert default_response.json()["market"] == "US"
     assert invalid_response.status_code == 422
     assert pipeline.calls == [(_CANONICAL_URL, "JP"), (_CANONICAL_URL, None)]
-
-
-def _youtube_metadata() -> dict[str, object]:
-    return {
-        "id": _VIDEO_ID,
-        "title": "Router test video",
-        "description": "A complete router test description.",
-        "channel": "Router test channel",
-        "duration": 42.2,
-    }
-
-
-async def test_reuses_source_metadata_across_repeated_http_submissions(
-    client: AsyncClient,
-) -> None:
-    """Return two successful Source responses after only one provider inspection."""
-    clock = ManualClock()
-    cache, _ = _router_cache(clock)
-    extractor = _OutcomeMetadataExtractor([_youtube_metadata()])
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=extractor,
-            settings=_settings(),
-            cache=cache,
-        ),
-        _transcription_service(
-            _CaptionProvider([_CaptionTrack("en", ["Cached source transcript."])])
-        ),
-    )
-    _install_pipeline(app, pipeline)
-
-    try:
-        first_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
-        second_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
-
-        assert first_response.status_code == 200
-        assert second_response.status_code == 200
-        assert first_response.json()["source"] == second_response.json()["source"]
-        assert extractor.calls == [_CANONICAL_URL]
-    finally:
-        await cache.aclose()
-
-
-async def test_converges_submitted_aliases_through_provider_identity(
-    client: AsyncClient,
-    tmp_path: Path,
-) -> None:
-    """Serve accepted Instagram aliases from one provider-authoritative Source."""
-    clock = ManualClock()
-    cache, _ = _router_cache(clock)
-    submitted_url = "https://www.instagram.com/p/ABC_123/"
-    canonical_url = "https://www.instagram.com/reel/ABC_123"
-    extractor = _SocialMetadataExtractor(
-        {
-            "id": "ABC_123",
-            "extractor_key": "Instagram",
-            "webpage_url": canonical_url,
-            "title": "Instagram cache video",
-            "description": "Instagram cache description",
-            "channel": "Instagram cache channel",
-            "duration": 42.2,
-            "formats": [{"vcodec": "avc1"}],
-        }
-    )
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=extractor,
-            settings=_settings(),
-            cache=cache,
-        ),
-        _social_transcription_service(tmp_path),
-    )
-    _install_pipeline(app, pipeline)
-
-    try:
-        submitted_response = await client.post(
-            "/api/extractions",
-            json={"url": submitted_url},
-        )
-        canonical_response = await client.post(
-            "/api/extractions",
-            json={"url": canonical_url},
-        )
-
-        assert submitted_response.status_code == 200
-        assert canonical_response.status_code == 200
-        assert submitted_response.json()["source"] == canonical_response.json()["source"]
-        assert len(extractor.calls) == 1
-    finally:
-        await cache.aclose()
-
-
-async def test_source_metadata_reuse_is_market_independent(
-    client: AsyncClient,
-) -> None:
-    """Keep Source reuse independent from each requested effective market."""
-    clock = ManualClock()
-    cache, _ = _router_cache(clock)
-    extractor = _OutcomeMetadataExtractor([_youtube_metadata()])
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=extractor,
-            settings=_settings(),
-            cache=cache,
-        ),
-        _transcription_service(
-            _CaptionProvider([_CaptionTrack("en", ["Market independent source."])])
-        ),
-    )
-    _install_pipeline(app, pipeline)
-
-    try:
-        us_response = await client.post(
-            "/api/extractions",
-            json={"url": _CANONICAL_URL, "market": "US"},
-        )
-        jp_response = await client.post(
-            "/api/extractions",
-            json={"url": _CANONICAL_URL, "market": "JP"},
-        )
-
-        assert us_response.status_code == 200
-        assert jp_response.status_code == 200
-        assert us_response.json()["market"] == "US"
-        assert jp_response.json()["market"] == "JP"
-        assert us_response.json()["source"] == jp_response.json()["source"]
-        assert extractor.calls == [_CANONICAL_URL]
-    finally:
-        await cache.aclose()
-
-
-@pytest.mark.parametrize(
-    ("first_error", "expected_status", "expected_code", "expected_message"),
-    [
-        (
-            MetadataProviderError("provider failure"),
-            502,
-            "metadata_provider_failed",
-            "Unable to retrieve source metadata.",
-        ),
-        (
-            YoutubeDLError("Video unavailable"),
-            404,
-            "source_unavailable",
-            "Source is unavailable.",
-        ),
-    ],
-    ids=["provider", "unavailable"],
-)
-async def test_source_inspection_errors_are_not_cached(
-    client: AsyncClient,
-    first_error: Exception,
-    expected_status: int,
-    expected_code: str,
-    expected_message: str,
-) -> None:
-    """Expose the first typed Source error and succeed on a later HTTP retry."""
-    clock = ManualClock()
-    cache, _ = _router_cache(clock)
-    extractor = _OutcomeMetadataExtractor([first_error, _youtube_metadata()])
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=extractor,
-            settings=_settings(),
-            cache=cache,
-        ),
-        _transcription_service(_CaptionProvider([_CaptionTrack("en", ["Retry succeeds."])])),
-    )
-    _install_pipeline(app, pipeline)
-
-    try:
-        failed_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
-        successful_response = await client.post(
-            "/api/extractions",
-            json={"url": _CANONICAL_URL},
-        )
-
-        assert failed_response.status_code == expected_status
-        assert failed_response.json() == {
-            "error": {"code": expected_code, "message": expected_message}
-        }
-        assert successful_response.status_code == 200
-        assert extractor.calls == [_CANONICAL_URL, _CANONICAL_URL]
-    finally:
-        await cache.aclose()
-
-
-@pytest.mark.parametrize(
-    ("provider_error", "expected_status", "expected_code", "expected_message"),
-    [
-        (
-            MetadataProviderError("provider failure"),
-            502,
-            "metadata_provider_failed",
-            "Unable to retrieve source metadata.",
-        ),
-        (
-            YoutubeDLError("Video unavailable"),
-            404,
-            "source_unavailable",
-            "Source is unavailable.",
-        ),
-    ],
-    ids=["provider", "unavailable"],
-)
-async def test_cache_read_failure_preserves_typed_source_errors(
-    client: AsyncClient,
-    provider_error: Exception,
-    expected_status: int,
-    expected_code: str,
-    expected_message: str,
-) -> None:
-    """Never serve stale Source metadata or cache-specific errors during read outages."""
-    clock = ManualClock()
-    cache, redis = _router_cache(clock)
-    extractor = _OutcomeMetadataExtractor([_youtube_metadata(), provider_error])
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=extractor,
-            settings=_settings(),
-            cache=cache,
-        ),
-        _transcription_service(_CaptionProvider([_CaptionTrack("en", ["Warm source cache."])])),
-    )
-    _install_pipeline(app, pipeline)
-
-    try:
-        warm_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
-        redis.fail_operations.add("read")
-        failed_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
-
-        assert warm_response.status_code == 200
-        assert failed_response.status_code == expected_status
-        assert failed_response.json() == {
-            "error": {"code": expected_code, "message": expected_message}
-        }
-        assert extractor.calls == [_CANONICAL_URL, _CANONICAL_URL]
-    finally:
-        await cache.aclose()
-
-
-async def test_endpoint_reuses_caption_transcript_without_repeating_acquisition(
-    client: AsyncClient,
-    tmp_path: Path,
-) -> None:
-    """Reuse one Caption Transcript through the public Source extraction endpoint."""
-    clock = ManualClock()
-    cache, _ = _router_cache(clock)
-    extractor = _OutcomeMetadataExtractor([_youtube_metadata()])
-    track = _CaptionTrack("en", ["Cached Caption Transcript."])
-    provider = _CaptionProvider([track])
-    downloader = _AudioDownloader()
-    transcriber = _FixedWhisperTranscriber(
-        WhisperResult(text="unused Whisper", language="en", segment_count=1)
-    )
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=extractor,
-            settings=_settings(),
-            cache=cache,
-        ),
-        CachedTranscriptionService(
-            TranscriptionService(
-                provider=provider,
-                audio_downloader=downloader,
-                transcriber=transcriber,
-                temp_media_dir=tmp_path,
-                semaphore=asyncio.Semaphore(1),
-            ),
-            cache,
-        ),
-    )
-    _install_pipeline(app, pipeline)
-
-    try:
-        first_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
-        second_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
-
-        expected_transcript = {
-            "text": "Cached Caption Transcript.",
-            "language": "en",
-            "method": "youtube_captions",
-        }
-        assert first_response.status_code == 200
-        assert second_response.status_code == 200
-        assert first_response.json()["transcript"] == expected_transcript
-        assert second_response.json()["transcript"] == expected_transcript
-        assert extractor.calls == [_CANONICAL_URL]
-        assert provider.calls == [_VIDEO_ID]
-        assert track.fetch_calls == 1
-        assert downloader.calls == []
-        assert transcriber.calls == []
-    finally:
-        await cache.aclose()
-
-
-async def test_endpoint_reuses_whisper_transcript_without_repeating_acquisition(
-    client: AsyncClient,
-    tmp_path: Path,
-) -> None:
-    """Reuse one social-video Whisper Transcript through the public endpoint."""
-    clock = ManualClock()
-    cache, _ = _router_cache(clock)
-    submitted_url = "https://www.instagram.com/reel/ABC123"
-    extractor = _SocialMetadataExtractor(
-        {
-            "id": "ABC123",
-            "extractor_key": "Instagram",
-            "webpage_url": submitted_url,
-            "title": "Whisper cache router video",
-            "description": "Whisper cache router description",
-            "channel": "Whisper cache router channel",
-            "duration": 42.2,
-            "formats": [{"vcodec": "avc1"}],
-        }
-    )
-    provider = _CaptionProvider([_CaptionTrack("en", ["unused Caption"])])
-    downloader = _AudioDownloader()
-    transcriber = _FixedWhisperTranscriber(
-        WhisperResult(
-            text="  Cached Whisper Transcript.  ",
-            language="fr",
-            segment_count=2,
-        )
-    )
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=extractor,
-            settings=_settings(),
-            cache=cache,
-        ),
-        CachedTranscriptionService(
-            TranscriptionService(
-                provider=provider,
-                audio_downloader=downloader,
-                transcriber=transcriber,
-                temp_media_dir=tmp_path,
-                semaphore=asyncio.Semaphore(1),
-            ),
-            cache,
-        ),
-    )
-    _install_pipeline(app, pipeline)
-
-    try:
-        first_response = await client.post("/api/extractions", json={"url": submitted_url})
-        second_response = await client.post("/api/extractions", json={"url": submitted_url})
-
-        expected_transcript = {
-            "text": "Cached Whisper Transcript.",
-            "language": "fr",
-            "method": "whisper",
-        }
-        assert first_response.status_code == 200
-        assert second_response.status_code == 200
-        assert first_response.json()["transcript"] == expected_transcript
-        assert second_response.json()["transcript"] == expected_transcript
-        assert extractor.calls == [submitted_url]
-        assert provider.calls == []
-        assert len(downloader.calls) == 1
-        assert downloader.calls[0][0] == submitted_url
-        assert len(transcriber.calls) == 1
-    finally:
-        await cache.aclose()
-
-
-async def test_endpoint_reuses_transcript_across_markets_while_enriching_each_market(
-    client: AsyncClient,
-    tmp_path: Path,
-) -> None:
-    """Keep Transcript reuse independent from market-sensitive downstream work."""
-    clock = ManualClock()
-    cache, _ = _router_cache(clock)
-    extractor = _OutcomeMetadataExtractor([_youtube_metadata()])
-    track = _CaptionTrack("en", ["Market-independent Transcript."])
-    provider = _CaptionProvider([track])
-    interpretation_service = _FakeInterpretationService()
-    result_aggregator = _FakeResultAggregator()
-    pipeline = ExtractionPipeline(
-        LocalSourceTranscriptProvider(
-            SourceMetadataService(
-                extractor=extractor,
-                settings=_settings(),
-                cache=cache,
-            ),
-            CachedTranscriptionService(
-                TranscriptionService(
-                    provider=provider,
-                    audio_downloader=_AudioDownloader(),
-                    transcriber=_FixedWhisperTranscriber(
-                        WhisperResult(
-                            text="unused Whisper",
-                            language="en",
-                            segment_count=1,
-                        )
-                    ),
-                    temp_media_dir=tmp_path,
-                    semaphore=asyncio.Semaphore(1),
-                ),
-                cache,
-            ),
-        ),
-        interpretation_service,
-        result_aggregator,
-    )
-    _install_pipeline(app, pipeline)
-
-    try:
-        us_response = await client.post(
-            "/api/extractions",
-            json={"url": _CANONICAL_URL, "market": "US"},
-        )
-        jp_response = await client.post(
-            "/api/extractions",
-            json={"url": _CANONICAL_URL, "market": "JP"},
-        )
-
-        assert us_response.status_code == 200
-        assert jp_response.status_code == 200
-        assert us_response.json()["transcript"] == jp_response.json()["transcript"]
-        assert extractor.calls == [_CANONICAL_URL]
-        assert provider.calls == [_VIDEO_ID]
-        assert track.fetch_calls == 1
-        assert len(interpretation_service.calls) == 2
-        assert len(result_aggregator.calls) == 2
-        assert result_aggregator.markets == [SpotifyMarket("US"), SpotifyMarket("JP")]
-    finally:
-        await cache.aclose()
-
-
-async def test_endpoint_reuses_mention_interpretation_across_effective_markets(
-    client: AsyncClient,
-    tmp_path: Path,
-) -> None:
-    """Reuse Mention interpretation while aggregating each effective market."""
-    clock = ManualClock()
-    cache, _ = _router_cache(clock)
-    extractor = _OutcomeMetadataExtractor([_youtube_metadata()])
-    caption_track = _CaptionTrack("en", ["Market-independent mention content."])
-    caption_provider = _CaptionProvider([caption_track])
-    llm_provider = _RecordingLLMProvider(
-        json.dumps(
-            {
-                "movies": [
-                    {"title": "Dune: Part One", "year": 2021},
-                    {"title": "Arrival", "year": 2016},
-                ],
-                "tv_series": [{"title": "Fargo", "year": 2014}],
-                "tracks": [
-                    {
-                        "track_title": "Track One",
-                        "artists": ["Artist One"],
-                        "release_title": "Release One",
-                        "release_year": 2020,
-                    }
-                ],
-                "music_releases": [
-                    {
-                        "release_title": "Release One",
-                        "artists": ["Artist One"],
-                        "release_year": 2020,
-                    }
-                ],
-                "books": [{"title": "Book One", "authors": ["Author One"]}],
-            }
-        )
-    )
-    interpretation_service = MentionInterpretationService(
-        llm_provider,
-        _interpretation_settings(),
-        cache,
-    )
-    result_aggregator = _FakeResultAggregator()
-    pipeline = ExtractionPipeline(
-        LocalSourceTranscriptProvider(
-            SourceMetadataService(
-                extractor=extractor,
-                settings=_settings(),
-                cache=cache,
-            ),
-            CachedTranscriptionService(
-                TranscriptionService(
-                    provider=caption_provider,
-                    audio_downloader=_AudioDownloader(),
-                    transcriber=_FixedWhisperTranscriber(
-                        WhisperResult(
-                            text="unused Whisper",
-                            language="en",
-                            segment_count=1,
-                        )
-                    ),
-                    temp_media_dir=tmp_path,
-                    semaphore=asyncio.Semaphore(1),
-                ),
-                cache,
-            ),
-        ),
-        interpretation_service,
-        result_aggregator,
-        SpotifyMarket("US"),
-    )
-    _install_pipeline(app, pipeline)
-
-    try:
-        us_response = await client.post(
-            "/api/extractions",
-            json={"url": _CANONICAL_URL, "market": "US"},
-        )
-        jp_response = await client.post(
-            "/api/extractions",
-            json={"url": _CANONICAL_URL, "market": "JP"},
-        )
-
-        assert us_response.status_code == 200
-        assert jp_response.status_code == 200
-        assert us_response.json()["results"] == jp_response.json()["results"]
-        assert len(llm_provider.calls) == 1
-        assert caption_provider.calls == [_VIDEO_ID]
-        assert caption_track.fetch_calls == 1
-        assert [movie.title for movie in result_aggregator.calls[1].screen_works.movies] == [
-            "Dune: Part One",
-            "Arrival",
-        ]
-        assert [
-            tv_series.title for tv_series in result_aggregator.calls[1].screen_works.tv_series
-        ] == ["Fargo"]
-        assert [track.track_title for track in result_aggregator.calls[1].music.tracks] == [
-            "Track One"
-        ]
-        assert [
-            music_release.release_title
-            for music_release in result_aggregator.calls[1].music.music_releases
-        ] == ["Release One"]
-        assert [book.title for book in result_aggregator.calls[1].books.books] == ["Book One"]
-        assert result_aggregator.calls[1] == result_aggregator.calls[0]
-        assert result_aggregator.calls[1] is not result_aggregator.calls[0]
-        assert result_aggregator.markets == [SpotifyMarket("US"), SpotifyMarket("JP")]
-    finally:
-        await cache.aclose()
-
-
-async def test_direct_transcript_submissions_do_not_use_video_transcript_cache(
-    client: AsyncClient,
-    tmp_path: Path,
-) -> None:
-    """Keep direct text submissions isolated from cached video-derived Transcripts."""
-    clock = ManualClock()
-    cache, _ = _router_cache(clock)
-    extractor = _OutcomeMetadataExtractor([_youtube_metadata()])
-    track = _CaptionTrack("en", ["Shared Transcript Text."])
-    provider = _CaptionProvider([track])
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=extractor,
-            settings=_settings(),
-            cache=cache,
-        ),
-        CachedTranscriptionService(
-            TranscriptionService(
-                provider=provider,
-                audio_downloader=_AudioDownloader(),
-                transcriber=_FixedWhisperTranscriber(
-                    WhisperResult(text="unused Whisper", language="en", segment_count=1)
-                ),
-                temp_media_dir=tmp_path,
-                semaphore=asyncio.Semaphore(1),
-            ),
-            cache,
-        ),
-    )
-    _install_pipeline(app, pipeline)
-
-    try:
-        before_warm = await client.post(
-            "/api/internal/extractions",
-            json={"transcript": "Shared Transcript Text."},
-        )
-        video_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
-        after_warm = await client.post(
-            "/api/internal/extractions",
-            json={"transcript": "Shared Transcript Text."},
-        )
-
-        expected_submission = {
-            "text": "Shared Transcript Text.",
-            "language": "und",
-            "method": "text_submission",
-        }
-        assert before_warm.status_code == 200
-        assert before_warm.json()["transcript"] == expected_submission
-        assert video_response.status_code == 200
-        assert video_response.json()["transcript"]["method"] == "youtube_captions"
-        assert after_warm.status_code == 200
-        assert after_warm.json()["transcript"] == expected_submission
-        assert extractor.calls == [_CANONICAL_URL]
-        assert provider.calls == [_VIDEO_ID]
-        assert track.fetch_calls == 1
-    finally:
-        await cache.aclose()
-
-
-async def test_endpoint_transcript_contract_bump_preserves_source_metadata_reuse(
-    client: AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Reacquire only the Transcript after its acquisition-contract version changes."""
-    clock = ManualClock()
-    cache, _ = _router_cache(clock)
-    extractor = _OutcomeMetadataExtractor([_youtube_metadata()])
-    track = _CaptionTrack("en", ["Transcript contract v1."])
-    provider = _CaptionProvider([track])
-    pipeline = _pipeline(
-        SourceMetadataService(
-            extractor=extractor,
-            settings=_settings(),
-            cache=cache,
-        ),
-        CachedTranscriptionService(
-            TranscriptionService(
-                provider=provider,
-                audio_downloader=_AudioDownloader(),
-                transcriber=_FixedWhisperTranscriber(
-                    WhisperResult(text="unused Whisper", language="en", segment_count=1)
-                ),
-                temp_media_dir=tmp_path,
-                semaphore=asyncio.Semaphore(1),
-            ),
-            cache,
-        ),
-    )
-    _install_pipeline(app, pipeline)
-
-    try:
-        first_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
-        track._segments = ["Transcript contract v2."]
-        monkeypatch.setattr(
-            transcription_service_module,
-            "_TRANSCRIPT_ACQUISITION_CONTRACT_VERSION",
-            "transcript-acquisition-v2",
-        )
-        second_response = await client.post("/api/extractions", json={"url": _CANONICAL_URL})
-
-        assert first_response.status_code == 200
-        assert first_response.json()["transcript"]["text"] == "Transcript contract v1."
-        assert second_response.status_code == 200
-        assert second_response.json()["transcript"]["text"] == "Transcript contract v2."
-        assert extractor.calls == [_CANONICAL_URL]
-        assert provider.calls == [_VIDEO_ID, _VIDEO_ID]
-        assert track.fetch_calls == 2
-    finally:
-        await cache.aclose()

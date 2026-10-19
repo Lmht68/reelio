@@ -572,6 +572,7 @@ class RedisCache:
             ),
         )
         if result is _COMMAND_UNAVAILABLE:
+            await self._release_lease(entry, lease_key, ownership)
             return False
         if not bool(result):
             _emit_cache_event(entry.layer, "lease_loss", "ownership_write_lost", warning=True)
@@ -637,6 +638,7 @@ class RedisCache:
                 keys=[lease_key],
                 args=[ownership.token],
             ),
+            compensating_cleanup=True,
         )
         if result is not _COMMAND_UNAVAILABLE and not bool(result):
             _emit_cache_event(entry.layer, "lease_loss", "lease_release_lost", warning=True)
@@ -740,11 +742,13 @@ class RedisCache:
         entry: _CacheDescriptor[ValueT],
         operation: str,
         command: Callable[[], Awaitable[ResultT]],
+        *,
+        compensating_cleanup: bool = False,
     ) -> ResultT | _CommandUnavailable:
-        """Run one bounded Redis command unless shutdown or circuit state bypasses it."""
+        """Run a bounded Redis command, reserving circuit bypass for lease cleanup."""
         if await self._is_closed():
             return _COMMAND_UNAVAILABLE
-        is_probe = await self._admit_redis_command(entry.layer)
+        is_probe = False if compensating_cleanup else await self._admit_redis_command(entry.layer)
         if is_probe is None:
             return _COMMAND_UNAVAILABLE
         try:

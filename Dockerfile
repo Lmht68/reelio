@@ -21,16 +21,10 @@ FROM python:3.12.12-slim-bookworm AS runtime
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    REELIO_TEMP_MEDIA_DIR=/tmp/reelio \
-    REELIO_WHISPER_DEVICE=cpu \
-    REELIO_WHISPER_COMPUTE_TYPE=int8 \
-    HF_HOME=/var/cache/huggingface
+    PYTHONUNBUFFERED=1
 
 RUN groupadd --system --gid 10001 reelio \
-    && useradd --system --uid 10001 --gid reelio --home-dir /app --shell /usr/sbin/nologin reelio \
-    && mkdir -p /tmp/reelio /var/cache/huggingface \
-    && chown -R reelio:reelio /tmp/reelio /var/cache/huggingface
+    && useradd --system --uid 10001 --gid reelio --home-dir /app --shell /usr/sbin/nologin reelio
 
 WORKDIR /app
 
@@ -40,7 +34,7 @@ USER reelio
 
 EXPOSE 8181
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8181/health', timeout=4)"
 
 CMD ["uvicorn", "reelio.main:app", "--host", "0.0.0.0", "--port", "8181", "--workers", "1"]

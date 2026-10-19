@@ -1,1 +1,0 @@
-"""Transcript acquisition service package."""

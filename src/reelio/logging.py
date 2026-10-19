@@ -70,8 +70,6 @@ def configure_logging(level: str) -> None:
                     "propagate": False,
                 },
                 "httpx": {"level": "WARNING"},
-                "yt_dlp": {"level": "WARNING"},
-                "faster_whisper": {"level": "WARNING"},
             },
             "root": {"handlers": ["stderr"], "level": "WARNING"},
         }

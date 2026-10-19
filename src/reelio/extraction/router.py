@@ -557,6 +557,8 @@ def _to_transcript_response(
     response_model=extraction_schemas.ExtractResponse,
     summary="Extract mentioned Movies, TV Series, Tracks, Music Releases, and Book Works from a public video Source",
     description=(
+        "Textify backs Source inspection and Transcript acquisition; callers still receive "
+        "Reelio's synchronous response and Reelio-owned errors. "
         "Accept a public YouTube, Instagram, Facebook, TikTok, or X video URL and "
         "return the normalized Source, the Transcript with its acquisition method, "
         "the effective Spotify market, category-specific result statistics, and "
@@ -662,24 +664,21 @@ def _to_transcript_response(
         502: {
             "model": extraction_schemas.ErrorResponse,
             "description": (
-                "Metadata, transcript, LLM, TMDB, Spotify, Open Library, or Textify "
-                "transport or contract failure. Any TMDB, Spotify, or Open Library "
-                "provider failure fails the complete request. Open Library failures are "
-                "atomic with catalog_provider_failed and message Open Library catalog "
-                "request failed."
+                "Source or Transcript provider transport or contract failure. Any TMDB, "
+                "Spotify, or Open Library provider failure fails the complete request. Open "
+                "Library failures are atomic with catalog_provider_failed and message Open "
+                "Library catalog request failed."
             ),
         },
         503: {
             "model": extraction_schemas.ErrorResponse,
             "description": (
-                "Textify capacity, job-store, or durable coordination is temporarily unavailable."
+                "Source-and-Transcript acquisition or durable coordination is temporarily "
+                "unavailable."
             ),
             "headers": {
                 "Retry-After": {
-                    "description": (
-                        "Whole seconds to wait before retrying temporary Textify capacity, "
-                        "job-store, or coordination unavailability."
-                    ),
+                    "description": "Whole seconds to wait before retrying temporary unavailability.",
                     "schema": {"type": "integer"},
                 },
             },
@@ -687,9 +686,9 @@ def _to_transcript_response(
         504: {
             "model": extraction_schemas.ErrorResponse,
             "description": (
-                "External provider timeout, including exhausted Textify transport retries. "
-                "Open Library timeouts are atomic with pipeline_timeout and message Open "
-                "Library catalog request timed out."
+                "External provider timeout, including exhausted Source-and-Transcript "
+                "provider transport retries. Open Library timeouts are atomic with "
+                "pipeline_timeout and message Open Library catalog request timed out."
             ),
         },
     },
