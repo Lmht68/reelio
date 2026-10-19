@@ -82,7 +82,7 @@ jobs:
         env:
           REELIO_TEST_REDIS_URL: redis://localhost:6379/15
           REELIO_TEST_REDIS_UNAVAILABLE_URL: redis://localhost:6399/15
-        run: uv run --locked pytest -m redis_smoke tests/cache/test_redis_smoke.py
+        run: uv run --locked pytest -m redis_smoke tests/cache/test_redis_smoke.py tests/extraction/test_textify_integration.py
 
 
       - name: Check Ruff linting

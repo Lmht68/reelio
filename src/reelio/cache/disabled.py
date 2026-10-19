@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 
 from reelio.cache.interface import (
     CacheEntry,
+    CacheLoadResult,
     CacheSkip,
     CacheWrite,
     RetainedCacheValue,
@@ -28,8 +29,24 @@ class DisabledCache:
         Returns:
             Value returned by the loader.
         """
+        return (await self.get_or_load_with_status(entry, loader)).value
+
+    async def get_or_load_with_status[ValueT](
+        self,
+        entry: CacheEntry[ValueT],
+        loader: Callable[[], Awaitable[ValueT]],
+    ) -> CacheLoadResult[ValueT]:
+        """Load once and report that no value was persisted.
+
+        Args:
+            entry: Ignored cache operation descriptor.
+            loader: Awaitable operation producing the required value.
+
+        Returns:
+            Loader value with unpersisted status.
+        """
         del entry
-        return await loader()
+        return CacheLoadResult(value=await loader(), persisted=False)
 
     async def get_or_load_revalidating[ValueT](
         self,

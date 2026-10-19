@@ -7,7 +7,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, NoReturn
+from typing import Literal, NoReturn, cast
 from urllib.parse import urlparse
 
 import httpx
@@ -24,6 +24,8 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from reelio.cache import AsyncCache, CacheCodecError, CacheEntry
+from reelio.cache.interface import JsonObject
 from reelio.extraction.coordination import (
     CoordinationConfig,
     CoordinationError,
@@ -95,6 +97,7 @@ class TextifyConfig(BaseSettings):
         gt=0,
         allow_inf_nan=False,
     )
+    result_retention_seconds: int = Field(default=2_592_000, ge=1)
 
     @field_validator("origin")
     @classmethod
@@ -273,6 +276,137 @@ class _TextifyResult(_TextifyModel):
     transcript: _TextifyTranscript
 
 
+class _CachedTextifySource(BaseModel):
+    """Validate the exact Reelio Source fields retained for one Textify result."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    platform: Platform
+    video_id: StrictStr
+    url: StrictStr
+    title: StrictStr
+    description: StrictStr
+    channel: StrictStr
+    duration_seconds: StrictInt = Field(gt=0)
+
+    @field_validator("platform", mode="before")
+    @classmethod
+    def _validate_platform(cls, value: object) -> Platform:
+        """Reject invalid or coercible cached platform values."""
+        if not isinstance(value, str):
+            raise ValueError("Cached Source platform must be a string")
+        try:
+            return Platform(value)
+        except ValueError as exc:
+            raise ValueError("Cached Source platform is unsupported") from exc
+
+    @field_validator("video_id", "url")
+    @classmethod
+    def _require_nonblank_identity(cls, value: str) -> str:
+        """Reject blank cached Source identity fields."""
+        if not value.strip():
+            raise ValueError("Cached Source identity field must not be blank")
+        return value
+
+
+class _CachedTextifyTranscript(BaseModel):
+    """Validate the exact Reelio Transcript fields retained for one Textify result."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    text: StrictStr
+    language: StrictStr
+    method: TranscriptMethod
+
+    @field_validator("method", mode="before")
+    @classmethod
+    def _validate_method(cls, value: object) -> TranscriptMethod:
+        """Reject invalid, coercible, and text-submission cached methods."""
+        if not isinstance(value, str):
+            raise ValueError("Cached Transcript method must be a string")
+        try:
+            method = TranscriptMethod(value)
+        except ValueError as exc:
+            raise ValueError("Cached Transcript method is unsupported") from exc
+        if method is TranscriptMethod.TEXT_SUBMISSION:
+            raise ValueError("Cached Textify Transcript cannot be a text submission")
+        return method
+
+    @field_validator("language")
+    @classmethod
+    def _require_normalized_language(cls, value: str) -> str:
+        """Reject blank or whitespace-padded cached Transcript languages."""
+        if not value.strip() or value != value.strip():
+            raise ValueError("Cached Transcript language must be nonblank and normalized")
+        return value
+
+    @field_validator("text")
+    @classmethod
+    def _require_normalized_text(cls, value: str) -> str:
+        """Reject blank or non-normalized cached Transcript text."""
+        if not value or value != normalize_transcript_segments((value,)):
+            raise ValueError("Cached Transcript text must be nonempty and normalized")
+        return value
+
+
+class _CachedTextifyResult(BaseModel):
+    """Validate one complete strict cached Textify result projection."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    source: _CachedTextifySource
+    transcript: _CachedTextifyTranscript
+
+
+class _TextifyResultCacheCodec:
+    """Serialize exact normalized Reelio Source-and-Transcript Textify results."""
+
+    version = "textify-result-v1"
+
+    def encode(self, value: tuple[Source, Transcript]) -> JsonObject:
+        """Encode one validated Textify result without its request identity.
+
+        Args:
+            value: Normalized Reelio Source and Transcript result.
+
+        Returns:
+            Strict JSON object suitable for the shared cache envelope.
+
+        Raises:
+            CacheCodecError: If the result cannot meet the cache contract.
+        """
+        if (
+            type(value) is not tuple
+            or len(value) != 2
+            or not isinstance(value[0], Source)
+            or not isinstance(value[1], Transcript)
+        ):
+            raise CacheCodecError("Invalid Textify result cache value")
+        try:
+            cache_value = _cache_value_from_reelio_result(value[0], value[1])
+        except ValidationError as exc:
+            raise CacheCodecError("Invalid Textify result cache value") from exc
+        return cast(JsonObject, cache_value.model_dump(mode="json"))
+
+    def decode(self, payload: JsonObject) -> tuple[Source, Transcript]:
+        """Decode one strict cached Textify result into fresh domain values.
+
+        Args:
+            payload: Decoded cache payload for one retained Textify result.
+
+        Returns:
+            Fresh normalized Reelio Source and Transcript values.
+
+        Raises:
+            CacheCodecError: If the payload violates the result cache contract.
+        """
+        try:
+            cache_value = _CachedTextifyResult.model_validate(payload)
+        except ValidationError as exc:
+            raise CacheCodecError("Invalid Textify result cache value") from exc
+        return _reelio_result_from_cache_value(cache_value)
+
+
 class _SucceededJobResponse(_TextifyModel):
     """Read a completed successful Textify job."""
 
@@ -328,6 +462,7 @@ class TextifySourceTranscriptProvider:
         client: httpx.AsyncClient,
         coordination_repository: TextifyCoordinationRepository,
         settings: TextifyConfig,
+        cache: AsyncCache,
         *,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -337,13 +472,15 @@ class TextifySourceTranscriptProvider:
         Args:
             client: No-redirect Textify HTTP client resolved against the configured origin.
             coordination_repository: Durable admission state owner.
-            settings: Validated Textify request and retry policy.
+            settings: Validated Textify request, retry, and result-retention policy.
+            cache: Shared cache borrowed from the application lifespan.
             clock: Monotonic clock used to bound retry sequences.
             sleeper: Awaitable delay used for Textify and transport retry instructions.
         """
         self._client = client
         self._coordination_repository = coordination_repository
         self._settings = settings
+        self._cache = cache
         self._clock = clock
         self._sleeper = sleeper
 
@@ -355,6 +492,43 @@ class TextifySourceTranscriptProvider:
 
         Returns:
             Reelio-owned normalized Source and Transcript values.
+
+        Raises:
+            TranscriptionError: If Textify returns invalid or unusable job data.
+            TranscriptionUnavailableError: If coordination, admission, or job storage
+                is temporarily unavailable.
+            PipelineTimeoutError: If Textify communication exhausts its timeout budget.
+        """
+        successful_coordination: TextifyCoordination | None = None
+
+        async def load_result() -> tuple[Source, Transcript]:
+            """Acquire an uncached Textify result and retain its exact coordination."""
+            nonlocal successful_coordination
+            result, successful_coordination = await self._acquire_uncached(submitted_url)
+            return result
+
+        cache_result = await self._cache.get_or_load_with_status(
+            _textify_result_entry(
+                submitted_url,
+                self._settings.result_retention_seconds,
+            ),
+            load_result,
+        )
+        if successful_coordination is not None and cache_result.persisted:
+            await self._cleanup_successful_coordination(successful_coordination)
+        return cache_result.value
+
+    async def _acquire_uncached(
+        self,
+        submitted_url: str,
+    ) -> tuple[tuple[Source, Transcript], TextifyCoordination]:
+        """Acquire one result through PostgreSQL-coordinated Textify work.
+
+        Args:
+            submitted_url: Exact public Source URL supplied by the caller.
+
+        Returns:
+            Normalized result with the exact successful coordination snapshot.
 
         Raises:
             TranscriptionError: If Textify returns invalid or unusable job data.
@@ -422,14 +596,31 @@ class TextifySourceTranscriptProvider:
             if isinstance(inspection, _CancelledJobResponse):
                 await self._retire(coordination)
                 raise _transcription_failure() from None
-            return _to_reelio_result(inspection.result)
+            return _to_reelio_result(inspection.result), coordination
 
     async def aclose(self) -> None:
-        """Close the owned HTTP client and coordination repository."""
+        """Close owned HTTP and coordination resources without closing the borrowed cache."""
         try:
             await self._client.aclose()
         finally:
             await self._coordination_repository.aclose()
+
+    async def _cleanup_successful_coordination(
+        self,
+        coordination: TextifyCoordination,
+    ) -> None:
+        """Best-effort retire one result now confirmed in the shared cache.
+
+        Args:
+            coordination: Exact successful coordination snapshot to remove.
+        """
+        try:
+            deleted = await self._coordination_repository.delete(coordination)
+        except CoordinationError:
+            _log_adapter_event("successful_coordination_cleanup_incomplete")
+            return
+        if not deleted:
+            _log_adapter_event("successful_coordination_cleanup_incomplete")
 
     async def _retire(self, coordination: TextifyCoordination) -> None:
         """Retire observed unusable coordination without creating replacement work.
@@ -793,6 +984,70 @@ def _retry_after(response: httpx.Response) -> int:
     return int(retry_after)
 
 
+def _textify_result_entry(
+    submitted_url: str,
+    retention_seconds: int,
+) -> CacheEntry[tuple[Source, Transcript]]:
+    """Describe one exact submitted-URL cache operation for a Textify result."""
+    return CacheEntry(
+        layer="source:textify-result",
+        key_version="v1",
+        identity={"submitted_url": submitted_url},
+        codec=_TextifyResultCacheCodec(),
+        ttl_seconds=lambda _: retention_seconds,
+        wait_timeout_seconds=1.0,
+    )
+
+
+def _cache_value_from_reelio_result(
+    source: Source,
+    transcript: Transcript,
+) -> _CachedTextifyResult:
+    """Validate normalized Reelio values against the durable result cache contract."""
+    return _CachedTextifyResult.model_validate(
+        {
+            "source": {
+                "platform": source.platform,
+                "video_id": source.video_id,
+                "url": source.url,
+                "title": source.title,
+                "description": source.description,
+                "channel": source.channel,
+                "duration_seconds": source.duration_seconds,
+            },
+            "transcript": {
+                "method": transcript.method,
+                "language": transcript.language,
+                "text": transcript.text,
+            },
+        }
+    )
+
+
+def _reelio_result_from_cache_value(
+    cache_value: _CachedTextifyResult,
+) -> tuple[Source, Transcript]:
+    """Construct fresh Reelio domain values from one validated cache projection."""
+    source = cache_value.source
+    transcript = cache_value.transcript
+    return (
+        Source(
+            platform=source.platform,
+            video_id=source.video_id,
+            url=source.url,
+            title=source.title,
+            description=source.description,
+            channel=source.channel,
+            duration_seconds=source.duration_seconds,
+        ),
+        Transcript(
+            text=transcript.text,
+            language=transcript.language,
+            method=transcript.method,
+        ),
+    )
+
+
 def _to_reelio_result(result: _TextifyResult) -> tuple[Source, Transcript]:
     """Convert a validated successful Textify result into Reelio domain values.
 
@@ -800,46 +1055,37 @@ def _to_reelio_result(result: _TextifyResult) -> tuple[Source, Transcript]:
         result: Strict compact Textify Source-and-Transcript response projection.
 
     Returns:
-        Reelio-owned Source and Transcript values.
+        Reelio-owned normalized Source and Transcript values.
     """
     source = result.source
     transcript = result.transcript
-    if (
-        not source.video_id.strip()
-        or not source.url.strip()
-        or source.duration_seconds <= 0
-        or not transcript.language.strip()
-        or transcript.language != transcript.language.strip()
-    ):
-        _invalid_textify_response("invalid_result_projection")
-    normalized_text = normalize_transcript_segments([transcript.text])
-    if not normalized_text or normalized_text != transcript.text:
-        _invalid_textify_response("unnormalized_result_transcript")
+    transcript_method = (
+        TranscriptMethod.WHISPER
+        if transcript.method == "faster_whisper"
+        else TranscriptMethod.YOUTUBE_CAPTIONS
+    )
     try:
-        platform = Platform(source.platform)
-        transcript_method = (
-            TranscriptMethod.WHISPER
-            if transcript.method == "faster_whisper"
-            else TranscriptMethod.YOUTUBE_CAPTIONS
+        cache_value = _CachedTextifyResult.model_validate(
+            {
+                "source": {
+                    "platform": source.platform,
+                    "video_id": source.video_id,
+                    "url": source.url,
+                    "title": source.title,
+                    "description": source.description,
+                    "channel": source.channel,
+                    "duration_seconds": source.duration_seconds,
+                },
+                "transcript": {
+                    "method": transcript_method,
+                    "language": transcript.language,
+                    "text": transcript.text,
+                },
+            }
         )
-        return (
-            Source(
-                platform=platform,
-                video_id=source.video_id,
-                url=source.url,
-                title=source.title,
-                description=source.description,
-                channel=source.channel,
-                duration_seconds=source.duration_seconds,
-            ),
-            Transcript(
-                text=transcript.text,
-                language=transcript.language,
-                method=transcript_method,
-            ),
-        )
-    except (ValidationError, ValueError):
+    except ValidationError:
         _invalid_textify_response("invalid_result_projection")
+    return _reelio_result_from_cache_value(cache_value)
 
 
 def _log_adapter_event(reason: str, code: _TextifyErrorCode | None = None) -> None:
@@ -888,15 +1134,17 @@ def _transcription_unavailable() -> TranscriptionUnavailableError:
 async def create_textify_source_transcript_provider(
     textify_settings: TextifyConfig,
     coordination_settings: CoordinationConfig,
+    cache: AsyncCache,
 ) -> TextifySourceTranscriptProvider:
     """Construct one verified durable Textify Source-and-Transcript provider.
 
     Args:
-        textify_settings: Validated Textify origin, timeout, and retry policy.
+        textify_settings: Validated Textify origin, timeout, retry, and retention policy.
         coordination_settings: Validated dedicated coordination database settings.
+        cache: Shared cache borrowed from the application lifespan.
 
     Returns:
-        A provider owning verified PostgreSQL coordination and no-redirect HTTP resources.
+        Provider owning verified PostgreSQL coordination and no-redirect HTTP resources.
     """
     coordination_repository = await create_postgres_textify_coordination(coordination_settings)
     try:
@@ -913,4 +1161,5 @@ async def create_textify_source_transcript_provider(
         client=client,
         coordination_repository=coordination_repository,
         settings=textify_settings,
+        cache=cache,
     )

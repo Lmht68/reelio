@@ -121,6 +121,19 @@ class CacheSkip[ValueT]:
 
 
 @dataclass(frozen=True, slots=True)
+class CacheLoadResult[ValueT]:
+    """Contain a cache read-through value and its persistence confirmation.
+
+    Attributes:
+        value: Decoded cached value or the original loader result.
+        persisted: Whether the value was a validated fresh hit or confirmed fill.
+    """
+
+    value: ValueT
+    persisted: bool
+
+
+@dataclass(frozen=True, slots=True)
 class RetainedCacheValue[ValueT]:
     """Expose a physically retained value only to its revalidation loader.
 
@@ -140,6 +153,14 @@ class AsyncCache(Protocol):
         loader: Callable[[], Awaitable[ValueT]],
     ) -> ValueT:
         """Return a cached value or invoke the loader exactly once for a miss."""
+        ...
+
+    async def get_or_load_with_status[ValueT](
+        self,
+        entry: CacheEntry[ValueT],
+        loader: Callable[[], Awaitable[ValueT]],
+    ) -> CacheLoadResult[ValueT]:
+        """Return a cached value or loader result with persistence confirmation."""
         ...
 
     async def get_or_load_revalidating[ValueT](

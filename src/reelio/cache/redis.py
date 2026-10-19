@@ -22,6 +22,7 @@ from reelio.cache.interface import (
     AsyncCache,
     CacheCodecError,
     CacheEntry,
+    CacheLoadResult,
     CacheSkip,
     CacheWrite,
     JsonObject,
@@ -244,6 +245,22 @@ class RedisCache:
         Returns:
             Decoded cache value or the loader's original value.
         """
+        return (await self.get_or_load_with_status(entry, loader)).value
+
+    async def get_or_load_with_status[ValueT](
+        self,
+        entry: CacheEntry[ValueT],
+        loader: Callable[[], Awaitable[ValueT]],
+    ) -> CacheLoadResult[ValueT]:
+        """Return an ordinary-TTL value with validated persistence confirmation.
+
+        Args:
+            entry: Versioned cache operation descriptor.
+            loader: Awaitable operation producing a required value for a miss.
+
+        Returns:
+            Decoded fresh value or the loader result and whether it persisted.
+        """
 
         async def revalidating_loader(
             retained_value: RetainedCacheValue[ValueT] | None,
@@ -270,7 +287,7 @@ class RedisCache:
         Returns:
             Decoded fresh value or the value produced by the loader.
         """
-        return await self._get_or_load(entry, loader)
+        return (await self._get_or_load(entry, loader)).value
 
     async def aclose(self) -> None:
         """Cancel renewal work and close the owned Redis client at most once."""
@@ -292,7 +309,7 @@ class RedisCache:
         self,
         entry: _CacheDescriptor[ValueT],
         loader: _RevalidatingLoader[ValueT],
-    ) -> ValueT:
+    ) -> CacheLoadResult[ValueT]:
         """Execute one cache operation while hiding lease and read-state mechanics."""
         try:
             key = self._cache_key(entry)
@@ -309,7 +326,7 @@ class RedisCache:
             return await self._load_without_cache(loader)
         if cache_read.state == "fresh":
             _emit_cache_event(entry.layer, "hit")
-            return cast(ValueT, cache_read.value)
+            return CacheLoadResult(value=cast(ValueT, cache_read.value), persisted=True)
 
         _emit_cache_event(entry.layer, "miss")
         lease_key = self._lease_key(key)
@@ -354,7 +371,7 @@ class RedisCache:
         key: str,
         lease_key: str,
         loader: _RevalidatingLoader[ValueT],
-    ) -> ValueT:
+    ) -> CacheLoadResult[ValueT]:
         """Poll a contended fill, then make one final ownership attempt before fallback."""
         _emit_cache_event(entry.layer, "wait", "started")
         deadline = self._runtime.monotonic() + entry.wait_timeout_seconds
@@ -371,7 +388,7 @@ class RedisCache:
                 return await self._load_without_cache(loader)
             if cache_read.state == "fresh":
                 _emit_cache_event(entry.layer, "hit")
-                return cast(ValueT, cache_read.value)
+                return CacheLoadResult(value=cast(ValueT, cache_read.value), persisted=True)
 
             ownership = await self._try_acquire_lease(entry, lease_key)
             if isinstance(ownership, _CommandUnavailable):
@@ -391,7 +408,7 @@ class RedisCache:
             return await self._load_without_cache(loader)
         if final_cache_read.state == "fresh":
             _emit_cache_event(entry.layer, "hit")
-            return cast(ValueT, final_cache_read.value)
+            return CacheLoadResult(value=cast(ValueT, final_cache_read.value), persisted=True)
         return await self._load_without_cache(loader, final_cache_read)
 
     async def _load_as_owner[ValueT](
@@ -401,7 +418,7 @@ class RedisCache:
         lease_key: str,
         ownership: _LeaseOwnership,
         loader: _RevalidatingLoader[ValueT],
-    ) -> ValueT:
+    ) -> CacheLoadResult[ValueT]:
         """Re-read under a lease, then load and write only while that lease remains owned."""
         renewal_task = await self._start_renewal(entry, lease_key, ownership)
         if renewal_task is None:
@@ -416,7 +433,7 @@ class RedisCache:
             await self._stop_renewal(renewal_task)
             await self._release_lease(entry, lease_key, ownership)
             _emit_cache_event(entry.layer, "hit")
-            return cast(ValueT, ownership_read.value)
+            return CacheLoadResult(value=cast(ValueT, ownership_read.value), persisted=True)
 
         retained_value = self._retained_value(ownership_read)
         try:
@@ -428,20 +445,21 @@ class RedisCache:
 
         await self._stop_renewal(renewal_task)
         if ownership.lost or await self._is_closed():
-            return load_outcome.value
+            return CacheLoadResult(value=load_outcome.value, persisted=False)
         if isinstance(load_outcome, CacheSkip):
             await self._discard_if_owned(entry, key, lease_key, ownership)
-            return load_outcome.value
-        await self._store_if_owned(entry, key, lease_key, ownership, load_outcome)
-        return load_outcome.value
+            return CacheLoadResult(value=load_outcome.value, persisted=False)
+        persisted = await self._store_if_owned(entry, key, lease_key, ownership, load_outcome)
+        return CacheLoadResult(value=load_outcome.value, persisted=persisted)
 
     async def _load_without_cache[ValueT](
         self,
         loader: _RevalidatingLoader[ValueT],
         cache_read: _CacheRead[ValueT] | None = None,
-    ) -> ValueT:
+    ) -> CacheLoadResult[ValueT]:
         """Invoke a loader without write authority and expose only current retained data."""
-        return (await loader(self._retained_value(cache_read))).value
+        load_outcome = await loader(self._retained_value(cache_read))
+        return CacheLoadResult(value=load_outcome.value, persisted=False)
 
     def _retained_value[ValueT](
         self,
@@ -510,8 +528,12 @@ class RedisCache:
         lease_key: str,
         ownership: _LeaseOwnership,
         load_outcome: _OrdinaryCacheValue[ValueT] | CacheWrite[ValueT],
-    ) -> None:
-        """Serialize once and atomically fill only while the owner token still matches."""
+    ) -> bool:
+        """Serialize and fill only while the owner token still matches.
+
+        Returns:
+            True only when the token-owned Redis fill confirmed persistence.
+        """
         try:
             cache_write = self._cache_write(entry, load_outcome)
             encoded_value = entry.codec.encode(cache_write.value)
@@ -534,12 +556,12 @@ class RedisCache:
         except (CacheCodecError, TypeError, ValueError):
             _emit_cache_event(entry.layer, "fail_open", "encode_failed", warning=True)
             await self._release_lease(entry, lease_key, ownership)
-            return
+            return False
 
         if len(payload) > self._policy.maximum_envelope_bytes:
             _emit_cache_event(entry.layer, "oversize_skip")
             await self._release_lease(entry, lease_key, ownership)
-            return
+            return False
 
         result = await self._run_redis_command(
             entry,
@@ -550,11 +572,12 @@ class RedisCache:
             ),
         )
         if result is _COMMAND_UNAVAILABLE:
-            return
+            return False
         if not bool(result):
             _emit_cache_event(entry.layer, "lease_loss", "ownership_write_lost", warning=True)
-            return
+            return False
         _emit_cache_event(entry.layer, "fill")
+        return True
 
     def _cache_write[ValueT](
         self,

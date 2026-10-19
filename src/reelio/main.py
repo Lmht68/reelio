@@ -82,6 +82,7 @@ async def _create_production_pipeline(
         source_transcript_provider = await create_textify_source_transcript_provider(
             textify_settings,
             coordination_settings,
+            cache,
         )
         cleanup.push_async_callback(source_transcript_provider.aclose)
         interpretation_service = MentionInterpretationService(

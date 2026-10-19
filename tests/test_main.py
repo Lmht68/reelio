@@ -327,10 +327,12 @@ async def test_production_lifespan_owns_one_textify_source_provider(
     async def create_textify_provider(
         textify_settings: object,
         coordination_settings: object,
+        configured_cache: object,
     ) -> _FakeTextifySourceTranscriptProvider:
         nonlocal textify_factory_calls
         assert isinstance(textify_settings, _FakeTextifyConfig)
         assert isinstance(coordination_settings, _FakeCoordinationConfig)
+        assert configured_cache is not None
         textify_factory_calls += 1
         return source_transcript_provider
 
@@ -411,8 +413,9 @@ async def test_production_lifespan_closes_llm_provider_after_textify_startup_fai
     async def fail_textify_provider(
         textify_settings: object,
         coordination_settings: object,
+        configured_cache: object,
     ) -> NoReturn:
-        del textify_settings, coordination_settings
+        del textify_settings, coordination_settings, configured_cache
         raise RuntimeError("Textify provider construction failed")
 
     def unexpected_local_transcription(*args: object, **kwargs: object) -> NoReturn:
@@ -471,9 +474,11 @@ async def test_production_lifespan_closes_resolver_after_aggregation_setup_failu
     async def create_textify_provider(
         textify_settings: object,
         coordination_settings: object,
+        configured_cache: object,
     ) -> _FakeTextifySourceTranscriptProvider:
         assert isinstance(textify_settings, _FakeTextifyConfig)
         assert isinstance(coordination_settings, _FakeCoordinationConfig)
+        assert configured_cache is not None
         return source_transcript_provider
 
     def create_resolver(
@@ -667,6 +672,7 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
     received_book_caches: list[object] = []
     received_spotify_caches: list[object] = []
     received_tmdb_caches: list[object] = []
+    received_textify_caches: list[object] = []
 
     @asynccontextmanager
     async def spotify_catalog_factory(
@@ -697,9 +703,11 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
     async def create_textify_provider(
         textify_settings: object,
         coordination_settings: object,
+        configured_cache: object,
     ) -> _FakeTextifySourceTranscriptProvider:
         assert isinstance(textify_settings, _FakeTextifyConfig)
         assert isinstance(coordination_settings, _FakeCoordinationConfig)
+        received_textify_caches.append(configured_cache)
         return source_transcript_provider
 
     monkeypatch.setattr(main_module, "SpotifyConfig", _FakeSpotifySettings)
@@ -739,6 +747,7 @@ async def test_enabled_production_lifespan_shares_cache_and_closes_it_after_pipe
         assert received_book_caches == [cache]
         assert received_tmdb_caches == [cache]
         assert received_spotify_caches == [cache]
+        assert received_textify_caches == [cache]
         assert cache.close_calls == 0
 
     assert book_resolver.close_calls == 1

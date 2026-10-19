@@ -24,7 +24,12 @@ from reelio.cache import (
     create_cache,
 )
 from reelio.cache.interface import JsonObject
-from reelio.cache.purge import PurgeProvider, RedisProviderPurger, _PurgeRedisClient
+from reelio.cache.purge import (
+    PurgeNamespaceCategory,
+    PurgeProvider,
+    RedisProviderPurger,
+    _PurgeRedisClient,
+)
 from reelio.cache.redis import (
     _ATOMIC_READ_SCRIPT,
     _CORRUPTION_DELETE_SCRIPT,
@@ -331,7 +336,7 @@ async def test_redis_lease_scripts_enforce_token_ownership() -> None:
 
 
 async def test_real_provider_purge_isolates_layers_and_forces_post_purge_loads() -> None:
-    """Purge live multi-page provider and Source keys without touching other layers."""
+    """Purge live active provider layers without disturbing legacy Source data."""
     redis_url = _redis_url_or_skip()
     settings = _smoke_settings(redis_url)
     namespace = _smoke_namespace(settings)
@@ -343,14 +348,14 @@ async def test_real_provider_purge_isolates_layers_and_forces_post_purge_loads()
     spotify_purger = _purger(spotify_purger_client, namespace)
     source_purger = _purger(source_purger_client, namespace)
     spotify_entries = [_entry("provider:spotify", f"spotify-{index}") for index in range(64)]
-    source_entries = [
+    active_source_entries = [
         _entry(layer, f"{layer}-{identity}")
-        for layer in (
-            "source:alias",
-            "source:metadata",
-            "source:transcript",
-            "source:interpretation",
-        )
+        for layer in ("source:textify-result", "source:interpretation")
+        for identity in range(1)
+    ]
+    legacy_source_entries = [
+        _entry(layer, f"{layer}-{identity}")
+        for layer in ("source:alias", "source:metadata", "source:transcript")
         for identity in range(1)
     ]
     preserved_entries = [
@@ -366,7 +371,7 @@ async def test_real_provider_purge_isolates_layers_and_forces_post_purge_loads()
                 f"spotify-lease-{index}",
                 px=60_000,
             )
-        for index, entry in enumerate(source_entries):
+        for index, entry in enumerate(active_source_entries + legacy_source_entries):
             assert (await _load(cache, entry, f"source-{index}"))[1] == 1
             assert await cache_client.set(
                 cache._lease_key(cache._cache_key(entry)),
@@ -389,15 +394,26 @@ async def test_real_provider_purge_isolates_layers_and_forces_post_purge_loads()
         await source_purger.aclose()
 
         assert spotify_result.namespaces[0].deleted_count == 128
-        assert tuple(result.deleted_count for result in source_result.namespaces) == (2, 2, 2, 2)
-        for entry in spotify_entries + source_entries:
+        assert tuple(result.namespace_category for result in source_result.namespaces) == (
+            PurgeNamespaceCategory.TEXTIFY_RESULT,
+            PurgeNamespaceCategory.MENTION_INTERPRETATION,
+        )
+        assert tuple(result.deleted_count for result in source_result.namespaces) == (2, 2)
+        for entry in spotify_entries + active_source_entries:
             cache_key = cache._cache_key(entry)
             assert await cleanup_client.get(cache_key) is None
             assert await cleanup_client.get(cache._lease_key(cache_key)) is None
+        for index, entry in enumerate(legacy_source_entries):
+            cache_key = cache._cache_key(entry)
+            assert await cleanup_client.get(cache_key) is not None
+            assert await cleanup_client.get(cache._lease_key(cache_key)) is not None
+            value, loader_calls = await _load(cache, entry, f"legacy-reloaded-{index}")
+            assert value == f"source-{index + len(active_source_entries)}"
+            assert loader_calls == 0
         for entry in preserved_entries:
             assert await cleanup_client.get(cache._cache_key(entry)) is not None
 
-        for index, entry in enumerate(spotify_entries + source_entries):
+        for index, entry in enumerate(spotify_entries + active_source_entries):
             value, loader_calls = await _load(cache, entry, f"reloaded-{index}")
             assert value == f"reloaded-{index}"
             assert loader_calls == 1

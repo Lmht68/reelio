@@ -136,16 +136,19 @@ def _catalog_entries(provider: PurgeProvider, count: int) -> list[_Descriptor]:
     return entries
 
 
-def _source_entries(count_per_layer: int) -> list[CacheEntry[str]]:
-    """Create Source alias, metadata, Transcript, and interpretation descriptors."""
-    entries: list[CacheEntry[str]] = []
-    layers = (
-        "source:alias",
-        "source:metadata",
-        "source:transcript",
-        "source:interpretation",
-    )
-    for layer in layers:
+def _source_entries(
+    count_per_layer: int,
+) -> tuple[list[CacheEntry[str]], list[CacheEntry[str]]]:
+    """Create active and legacy Source cache descriptors for purge coverage."""
+    active_entries: list[CacheEntry[str]] = []
+    legacy_entries: list[CacheEntry[str]] = []
+    for layer, entries in (
+        ("source:textify-result", active_entries),
+        ("source:interpretation", active_entries),
+        ("source:alias", legacy_entries),
+        ("source:metadata", legacy_entries),
+        ("source:transcript", legacy_entries),
+    ):
         for index in range(count_per_layer):
             identity: JsonObject = {
                 "platform": "youtube" if index % 2 == 0 else "tiktok",
@@ -154,7 +157,7 @@ def _source_entries(count_per_layer: int) -> list[CacheEntry[str]]:
                 "transcript": f"PRIVATE-TRANSCRIPT-{layer}-{index}",
             }
             entries.append(_ordinary_entry(layer, identity))
-    return entries
+    return active_entries, legacy_entries
 
 
 async def _store(cache: RedisCache, entry: _Descriptor, value: str) -> str:
@@ -258,9 +261,10 @@ async def test_catalog_purge_removes_only_selected_provider_data_and_leases(
     preserved_catalog_entries: list[_Descriptor] = [
         entry for candidate in other_providers for entry in _catalog_entries(candidate, 1)
     ]
-    preserved_source_entries = _source_entries(1)
+    active_source_entries, legacy_source_entries = _source_entries(1)
     preserved_entries = preserved_catalog_entries.copy()
-    preserved_entries.extend(preserved_source_entries)
+    preserved_entries.extend(active_source_entries)
+    preserved_entries.extend(legacy_source_entries)
 
     for index, entry in enumerate(selected_entries):
         assert await _store(cache, entry, f"selected-{index}") == f"selected-{index}"
@@ -287,12 +291,12 @@ async def test_catalog_purge_removes_only_selected_provider_data_and_leases(
         await _assert_hit(cache, entry, f"preserved-{index}")
 
 
-async def test_source_purge_removes_all_source_categories_and_preserves_catalog_entries() -> None:
-    """Purge every Source-derived layer across platform and LLM identities."""
+async def test_source_purge_removes_active_layers_and_preserves_legacy_entries() -> None:
+    """Purge only Textify results and Mention interpretations for Source administration."""
     clock = ManualClock()
     redis = FakeRedis(clock)
     cache = _cache(redis, clock)
-    source_entries = _source_entries(2)
+    active_entries, legacy_entries = _source_entries(2)
     catalog_entries: list[_Descriptor] = [
         entry
         for provider in (
@@ -303,9 +307,12 @@ async def test_source_purge_removes_all_source_categories_and_preserves_catalog_
         for entry in _catalog_entries(provider, 1)
     ]
 
-    for index, source_entry in enumerate(source_entries):
-        assert await _store(cache, source_entry, f"source-{index}") == f"source-{index}"
+    for index, source_entry in enumerate(active_entries):
+        assert await _store(cache, source_entry, f"active-{index}") == f"active-{index}"
         await _store_lease(redis, cache, source_entry)
+    for index, legacy_entry in enumerate(legacy_entries):
+        assert await _store(cache, legacy_entry, f"legacy-{index}") == f"legacy-{index}"
+        await _store_lease(redis, cache, legacy_entry)
     for index, catalog_entry in enumerate(catalog_entries):
         assert await _store(cache, catalog_entry, f"catalog-{index}") == f"catalog-{index}"
 
@@ -317,16 +324,18 @@ async def test_source_purge_removes_all_source_categories_and_preserves_catalog_
     ).purge(PurgeProvider.SOURCE)
 
     assert tuple(item.namespace_category for item in result.namespaces) == (
-        PurgeNamespaceCategory.SUBMITTED_URL_ALIAS,
-        PurgeNamespaceCategory.SOURCE_METADATA,
-        PurgeNamespaceCategory.TRANSCRIPT,
+        PurgeNamespaceCategory.TEXTIFY_RESULT,
         PurgeNamespaceCategory.MENTION_INTERPRETATION,
     )
-    assert tuple(item.deleted_count for item in result.namespaces) == (4, 4, 4, 4)
-    for source_entry in source_entries:
+    assert tuple(item.deleted_count for item in result.namespaces) == (4, 4)
+    for source_entry in active_entries:
         assert cache._cache_key(source_entry) not in redis.keys
         assert cache._lease_key(cache._cache_key(source_entry)) not in redis.keys
-        await _assert_miss(cache, source_entry, "source-reloaded")
+        await _assert_miss(cache, source_entry, "active-reloaded")
+    for index, legacy_entry in enumerate(legacy_entries):
+        assert cache._cache_key(legacy_entry) in redis.keys
+        assert cache._lease_key(cache._cache_key(legacy_entry)) in redis.keys
+        await _assert_hit(cache, legacy_entry, f"legacy-{index}")
     for index, catalog_entry in enumerate(catalog_entries):
         await _assert_hit(cache, catalog_entry, f"catalog-{index}")
 
@@ -546,7 +555,7 @@ def test_cli_sanitizes_configuration_and_redis_failure_output(
     unavailable_error = ProviderPurgeError(
         PurgeProvider.SOURCE,
         Environment.LOCAL,
-        PurgeNamespaceCategory.TRANSCRIPT,
+        PurgeNamespaceCategory.TEXTIFY_RESULT,
         3,
     )
     failing_purger = _RecordingPurger(unavailable_error)

@@ -35,9 +35,7 @@ class PurgeNamespaceCategory(StrEnum):
     """Identify one stable visible cache layer eligible for purge."""
 
     EXACT_OPERATION = "exact-operation"
-    SUBMITTED_URL_ALIAS = "submitted-url-alias"
-    SOURCE_METADATA = "source-metadata"
-    TRANSCRIPT = "transcript"
+    TEXTIFY_RESULT = "textify-result"
     MENTION_INTERPRETATION = "mention-interpretation"
 
 
@@ -110,17 +108,13 @@ _PROVIDER_CATEGORIES: dict[PurgeProvider, tuple[PurgeNamespaceCategory, ...]] = 
     PurgeProvider.TMDB: (PurgeNamespaceCategory.EXACT_OPERATION,),
     PurgeProvider.OPEN_LIBRARY: (PurgeNamespaceCategory.EXACT_OPERATION,),
     PurgeProvider.SOURCE: (
-        PurgeNamespaceCategory.SUBMITTED_URL_ALIAS,
-        PurgeNamespaceCategory.SOURCE_METADATA,
-        PurgeNamespaceCategory.TRANSCRIPT,
+        PurgeNamespaceCategory.TEXTIFY_RESULT,
         PurgeNamespaceCategory.MENTION_INTERPRETATION,
     ),
 }
 
 _STATIC_CATEGORY_LAYERS: dict[PurgeNamespaceCategory, str] = {
-    PurgeNamespaceCategory.SUBMITTED_URL_ALIAS: "source:alias",
-    PurgeNamespaceCategory.SOURCE_METADATA: "source:metadata",
-    PurgeNamespaceCategory.TRANSCRIPT: "source:transcript",
+    PurgeNamespaceCategory.TEXTIFY_RESULT: "source:textify-result",
     PurgeNamespaceCategory.MENTION_INTERPRETATION: "source:interpretation",
 }
 

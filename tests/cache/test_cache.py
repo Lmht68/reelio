@@ -13,6 +13,7 @@ import pytest
 from reelio.cache import (
     CacheCodecError,
     CacheEntry,
+    CacheLoadResult,
     CacheSkip,
     CacheWrite,
     DisabledCache,
@@ -73,6 +74,22 @@ class _TextCodec:
         if set(payload) != {"text"} or not isinstance(value, str):
             raise CacheCodecError("Expected text payload")
         return value
+
+
+class _EncodeFailingTextCodec:
+    """Reject every value during cache serialization."""
+
+    version = "encode-failing-v1"
+
+    def encode(self, value: str) -> JsonObject:
+        """Reject one attempted cache value serialization."""
+        del value
+        raise CacheCodecError("Intentional serialization failure")
+
+    def decode(self, payload: JsonObject) -> str:
+        """Reject an unexpected attempt to decode this test-only codec."""
+        del payload
+        raise CacheCodecError("Intentional deserialization failure")
 
 
 class _StringListCodec:
@@ -211,6 +228,16 @@ async def test_disabled_cache_loads_once_without_persisting_nullable_value() -> 
     assert await cache.get_or_load(entry, load) is None
     assert calls == 1
     await cache.aclose()
+
+
+async def test_disabled_cache_reports_unpersisted_load_status() -> None:
+    """Disabled caching returns the loader value without persistence confirmation."""
+    cache = DisabledCache()
+    entry = _text_entry({"path": "/search.json"})
+
+    result = await cache.get_or_load_with_status(entry, lambda: _completed("loaded"))
+
+    assert result == CacheLoadResult(value="loaded", persisted=False)
 
 
 async def test_disabled_cache_revalidates_without_retaining() -> None:
@@ -410,7 +437,9 @@ async def test_invalid_ordinary_ttl_returns_value_without_caching() -> None:
     cache, redis, _ = _redis_cache(clock)
     entry = _text_entry({"path": "/invalid-ttl"}, ttl_seconds=0)
 
-    assert await cache.get_or_load(entry, lambda: _completed("provider-value")) == "provider-value"
+    result = await cache.get_or_load_with_status(entry, lambda: _completed("provider-value"))
+
+    assert result == CacheLoadResult(value="provider-value", persisted=False)
     assert redis.raw_value(cache._cache_key(entry)) is None
 
 
@@ -563,6 +592,89 @@ async def test_redis_cache_reuses_fresh_nullable_values_without_loader_calls() -
     assert calls == 1
 
 
+async def test_redis_cache_reports_confirmed_fill_and_fresh_hit_status() -> None:
+    """Only a confirmed fill or validated fresh hit reports persisted status."""
+    clock = ManualClock()
+    cache, _, _ = _redis_cache(clock)
+    entry = _text_entry({"path": "/search.json"})
+    calls = 0
+
+    async def load() -> str | None:
+        nonlocal calls
+        calls += 1
+        return "loaded"
+
+    first = await cache.get_or_load_with_status(entry, load)
+    second = await cache.get_or_load_with_status(entry, load)
+
+    assert first == CacheLoadResult(value="loaded", persisted=True)
+    assert second == CacheLoadResult(value="loaded", persisted=True)
+    assert calls == 1
+
+
+async def test_redis_cache_reports_key_and_shutdown_fallbacks_as_unpersisted() -> None:
+    """Key construction and closed-cache fallbacks cannot report persistence."""
+    clock = ManualClock()
+    cache, _, _ = _redis_cache(clock)
+    invalid_entry = CacheEntry(
+        layer="invalid layer",
+        key_version="v1",
+        identity={"path": "/search.json"},
+        codec=_OptionalTextCodec(),
+        ttl_seconds=lambda _: 10,
+        wait_timeout_seconds=1.0,
+    )
+
+    invalid_key_result = await cache.get_or_load_with_status(
+        invalid_entry, lambda: _completed("loaded")
+    )
+
+    assert invalid_key_result == CacheLoadResult(value="loaded", persisted=False)
+
+    await cache.aclose()
+    closed_result = await cache.get_or_load_with_status(
+        _text_entry({"path": "/closed"}), lambda: _completed("closed")
+    )
+
+    assert closed_result == CacheLoadResult(value="closed", persisted=False)
+
+
+async def test_redis_cache_reports_codec_failure_as_unpersisted() -> None:
+    """A rejected serialized value returns without persistence confirmation."""
+    clock = ManualClock()
+    cache, redis, _ = _redis_cache(clock)
+    entry = CacheEntry(
+        layer="provider:codec-test",
+        key_version="v1",
+        identity={"path": "/search.json"},
+        codec=_EncodeFailingTextCodec(),
+        ttl_seconds=lambda _: 10,
+        wait_timeout_seconds=1.0,
+    )
+
+    result = await cache.get_or_load_with_status(entry, lambda: _completed("loaded"))
+
+    assert result == CacheLoadResult(value="loaded", persisted=False)
+    assert redis.raw_value(cache._cache_key(entry)) is None
+
+
+async def test_redis_cache_reports_ownership_write_lease_loss_as_unpersisted() -> None:
+    """A replaced lease token cannot confirm persistence for the former owner."""
+    clock = ManualClock()
+    cache, redis, _ = _redis_cache(clock)
+    entry = _text_entry({"path": "/search.json"})
+    redis.block("ownership_write")
+
+    task = asyncio.create_task(cache.get_or_load_with_status(entry, lambda: _completed("loaded")))
+    await redis.started("ownership_write").wait()
+    lease_key = cache._lease_key(cache._cache_key(entry))
+    await redis.set(lease_key, "replacement", px=30_000)
+    redis.unblock("ownership_write")
+
+    assert await task == CacheLoadResult(value="loaded", persisted=False)
+    assert redis.raw_value(cache._cache_key(entry)) is None
+
+
 async def test_redis_cache_canonicalizes_equivalent_identity_and_isolates_distinct_identity() -> (
     None
 ):
@@ -656,7 +768,9 @@ async def test_corruption_delete_failure_returns_loader_value_without_overwrite(
     await redis.put_raw(key, raw_payload)
     redis.fail_operations.add("corrupt_delete")
 
-    assert await cache.get_or_load(entry, lambda: _completed("fresh")) == "fresh"
+    result = await cache.get_or_load_with_status(entry, lambda: _completed("fresh"))
+
+    assert result == CacheLoadResult(value="fresh", persisted=False)
     assert redis.raw_value(key) == raw_payload
 
 
@@ -804,12 +918,12 @@ async def test_waiter_loads_without_writing_after_its_layer_deadline() -> None:
 
     owner_task = asyncio.create_task(owner_cache.get_or_load(entry, owner_loader))
     await owner_started.wait()
-    waiter_task = asyncio.create_task(waiter_cache.get_or_load(entry, waiter_loader))
+    waiter_task = asyncio.create_task(waiter_cache.get_or_load_with_status(entry, waiter_loader))
     await _wait_for_command(redis, "lease_acquire", 2)
 
     sleeper.advance(0.2)
     await _settle()
-    assert await waiter_task == "waiter"
+    assert await waiter_task == CacheLoadResult(value="waiter", persisted=False)
     assert waiter_calls == 1
     assert redis.command_counts["ownership_write"] == 0
 
@@ -833,7 +947,7 @@ async def test_lost_owner_returns_its_value_without_overwriting_a_newer_fill() -
         await finish_first.wait()
         return "first-result"
 
-    first_task = asyncio.create_task(first_cache.get_or_load(entry, first_loader))
+    first_task = asyncio.create_task(first_cache.get_or_load_with_status(entry, first_loader))
     await first_started.wait()
     await _settle()
 
@@ -846,7 +960,7 @@ async def test_lost_owner_returns_its_value_without_overwriting_a_newer_fill() -
         == "second-result"
     )
     finish_first.set()
-    assert await first_task == "first-result"
+    assert await first_task == CacheLoadResult(value="first-result", persisted=False)
     assert (
         await second_cache.get_or_load(entry, lambda: _completed("unexpected")) == "second-result"
     )
@@ -905,15 +1019,17 @@ async def test_old_token_release_does_not_delete_a_new_owner_lease() -> None:
     assert await second_task == "second"
 
 
-@pytest.mark.parametrize("operation", ["lease_acquire", "ownership_write"])
+@pytest.mark.parametrize("operation", ["read", "lease_acquire", "ownership_write"])
 async def test_redis_command_failures_remain_fail_open(operation: str) -> None:
-    """Acquisition and ownership-write failures return the original loader value."""
+    """Unavailable Redis commands return unpersisted loader values."""
     clock = ManualClock()
     cache, redis, _ = _redis_cache(clock)
     entry = _text_entry({"path": "/search.json"})
     redis.fail_operations.add(operation)
 
-    assert await cache.get_or_load(entry, lambda: _completed("loaded")) == "loaded"
+    result = await cache.get_or_load_with_status(entry, lambda: _completed("loaded"))
+
+    assert result == CacheLoadResult(value="loaded", persisted=False)
     assert redis.raw_value(cache._cache_key(entry)) is None
 
 
@@ -935,13 +1051,15 @@ async def test_wait_read_failure_returns_the_waiter_loader_value() -> None:
 
     owner_task = asyncio.create_task(owner_cache.get_or_load(entry, owner_loader))
     await owner_started.wait()
-    waiter_task = asyncio.create_task(waiter_cache.get_or_load(entry, lambda: _completed("waiter")))
+    waiter_task = asyncio.create_task(
+        waiter_cache.get_or_load_with_status(entry, lambda: _completed("waiter"))
+    )
     await _wait_for_command(redis, "lease_acquire", 2)
     redis.fail_operations.add("read")
 
     sleeper.advance(0.1)
     await _settle()
-    assert await waiter_task == "waiter"
+    assert await waiter_task == CacheLoadResult(value="waiter", persisted=False)
 
     release_owner.set()
     assert await owner_task == "owner"
@@ -961,7 +1079,7 @@ async def test_renewal_failure_leaves_the_loaded_value_uncached() -> None:
         await release_owner.wait()
         return "owner"
 
-    owner_task = asyncio.create_task(cache.get_or_load(entry, owner_loader))
+    owner_task = asyncio.create_task(cache.get_or_load_with_status(entry, owner_loader))
     await owner_started.wait()
     await _settle()
     redis.fail_operations.add("lease_renew")
@@ -969,7 +1087,7 @@ async def test_renewal_failure_leaves_the_loaded_value_uncached() -> None:
     await _settle()
     release_owner.set()
 
-    assert await owner_task == "owner"
+    assert await owner_task == CacheLoadResult(value="owner", persisted=False)
     assert redis.raw_value(cache._cache_key(entry)) is None
 
 
@@ -998,7 +1116,9 @@ async def test_blocked_redis_command_respects_the_bounded_command_timeout() -> N
     redis.block("read")
     entry = _text_entry({"path": "/search.json"})
 
-    assert await cache.get_or_load(entry, lambda: _completed("loaded")) == "loaded"
+    result = await cache.get_or_load_with_status(entry, lambda: _completed("loaded"))
+
+    assert result == CacheLoadResult(value="loaded", persisted=False)
     assert redis.command_counts["read"] == 1
     assert _CachePolicy().command_timeout_seconds == 1.0
 
@@ -1016,8 +1136,11 @@ async def test_oversize_envelopes_are_returned_without_being_cached() -> None:
         calls += 1
         return value
 
-    assert await cache.get_or_load(entry, load) == value
-    assert await cache.get_or_load(entry, load) == value
+    first = await cache.get_or_load_with_status(entry, load)
+    second = await cache.get_or_load_with_status(entry, load)
+
+    assert first == CacheLoadResult(value=value, persisted=False)
+    assert second == CacheLoadResult(value=value, persisted=False)
     assert calls == 2
     assert redis.raw_value(cache._cache_key(entry)) is None
 
@@ -1029,32 +1152,42 @@ async def test_circuit_bypasses_then_recovers_through_one_probe() -> None:
     entry = _text_entry({"path": "/search.json"})
     redis.fail_operations.add("read")
 
-    assert await cache.get_or_load(entry, lambda: _completed("first")) == "first"
+    first = await cache.get_or_load_with_status(entry, lambda: _completed("first"))
+    assert first == CacheLoadResult(value="first", persisted=False)
     assert redis.command_counts["read"] == 1
     redis.fail_operations.clear()
-    assert await cache.get_or_load(entry, lambda: _completed("bypassed")) == "bypassed"
+    bypassed = await cache.get_or_load_with_status(entry, lambda: _completed("bypassed"))
+    assert bypassed == CacheLoadResult(value="bypassed", persisted=False)
     assert redis.command_counts["read"] == 1
 
     clock.advance(30.0)
     redis.fail_operations.add("read")
-    assert await cache.get_or_load(entry, lambda: _completed("failed-probe")) == "failed-probe"
+    failed_probe = await cache.get_or_load_with_status(entry, lambda: _completed("failed-probe"))
+    assert failed_probe == CacheLoadResult(value="failed-probe", persisted=False)
     assert redis.command_counts["read"] == 2
     redis.fail_operations.clear()
-    assert await cache.get_or_load(entry, lambda: _completed("still-bypassed")) == "still-bypassed"
+    still_bypassed = await cache.get_or_load_with_status(
+        entry, lambda: _completed("still-bypassed")
+    )
+    assert still_bypassed == CacheLoadResult(value="still-bypassed", persisted=False)
     assert redis.command_counts["read"] == 2
 
     clock.advance(30.0)
     redis.block("read")
-    probe_task = asyncio.create_task(cache.get_or_load(entry, lambda: _completed("recovered")))
+    probe_task = asyncio.create_task(
+        cache.get_or_load_with_status(entry, lambda: _completed("recovered"))
+    )
     await _wait_for_command(redis, "read", 3)
     bypass_task = asyncio.create_task(
-        cache.get_or_load(entry, lambda: _completed("concurrent-bypass"))
+        cache.get_or_load_with_status(entry, lambda: _completed("concurrent-bypass"))
     )
-    assert await bypass_task == "concurrent-bypass"
+    assert await bypass_task == CacheLoadResult(value="concurrent-bypass", persisted=False)
     assert redis.command_counts["read"] == 3
     redis.unblock("read")
-    assert await probe_task == "recovered"
-    assert await cache.get_or_load(entry, lambda: _completed("unexpected")) == "recovered"
+    assert await probe_task == CacheLoadResult(value="recovered", persisted=True)
+    assert await cache.get_or_load_with_status(
+        entry, lambda: _completed("unexpected")
+    ) == CacheLoadResult(value="recovered", persisted=True)
 
 
 async def test_aclose_cancels_renewal_before_closing_redis() -> None:

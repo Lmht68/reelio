@@ -16,13 +16,32 @@ import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from reelio.cache import (
+    AsyncCache,
+    CacheCodecError,
+    CacheEntry,
+    CacheLoadResult,
+    CacheSkip,
+    CacheWrite,
+    DisabledCache,
+    RedisCache,
+    RevalidatingCacheEntry,
+)
+from reelio.cache.interface import JsonObject, RetainedCacheValue
+from reelio.cache.purge import PurgeNamespaceCategory, PurgeProvider, RedisProviderPurger
+from reelio.cache.redis import _RedisClient
 from reelio.config import Environment, app_settings
 from reelio.extraction.coordination import (
     CoordinationConfig,
+    CoordinationError,
+    TextifyCoordination,
+    TextifyCoordinationRepository,
     create_postgres_textify_coordination,
 )
 from reelio.extraction.market import SpotifyMarket
@@ -450,10 +469,14 @@ async def _create_pipeline(
     textify_transport: httpx.AsyncBaseTransport | None = None,
     textify_settings: TextifyConfig | None = None,
     clock: Callable[[], float] = time.monotonic,
+    cache: AsyncCache | None = None,
+    coordination_repository: TextifyCoordinationRepository | None = None,
 ) -> ExtractionPipeline:
     """Compose a real coordination-backed pipeline against a Textify ASGI server."""
-    coordination_repository = await create_postgres_textify_coordination(
-        _coordination_settings(database_url)
+    coordination = (
+        coordination_repository
+        if coordination_repository is not None
+        else await create_postgres_textify_coordination(_coordination_settings(database_url))
     )
     transport = (
         httpx.ASGITransport(app=server.application)
@@ -467,9 +490,10 @@ async def _create_pipeline(
     )
     source_transcript_provider = TextifySourceTranscriptProvider(
         client=textify_client,
-        coordination_repository=coordination_repository,
+        coordination_repository=coordination,
         settings=textify_settings or _textify_settings(),
         clock=clock,
+        cache=cache if cache is not None else DisabledCache(),
         sleeper=sleeper,
     )
     return ExtractionPipeline(
@@ -498,6 +522,230 @@ async def _stored_coordinations(
     finally:
         await engine.dispose()
     return [cast(_StoredCoordination, tuple(row)) for row in rows]
+
+
+_CACHE_NAMESPACE = "reelio:local"
+
+
+def _redis_url_or_skip() -> str:
+    """Return the configured Redis endpoint or skip an external-service scenario."""
+    redis_url = os.environ.get("REELIO_TEST_REDIS_URL")
+    if redis_url is None:
+        pytest.skip("REELIO_TEST_REDIS_URL is required for Redis integration tests")
+    return redis_url
+
+
+def _cache_secret() -> bytes:
+    """Return a unique cache-key secret for one isolated Redis scenario."""
+    return f"textify-cache-{uuid4()}".encode()
+
+
+def _redis_cache(redis_url: str, cache_secret: bytes) -> RedisCache:
+    """Create a Redis cache with the concrete client's narrower owned protocol."""
+    return RedisCache(
+        cast(
+            _RedisClient,
+            Redis.from_url(redis_url, decode_responses=False),
+        ),
+        _CACHE_NAMESPACE,
+        cache_secret,
+    )
+
+
+def _textify_result_cache_key(submitted_url: str, cache_secret: bytes) -> str:
+    """Derive the expected result key from the exact submitted URL identity."""
+    identity = json.dumps(
+        {"submitted_url": submitted_url},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
+    digest = hmac.new(cache_secret, identity, "sha256").hexdigest()
+    return f"{_CACHE_NAMESPACE}:source:textify-result:v1:{digest}"
+
+
+class _TextCacheCodec:
+    """Encode exact string fixtures for provider-purge integration coverage."""
+
+    version = "textify-integration-v1"
+
+    def encode(self, value: str) -> JsonObject:
+        """Encode one exact string value."""
+        return {"value": value}
+
+    def decode(self, payload: JsonObject) -> str:
+        """Decode one exact string value.
+
+        Raises:
+            CacheCodecError: If the fixture payload has an unexpected shape.
+        """
+        value = payload.get("value")
+        if set(payload) != {"value"} or not isinstance(value, str):
+            raise CacheCodecError("Expected exact text cache fixture payload.")
+        return value
+
+
+def _source_cache_entry(layer: str, identity: JsonObject) -> CacheEntry[str]:
+    """Create one ordinary source-layer descriptor for a real Redis test."""
+    return CacheEntry(
+        layer=layer,
+        key_version="v1",
+        identity=identity,
+        codec=_TextCacheCodec(),
+        ttl_seconds=lambda _: 60,
+        wait_timeout_seconds=1.0,
+    )
+
+
+class _FaultInjectingRedisScript:
+    """Raise one selected cache-script failure before reaching real Redis."""
+
+    def __init__(
+        self,
+        script: Callable[..., Awaitable[object]],
+        operation: str | None,
+        failed_operation: str,
+    ) -> None:
+        """Initialize a registered script with one optional injected failure."""
+        self._script = script
+        self._operation = operation
+        self._failed_operation = failed_operation
+
+    async def __call__(
+        self,
+        *,
+        keys: list[str],
+        args: list[bytes | str | int],
+    ) -> object:
+        """Run the script unless its operation is configured to fail."""
+        if self._operation == self._failed_operation:
+            raise RedisError("Injected Redis cache operation failure.")
+        return await self._script(keys=keys, args=args)
+
+
+class _FaultInjectingRedisClient:
+    """Expose the RedisCache client surface while failing one selected operation."""
+
+    def __init__(self, client: Redis, failed_operation: str) -> None:
+        """Initialize the real Redis client and operation to fail."""
+        self._client = client
+        self._failed_operation = failed_operation
+
+    async def set(
+        self,
+        name: str,
+        value: bytes | str,
+        *,
+        ex: int | None = None,
+        px: int | None = None,
+        nx: bool = False,
+    ) -> bool | None:
+        """Acquire a lease unless lease acquisition is configured to fail."""
+        if self._failed_operation == "lease":
+            raise RedisError("Injected Redis lease acquisition failure.")
+        return cast(bool | None, await self._client.set(name, value, ex=ex, px=px, nx=nx))
+
+    def register_script(self, script: str) -> _FaultInjectingRedisScript:
+        """Wrap one registered Redis script with its cache operation identity."""
+        operation: str | None = None
+        if "PTTL" in script:
+            operation = "read"
+        elif 'redis.call("SET", KEYS[1]' in script:
+            operation = "ownership-write"
+        registered_script = cast(
+            Callable[..., Awaitable[object]], self._client.register_script(script)
+        )
+        return _FaultInjectingRedisScript(
+            registered_script,
+            operation,
+            self._failed_operation,
+        )
+
+    async def aclose(self) -> None:
+        """Close the owned real Redis client."""
+        await self._client.aclose()
+
+
+class _RecordingCache:
+    """Record confirmed cache persistence while delegating every cache operation."""
+
+    def __init__(self, cache: AsyncCache, events: list[str]) -> None:
+        """Initialize a transparent cache recorder."""
+        self._cache = cache
+        self._events = events
+
+    async def get_or_load[ValueT](
+        self,
+        entry: CacheEntry[ValueT],
+        loader: Callable[[], Awaitable[ValueT]],
+    ) -> ValueT:
+        """Delegate ordinary cache retrieval."""
+        return cast(ValueT, await self._cache.get_or_load(entry, loader))
+
+    async def get_or_load_with_status[ValueT](
+        self,
+        entry: CacheEntry[ValueT],
+        loader: Callable[[], Awaitable[ValueT]],
+    ) -> CacheLoadResult[ValueT]:
+        """Delegate cache retrieval and record confirmed persistence."""
+        result = await self._cache.get_or_load_with_status(entry, loader)
+        if result.persisted:
+            self._events.append("cache_fill_confirmed")
+        return result
+
+    async def get_or_load_revalidating[ValueT](
+        self,
+        entry: RevalidatingCacheEntry[ValueT],
+        loader: Callable[
+            [RetainedCacheValue[ValueT] | None],
+            Awaitable[CacheWrite[ValueT] | CacheSkip[ValueT]],
+        ],
+    ) -> ValueT:
+        """Delegate revalidating cache retrieval."""
+        return cast(
+            ValueT,
+            await self._cache.get_or_load_revalidating(entry, loader),
+        )
+
+    async def aclose(self) -> None:
+        """Close the delegated cache when the recorder owns it."""
+        await self._cache.aclose()
+
+
+class _CleanupFailingCoordinationRepository:
+    """Fail successful coordination cleanup after observing cache persistence."""
+
+    def __init__(
+        self,
+        repository: TextifyCoordinationRepository,
+        events: list[str],
+    ) -> None:
+        """Initialize a transparent repository wrapper with ordering evidence."""
+        self._repository = repository
+        self._events = events
+
+    async def get_or_create(self, submitted_url: str) -> TextifyCoordination:
+        """Delegate coordination acquisition."""
+        return await self._repository.get_or_create(submitted_url)
+
+    async def attach_capability(
+        self,
+        coordination: TextifyCoordination,
+        capability_link: str,
+    ) -> TextifyCoordination:
+        """Delegate capability-link persistence."""
+        return await self._repository.attach_capability(coordination, capability_link)
+
+    async def delete(self, coordination: TextifyCoordination) -> bool:
+        """Assert fill order, then raise a recoverable cleanup failure."""
+        del coordination
+        assert self._events == ["cache_fill_confirmed"]
+        raise CoordinationError("Injected successful coordination cleanup failure.")
+
+    async def aclose(self) -> None:
+        """Close the delegated repository."""
+        await self._repository.aclose()
 
 
 async def _pipeline_factory(pipeline: ExtractionPipeline) -> ExtractionPipeline:
@@ -707,39 +955,65 @@ async def test_public_extraction_uses_textify_whisper_and_durable_coordination(
     assert stored_capability_link == capability_link
 
 
-async def test_repeated_public_extraction_resumes_existing_textify_job(
+@pytest.mark.redis_smoke
+async def test_repeated_public_extraction_uses_confirmed_textify_result_cache(
     migrated_coordination_database: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reuse durable coordination when a caller repeats an exact submitted URL."""
+    """Cache one exact URL result, then serve its repeat without Textify activity."""
     monkeypatch.setattr(app_settings, "environment", Environment.LOCAL)
+    redis_url = _redis_url_or_skip()
+    cache_secret = _cache_secret()
+    cache_key = _textify_result_cache_key(_SUBMITTED_URL, cache_secret)
+    cache = _redis_cache(redis_url, cache_secret)
+    observer = Redis.from_url(redis_url, decode_responses=False)
     server = _TextifyContractServer("faster_whisper")
 
     async def sleeper(seconds: float) -> None:
         assert seconds == 0
 
-    pipeline = await _create_pipeline(migrated_coordination_database, server, sleeper)
-    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+    try:
+        pipeline = await _create_pipeline(
+            migrated_coordination_database,
+            server,
+            sleeper,
+            textify_settings=_textify_settings(result_retention_seconds=120),
+            cache=cache,
+        )
+        application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
 
-    async with application.router.lifespan_context(application):
-        transport = httpx.ASGITransport(app=application)
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://reelio.test",
-        ) as client:
-            first_response = await client.post(
-                "/api/extractions",
-                json={"url": _SUBMITTED_URL},
-            )
-            second_response = await client.post(
-                "/api/extractions",
-                json={"url": _SUBMITTED_URL},
-            )
+        async with application.router.lifespan_context(application):
+            transport = httpx.ASGITransport(app=application)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://reelio.test",
+            ) as client:
+                first_response = await client.post(
+                    "/api/extractions",
+                    json={"url": _SUBMITTED_URL},
+                )
+                second_response = await client.post(
+                    "/api/extractions",
+                    json={"url": _SUBMITTED_URL},
+                )
 
-    assert first_response.status_code == 200
-    assert second_response.status_code == 200
-    assert len(server.idempotency_keys) == 1
-    assert server.job_count == 1
+        assert first_response.status_code == 200
+        assert second_response.status_code == 200
+        assert second_response.json() == first_response.json()
+        assert await observer.exists(cache_key) == 1
+        physical_ttl_milliseconds = await observer.pttl(cache_key)
+        assert 119_000 <= physical_ttl_milliseconds <= 120_000
+        assert server.request_paths == [
+            "/api/v1/transcription-jobs",
+            server.capability_links[0],
+        ]
+        assert len(server.idempotency_keys) == 1
+        assert server.job_count == 1
+        assert await _stored_coordinations(migrated_coordination_database) == []
+    finally:
+        await observer.unlink(cache_key)
+        await observer.aclose()
+        await cache.aclose()
 
 
 async def test_public_extraction_preserves_textify_youtube_captions(
@@ -1005,6 +1279,336 @@ async def test_distinct_exact_urls_receive_distinct_textify_coordination_identit
     assert server.job_count == 2
     assert len(set(server.idempotency_keys)) == 2
     assert server.cancellation_paths == []
+
+
+@pytest.mark.redis_smoke
+async def test_distinct_exact_urls_create_independent_textify_result_cache_entries(
+    migrated_coordination_database: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cache each exact submitted URL despite a shared resulting Source identity."""
+    monkeypatch.setattr(app_settings, "environment", Environment.LOCAL)
+    redis_url = _redis_url_or_skip()
+    cache_secret = _cache_secret()
+    shared_source_url = f"{_SUBMITTED_URL}&feature=shared"
+    first_cache_key = _textify_result_cache_key(_SUBMITTED_URL, cache_secret)
+    second_cache_key = _textify_result_cache_key(shared_source_url, cache_secret)
+    cache = _redis_cache(redis_url, cache_secret)
+    observer = Redis.from_url(redis_url, decode_responses=False)
+    server = _TextifyContractServer("faster_whisper")
+
+    async def sleeper(seconds: float) -> None:
+        assert seconds == 0
+
+    try:
+        pipeline = await _create_pipeline(
+            migrated_coordination_database,
+            server,
+            sleeper,
+            cache=cache,
+        )
+        application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+
+        async with application.router.lifespan_context(application):
+            transport = httpx.ASGITransport(app=application)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://reelio.test",
+            ) as client:
+                first_response = await client.post(
+                    "/api/extractions",
+                    json={"url": _SUBMITTED_URL},
+                )
+                second_response = await client.post(
+                    "/api/extractions",
+                    json={"url": shared_source_url},
+                )
+                first_repeat_response = await client.post(
+                    "/api/extractions",
+                    json={"url": _SUBMITTED_URL},
+                )
+                second_repeat_response = await client.post(
+                    "/api/extractions",
+                    json={"url": shared_source_url},
+                )
+
+        assert first_response.status_code == 200
+        assert second_response.status_code == 200
+        assert first_repeat_response.json() == first_response.json()
+        assert second_repeat_response.json() == second_response.json()
+        assert first_cache_key != second_cache_key
+        assert await observer.exists(first_cache_key, second_cache_key) == 2
+        assert server.job_count == 2
+        assert len(server.idempotency_keys) == 2
+        assert len(server.request_paths) == 4
+        assert await _stored_coordinations(migrated_coordination_database) == []
+    finally:
+        await observer.unlink(first_cache_key, second_cache_key)
+        await observer.aclose()
+        await cache.aclose()
+
+
+@pytest.mark.redis_smoke
+async def test_active_textify_coordination_has_no_result_cache_until_completion(
+    migrated_coordination_database: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep active PostgreSQL coordination separate from a not-yet-filled result cache."""
+    monkeypatch.setattr(app_settings, "environment", Environment.LOCAL)
+    redis_url = _redis_url_or_skip()
+    cache_secret = _cache_secret()
+    cache_key = _textify_result_cache_key(_SUBMITTED_URL, cache_secret)
+    cache = _redis_cache(redis_url, cache_secret)
+    observer = Redis.from_url(redis_url, decode_responses=False)
+    server = _TextifyContractServer(
+        "faster_whisper",
+        active_polls=1,
+        active_retry_after=1,
+    )
+    processing_wait_started = asyncio.Event()
+    release_processing_wait = asyncio.Event()
+    request_task: asyncio.Task[httpx.Response] | None = None
+
+    async def sleeper(seconds: float) -> None:
+        if seconds == 0:
+            return
+        assert seconds == 1
+        processing_wait_started.set()
+        await release_processing_wait.wait()
+
+    try:
+        pipeline = await _create_pipeline(
+            migrated_coordination_database,
+            server,
+            sleeper,
+            cache=cache,
+        )
+        application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+
+        async with application.router.lifespan_context(application):
+            transport = httpx.ASGITransport(app=application)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://reelio.test",
+            ) as client:
+                request_task = asyncio.create_task(
+                    client.post("/api/extractions", json={"url": _SUBMITTED_URL})
+                )
+                await asyncio.wait_for(processing_wait_started.wait(), timeout=1)
+                stored_coordinations = await _stored_coordinations(migrated_coordination_database)
+                assert len(stored_coordinations) == 1
+                assert stored_coordinations[0][2] == server.capability_links[0]
+                assert await observer.exists(cache_key) == 0
+
+                release_processing_wait.set()
+                response = await request_task
+
+        assert response.status_code == 200
+        assert await observer.exists(cache_key) == 1
+        assert await _stored_coordinations(migrated_coordination_database) == []
+    finally:
+        release_processing_wait.set()
+        if request_task is not None and not request_task.done():
+            await request_task
+        await observer.unlink(cache_key)
+        await observer.aclose()
+        await cache.aclose()
+
+
+@pytest.mark.redis_smoke
+@pytest.mark.parametrize("terminal_behavior", ["failed", "cancelled"])
+async def test_terminal_textify_outcomes_do_not_create_result_cache_entries(
+    migrated_coordination_database: str,
+    terminal_behavior: Literal["failed", "cancelled"],
+) -> None:
+    """Never cache failed or cancelled Textify outcomes."""
+    redis_url = _redis_url_or_skip()
+    cache_secret = _cache_secret()
+    cache_key = _textify_result_cache_key(_SUBMITTED_URL, cache_secret)
+    cache = _redis_cache(redis_url, cache_secret)
+    observer = Redis.from_url(redis_url, decode_responses=False)
+    server = _TextifyContractServer(
+        "faster_whisper",
+        terminal_behaviors=(terminal_behavior,),
+    )
+
+    async def sleeper(seconds: float) -> None:
+        assert seconds == 0
+
+    try:
+        pipeline = await _create_pipeline(
+            migrated_coordination_database,
+            server,
+            sleeper,
+            cache=cache,
+        )
+        response = await _request_public_extraction(pipeline)
+
+        assert response.status_code == 502
+        assert await observer.exists(cache_key) == 0
+        assert await _stored_coordinations(migrated_coordination_database) == []
+    finally:
+        await observer.unlink(cache_key)
+        await observer.aclose()
+        await cache.aclose()
+
+
+@pytest.mark.redis_smoke
+async def test_malformed_textify_response_does_not_create_result_cache_entry(
+    migrated_coordination_database: str,
+) -> None:
+    """Never cache an unparseable Textify lifecycle response."""
+    redis_url = _redis_url_or_skip()
+    cache_secret = _cache_secret()
+    cache_key = _textify_result_cache_key(_SUBMITTED_URL, cache_secret)
+    cache = _redis_cache(redis_url, cache_secret)
+    observer = Redis.from_url(redis_url, decode_responses=False)
+    server = _TextifyContractServer("faster_whisper")
+
+    async def sleeper(seconds: float) -> None:
+        assert seconds == 0
+
+    try:
+        pipeline = await _create_pipeline(
+            migrated_coordination_database,
+            server,
+            sleeper,
+            _MalformedPollingResponseTransport(server.application),
+            cache=cache,
+        )
+        response = await _request_public_extraction(pipeline)
+
+        assert response.status_code == 502
+        assert await observer.exists(cache_key) == 0
+        assert len(await _stored_coordinations(migrated_coordination_database)) == 1
+    finally:
+        await observer.unlink(cache_key)
+        await observer.aclose()
+        await cache.aclose()
+
+
+@pytest.mark.redis_smoke
+@pytest.mark.parametrize("failed_operation", ["read", "lease", "ownership-write"])
+async def test_redis_cache_failures_keep_coordination_for_a_healthy_resume(
+    migrated_coordination_database: str,
+    failed_operation: Literal["read", "lease", "ownership-write"],
+) -> None:
+    """Return success without persistence, then resume the same job with healthy Redis."""
+    redis_url = _redis_url_or_skip()
+    cache_secret = _cache_secret()
+    cache_key = _textify_result_cache_key(_SUBMITTED_URL, cache_secret)
+    failing_cache = RedisCache(
+        _FaultInjectingRedisClient(
+            Redis.from_url(redis_url, decode_responses=False),
+            failed_operation,
+        ),
+        _CACHE_NAMESPACE,
+        cache_secret,
+    )
+    healthy_cache = _redis_cache(redis_url, cache_secret)
+    observer = Redis.from_url(redis_url, decode_responses=False)
+    server = _TextifyContractServer("faster_whisper")
+
+    async def sleeper(seconds: float) -> None:
+        assert seconds == 0
+
+    try:
+        failed_persistence_pipeline = await _create_pipeline(
+            migrated_coordination_database,
+            server,
+            sleeper,
+            cache=failing_cache,
+        )
+        first_response = await _request_public_extraction(failed_persistence_pipeline)
+
+        assert first_response.status_code == 200
+        first_coordination = await _stored_coordinations(migrated_coordination_database)
+        assert len(first_coordination) == 1
+        assert first_coordination[0][2] == server.capability_links[0]
+        assert await observer.exists(cache_key) == 0
+
+        resumed_pipeline = await _create_pipeline(
+            migrated_coordination_database,
+            server,
+            sleeper,
+            cache=healthy_cache,
+        )
+        second_response = await _request_public_extraction(resumed_pipeline)
+
+        assert second_response.status_code == 200
+        assert second_response.json() == first_response.json()
+        assert server.job_count == 1
+        assert len(server.idempotency_keys) == 1
+        assert await observer.exists(cache_key) == 1
+        assert await _stored_coordinations(migrated_coordination_database) == []
+    finally:
+        await observer.unlink(cache_key)
+        await observer.aclose()
+        await failing_cache.aclose()
+        await healthy_cache.aclose()
+
+
+@pytest.mark.redis_smoke
+async def test_confirmed_cache_fill_precedes_recoverable_coordination_cleanup_failure(
+    migrated_coordination_database: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep a confirmed result when successful coordination cleanup later fails."""
+    monkeypatch.setattr(app_settings, "environment", Environment.LOCAL)
+    redis_url = _redis_url_or_skip()
+    cache_secret = _cache_secret()
+    cache_key = _textify_result_cache_key(_SUBMITTED_URL, cache_secret)
+    cache = _redis_cache(redis_url, cache_secret)
+    observer = Redis.from_url(redis_url, decode_responses=False)
+    server = _TextifyContractServer("faster_whisper")
+    events: list[str] = []
+
+    async def sleeper(seconds: float) -> None:
+        assert seconds == 0
+
+    try:
+        first_repository = await create_postgres_textify_coordination(
+            _coordination_settings(migrated_coordination_database)
+        )
+        failed_cleanup_pipeline = await _create_pipeline(
+            migrated_coordination_database,
+            server,
+            sleeper,
+            cache=_RecordingCache(cache, events),
+            coordination_repository=_CleanupFailingCoordinationRepository(
+                first_repository,
+                events,
+            ),
+        )
+        first_response = await _request_public_extraction(failed_cleanup_pipeline)
+
+        assert first_response.status_code == 200
+        assert events == ["cache_fill_confirmed"]
+        assert await observer.exists(cache_key) == 1
+        preserved_coordination = await _stored_coordinations(migrated_coordination_database)
+        assert len(preserved_coordination) == 1
+
+        resumed_pipeline = await _create_pipeline(
+            migrated_coordination_database,
+            server,
+            sleeper,
+            cache=cache,
+        )
+        second_response = await _request_public_extraction(resumed_pipeline)
+
+        assert second_response.status_code == 200
+        assert second_response.json() == first_response.json()
+        assert server.request_paths == [
+            "/api/v1/transcription-jobs",
+            server.capability_links[0],
+        ]
+        assert await _stored_coordinations(migrated_coordination_database) == (
+            preserved_coordination
+        )
+    finally:
+        await observer.unlink(cache_key)
+        await observer.aclose()
+        await cache.aclose()
 
 
 @pytest.mark.parametrize("terminal_behavior", ["failed", "cancelled"])
@@ -1909,3 +2513,77 @@ async def test_public_extraction_excludes_private_textify_data_from_errors_and_l
         assert private_value not in response.text
         assert all(private_value not in record.getMessage() for record in adapter_records)
         assert all(private_value not in str(record.__dict__) for record in adapter_records)
+
+
+@pytest.mark.redis_smoke
+async def test_source_purge_removes_only_active_cache_layers_and_not_coordination(
+    migrated_coordination_database: str,
+) -> None:
+    """Purge Textify and Mention values while preserving legacy data and PostgreSQL."""
+    redis_url = _redis_url_or_skip()
+    cache_secret = _cache_secret()
+    cache = _redis_cache(redis_url, cache_secret)
+    observer = Redis.from_url(redis_url, decode_responses=False)
+    entries_by_layer = {
+        layer: _source_cache_entry(layer, {"entry": layer})
+        for layer in (
+            "source:textify-result",
+            "source:interpretation",
+            "source:alias",
+            "source:metadata",
+            "source:transcript",
+        )
+    }
+    cache_keys = {layer: cache._cache_key(entry) for layer, entry in entries_by_layer.items()}
+    repository = await create_postgres_textify_coordination(
+        _coordination_settings(migrated_coordination_database)
+    )
+
+    try:
+        for layer, entry in entries_by_layer.items():
+
+            async def loader(value: str = layer) -> str:
+                return value
+
+            assert await cache.get_or_load(entry, loader) == layer
+
+        coordination = await repository.get_or_create(_SUBMITTED_URL)
+        before_purge = await _stored_coordinations(migrated_coordination_database)
+        assert len(before_purge) == 1
+        assert before_purge[0][1] == coordination.idempotency_key
+
+        purger = RedisProviderPurger(
+            Redis.from_url(redis_url, decode_responses=False),
+            _CACHE_NAMESPACE,
+            Environment.LOCAL,
+        )
+        try:
+            purge_result = await purger.purge(PurgeProvider.SOURCE)
+        finally:
+            await purger.aclose()
+
+        assert tuple(item.namespace_category for item in purge_result.namespaces) == (
+            PurgeNamespaceCategory.TEXTIFY_RESULT,
+            PurgeNamespaceCategory.MENTION_INTERPRETATION,
+        )
+        assert (
+            await observer.exists(
+                cache_keys["source:textify-result"],
+                cache_keys["source:interpretation"],
+            )
+            == 0
+        )
+        assert (
+            await observer.exists(
+                cache_keys["source:alias"],
+                cache_keys["source:metadata"],
+                cache_keys["source:transcript"],
+            )
+            == 3
+        )
+        assert await _stored_coordinations(migrated_coordination_database) == before_purge
+    finally:
+        await observer.unlink(*cache_keys.values())
+        await repository.aclose()
+        await observer.aclose()
+        await cache.aclose()

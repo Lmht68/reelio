@@ -9,6 +9,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from reelio.cache import DisabledCache
 from reelio.extraction.coordination import TextifyCoordination
 from reelio.extraction.exceptions import TranscriptionError
 from reelio.extraction.services.textify import (
@@ -169,6 +170,7 @@ async def test_provider_submits_commits_and_polls_the_stored_capability() -> Non
         client=client,
         coordination_repository=repository,
         settings=_textify_settings(),
+        cache=DisabledCache(),
         sleeper=sleeper,
     )
 
@@ -225,6 +227,7 @@ async def test_provider_rejects_admission_that_does_not_repeat_its_capability() 
         client=client,
         coordination_repository=repository,
         settings=_textify_settings(),
+        cache=DisabledCache(),
         sleeper=lambda seconds: pytest.fail(f"unexpected poll wait: {seconds}"),
     )
 
