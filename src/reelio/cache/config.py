@@ -102,9 +102,11 @@ def _validate_redis_url(redis_url: str, environment: Environment) -> None:
 
     hostname = endpoint.hostname.casefold()
     if endpoint.scheme == "redis":
-        is_local_loopback = hostname in {"localhost", "127.0.0.1", "::1"}
-        if environment is not Environment.LOCAL or not is_local_loopback:
-            raise ValueError("redis URLs are allowed only for local loopback endpoints")
+        is_local_endpoint = hostname in {"localhost", "127.0.0.1", "::1", "redis"}
+        if environment is not Environment.LOCAL or not is_local_endpoint:
+            raise ValueError(
+                "redis URLs are allowed only for local loopback or Compose redis endpoints"
+            )
         return
 
     _validate_tls_query_overrides(parse_qsl(endpoint.query, keep_blank_values=True))

@@ -76,6 +76,9 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --dev
 
+      - name: Check Docker Compose CLI
+        run: docker compose version
+
       - name: Run complete pytest suite
         run: uv run --locked pytest
       - name: Run Redis cache smoke scenarios
@@ -94,5 +97,35 @@ jobs:
       - name: Check strict mypy
         run: uv run --locked mypy src tests
 
-      - name: Build production Docker image
-        run: docker build --pull --tag reelio:ci .
+      - name: Build and inspect production Docker image
+        run: |
+          docker build --pull --tag reelio:ci .
+          docker image inspect reelio:ci | python -c '
+          import json
+          import sys
+
+          config = json.load(sys.stdin)[0]["Config"]
+          assert config["User"] == "reelio"
+          assert config["Cmd"] == [
+              "uvicorn",
+              "reelio.main:app",
+              "--host",
+              "0.0.0.0",
+              "--port",
+              "8181",
+              "--workers",
+              "1",
+          ]
+          assert config["Healthcheck"]["Test"] == [
+              "CMD-SHELL",
+              "python -c \"import urllib.request; urllib.request.urlopen("
+              + chr(39)
+              + "http://127.0.0.1:8181/health"
+              + chr(39)
+              + ", timeout=4)\"",
+          ]
+          '
+          docker run --rm reelio:ci sh -c \
+            'test "$(id -u)" = 10001 && test -r /app/alembic.ini && \
+            test -r /app/migrations/env.py && \
+            test -r /app/migrations/versions/0002_index_textify_coordination_expiration.py'

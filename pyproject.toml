@@ -39,6 +39,8 @@ dev = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
+    "compose: validates the rendered local Docker Compose deployment contract",
+    "live: requires an operator-configured Reelio and Textify deployment",
     "redis_smoke: requires REELIO_TEST_REDIS_URL and a Redis-compatible server",
 ]
 

@@ -29,6 +29,8 @@ RUN groupadd --system --gid 10001 reelio \
 WORKDIR /app
 
 COPY --from=builder --chown=reelio:reelio /app/.venv /app/.venv
+COPY --chown=reelio:reelio alembic.ini ./
+COPY --chown=reelio:reelio migrations ./migrations
 
 USER reelio
 

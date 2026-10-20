@@ -391,17 +391,25 @@ def test_enabled_cache_rejects_invalid_redis_endpoint_syntax(redis_url: str) -> 
         )
 
 
-def test_enabled_cache_allows_local_loopback_plaintext_redis() -> None:
-    """Permit explicit local development cache over a loopback plaintext endpoint."""
-    settings = _without_dotenv(
+def test_enabled_cache_allows_local_plaintext_redis_endpoints() -> None:
+    """Permit loopback and Compose service plaintext endpoints in local development."""
+    loopback_settings = _without_dotenv(
         CacheConfig,
         enabled=True,
         environment=Environment.LOCAL,
         redis_url="redis://:password@[::1]:6379/0",
         key_secret="cache-key",
     )
+    compose_settings = _without_dotenv(
+        CacheConfig,
+        enabled=True,
+        environment=Environment.LOCAL,
+        redis_url="redis://redis:6379/0",
+        key_secret="cache-key",
+    )
 
-    assert settings.namespace == "reelio:local"
+    assert loopback_settings.namespace == "reelio:local"
+    assert compose_settings.namespace == "reelio:local"
 
 
 @pytest.mark.parametrize(

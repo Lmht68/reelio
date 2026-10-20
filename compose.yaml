@@ -1,0 +1,129 @@
+name: reelio
+
+x-reelio-image: &reelio-image
+  build:
+    context: .
+  image: "reelio:${REELIO_IMAGE_TAG:-local}"
+
+x-coordination-environment: &coordination-environment
+  REELIO_COORDINATION_DATABASE_URL: "postgresql+asyncpg://${REELIO_POSTGRES_USER:?REELIO_POSTGRES_USER must be set}:${REELIO_POSTGRES_PASSWORD:?REELIO_POSTGRES_PASSWORD must be set}@postgres:5432/${REELIO_POSTGRES_DB:?REELIO_POSTGRES_DB must be set}"
+  REELIO_COORDINATION_HMAC_SECRET: "${REELIO_COORDINATION_HMAC_SECRET:?REELIO_COORDINATION_HMAC_SECRET must be set}"
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${REELIO_POSTGRES_DB:?REELIO_POSTGRES_DB must be set}"
+      POSTGRES_USER: "${REELIO_POSTGRES_USER:?REELIO_POSTGRES_USER must be set}"
+      POSTGRES_PASSWORD: "${REELIO_POSTGRES_PASSWORD:?REELIO_POSTGRES_PASSWORD must be set}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7.4.11-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--maxmemory",
+        "512mb",
+        "--maxmemory-policy",
+        "allkeys-lfu",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+      ]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  migrate:
+    <<: *reelio-image
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment: *coordination-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *reelio-image
+    restart: unless-stopped
+    environment:
+      <<: *coordination-environment
+      REELIO_ENVIRONMENT: "local"
+      REELIO_LOG_LEVEL: "${REELIO_LOG_LEVEL:-INFO}"
+      REELIO_CACHE_ENABLED: "true"
+      REELIO_CACHE_REDIS_URL: "redis://redis:6379/0"
+      REELIO_CACHE_KEY_SECRET: "${REELIO_CACHE_KEY_SECRET:?REELIO_CACHE_KEY_SECRET must be set}"
+      REELIO_COORDINATION_RETENTION_SECONDS: "${REELIO_COORDINATION_RETENTION_SECONDS:-86400}"
+      REELIO_TEXTIFY_ORIGIN: "${REELIO_TEXTIFY_ORIGIN:-http://textify:8182}"
+      REELIO_TEXTIFY_REQUEST_TIMEOUT_SECONDS: "${REELIO_TEXTIFY_REQUEST_TIMEOUT_SECONDS:-5.0}"
+      REELIO_TEXTIFY_ADMISSION_CAPACITY_RETRY_BUDGET_SECONDS: "${REELIO_TEXTIFY_ADMISSION_CAPACITY_RETRY_BUDGET_SECONDS:-10.0}"
+      REELIO_TEXTIFY_TRANSPORT_RETRY_BUDGET_SECONDS: "${REELIO_TEXTIFY_TRANSPORT_RETRY_BUDGET_SECONDS:-30.0}"
+      REELIO_TEXTIFY_RESULT_RETENTION_SECONDS: "${REELIO_TEXTIFY_RESULT_RETENTION_SECONDS:-2592000}"
+      REELIO_LLM_PROVIDER: "${REELIO_LLM_PROVIDER:?REELIO_LLM_PROVIDER must be set}"
+      REELIO_MAX_SOURCE_TITLE_CHARS: "${REELIO_MAX_SOURCE_TITLE_CHARS:-500}"
+      REELIO_MAX_DESCRIPTION_CHARS: "${REELIO_MAX_DESCRIPTION_CHARS:-2000}"
+      REELIO_MAX_TRANSCRIPT_LANGUAGE_CHARS: "${REELIO_MAX_TRANSCRIPT_LANGUAGE_CHARS:-64}"
+      REELIO_MAX_TRANSCRIPT_CHARS: "${REELIO_MAX_TRANSCRIPT_CHARS:-100000}"
+      REELIO_OPENAI_API_KEY: "${REELIO_OPENAI_API_KEY:-}"
+      REELIO_OPENAI_MODEL: "${REELIO_OPENAI_MODEL:-gpt-5-nano}"
+      REELIO_OPENAI_REASONING_EFFORT: "${REELIO_OPENAI_REASONING_EFFORT:-low}"
+      REELIO_OPENAI_REQUEST_TIMEOUT_SECONDS: "${REELIO_OPENAI_REQUEST_TIMEOUT_SECONDS:-20}"
+      REELIO_OPENAI_MAX_OUTPUT_TOKENS: "${REELIO_OPENAI_MAX_OUTPUT_TOKENS:-8192}"
+      REELIO_OPENAI_MAX_RETRIES: "${REELIO_OPENAI_MAX_RETRIES:-2}"
+      REELIO_DEEPSEEK_API_KEY: "${REELIO_DEEPSEEK_API_KEY:-}"
+      REELIO_DEEPSEEK_BASE_URL: "${REELIO_DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
+      REELIO_DEEPSEEK_MODEL: "${REELIO_DEEPSEEK_MODEL:-deepseek-flash}"
+      REELIO_DEEPSEEK_REQUEST_TIMEOUT_SECONDS: "${REELIO_DEEPSEEK_REQUEST_TIMEOUT_SECONDS:-20}"
+      REELIO_DEEPSEEK_TEMPERATURE: "${REELIO_DEEPSEEK_TEMPERATURE:-0.0}"
+      REELIO_DEEPSEEK_MAX_OUTPUT_TOKENS: "${REELIO_DEEPSEEK_MAX_OUTPUT_TOKENS:-8192}"
+      REELIO_DEEPSEEK_MAX_RETRIES: "${REELIO_DEEPSEEK_MAX_RETRIES:-2}"
+      REELIO_TMDB_API_KEY: "${REELIO_TMDB_API_KEY:?REELIO_TMDB_API_KEY must be set}"
+      REELIO_TMDB_BASE_URL: "${REELIO_TMDB_BASE_URL:-https://api.themoviedb.org/3}"
+      REELIO_TMDB_IMAGE_BASE_URL: "${REELIO_TMDB_IMAGE_BASE_URL:-https://image.tmdb.org/t/p/w500}"
+      REELIO_TMDB_REQUEST_TIMEOUT_SECONDS: "${REELIO_TMDB_REQUEST_TIMEOUT_SECONDS:-10}"
+      REELIO_SPOTIFY_CLIENT_ID: "${REELIO_SPOTIFY_CLIENT_ID:?REELIO_SPOTIFY_CLIENT_ID must be set}"
+      REELIO_SPOTIFY_CLIENT_SECRET: "${REELIO_SPOTIFY_CLIENT_SECRET:?REELIO_SPOTIFY_CLIENT_SECRET must be set}"
+      REELIO_SPOTIFY_DEFAULT_MARKET: "${REELIO_SPOTIFY_DEFAULT_MARKET:-US}"
+      REELIO_SPOTIFY_BASE_URL: "${REELIO_SPOTIFY_BASE_URL:-https://api.spotify.com/v1}"
+      REELIO_SPOTIFY_TOKEN_URL: "${REELIO_SPOTIFY_TOKEN_URL:-https://accounts.spotify.com/api/token}"
+      REELIO_SPOTIFY_REQUEST_TIMEOUT_SECONDS: "${REELIO_SPOTIFY_REQUEST_TIMEOUT_SECONDS:-10}"
+      REELIO_SPOTIFY_TOKEN_EXPIRY_SKEW_SECONDS: "${REELIO_SPOTIFY_TOKEN_EXPIRY_SKEW_SECONDS:-30}"
+      REELIO_OPEN_LIBRARY_CONTACT_EMAIL: "${REELIO_OPEN_LIBRARY_CONTACT_EMAIL:?REELIO_OPEN_LIBRARY_CONTACT_EMAIL must be set}"
+      REELIO_OPEN_LIBRARY_BASE_URL: "${REELIO_OPEN_LIBRARY_BASE_URL:-https://openlibrary.org}"
+      REELIO_OPEN_LIBRARY_REQUEST_TIMEOUT_SECONDS: "${REELIO_OPEN_LIBRARY_REQUEST_TIMEOUT_SECONDS:-10}"
+      REELIO_OPEN_LIBRARY_REQUESTS_PER_SECOND: "${REELIO_OPEN_LIBRARY_REQUESTS_PER_SECOND:-3}"
+    ports:
+      - "127.0.0.1:${REELIO_API_HOST_PORT:-8181}:8181"
+    networks:
+      default:
+      reelio-textify:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+networks:
+  reelio-textify:
+    external: true
+    name: reelio-textify
+
+volumes:
+  postgres-data:
+    name: reelio-postgres-data
