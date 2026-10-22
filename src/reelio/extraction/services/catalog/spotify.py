@@ -49,9 +49,10 @@ logger = logging.getLogger(__name__)
 _CATALOG_ERROR_MESSAGE = "Spotify catalog request failed."
 _CATALOG_TIMEOUT_MESSAGE = "Spotify catalog request timed out."
 _SEARCH_LIMIT = 3
-_EMPTY_SEARCH_FRESHNESS_CAP_SECONDS = 900
+_EMPTY_SEARCH_FRESHNESS_SECONDS = 900
+_POSITIVE_SEARCH_FRESHNESS_SECONDS = 21_600
 _SEARCH_PHYSICAL_RETENTION_SECONDS = 21_600
-_SEARCH_ADAPTER_CONTRACT_VERSION = "spotify-search-v1"
+_SEARCH_ADAPTER_CONTRACT_VERSION = "spotify-search-v2"
 _STAGE = "spotify_catalog"
 _NON_BLANK_TEXT = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 _RELEASE_YEAR_PATTERN = re.compile(r"^[0-9]{4}$")
@@ -448,7 +449,7 @@ def _decode_track_candidate(track: _CachedTrackCandidate) -> TrackCandidate:
 
 @dataclass(frozen=True, slots=True)
 class _SearchResponseCachePolicy:
-    """Contain parsed provider cache metadata without inventing freshness."""
+    """Contain parsed cache eligibility and a Reelio-owned freshness deadline."""
 
     state: Literal["omitted", "usable", "unusable"]
     freshness_lifetime_seconds: int | None
@@ -830,11 +831,9 @@ def _cacheable_search_result[CandidateT](
     CacheWrite[_SpotifySearchCacheValue[CandidateT]]
     | CacheSkip[_SpotifySearchCacheValue[CandidateT]]
 ):
-    """Build serving and physical durations from one usable provider lifetime."""
+    """Build Reelio-owned serving and physical durations for one eligible result."""
     serving_freshness_cap = (
-        _EMPTY_SEARCH_FRESHNESS_CAP_SECONDS
-        if not candidates
-        else _SEARCH_PHYSICAL_RETENTION_SECONDS
+        _EMPTY_SEARCH_FRESHNESS_SECONDS if not candidates else _POSITIVE_SEARCH_FRESHNESS_SECONDS
     )
     serving_freshness_seconds = min(freshness_lifetime_seconds, serving_freshness_cap)
     if serving_freshness_seconds == 0 and etag is None:
@@ -854,7 +853,7 @@ def _cacheable_search_result[CandidateT](
 
 
 def _search_response_cache_policy(response: httpx.Response) -> _SearchResponseCachePolicy:
-    """Parse explicit Spotify Cache-Control and Age fields into a storage decision."""
+    """Validate Spotify cache eligibility while selecting local freshness."""
     age_seconds = _response_age_seconds(response)
     if age_seconds is None:
         return _SearchResponseCachePolicy("unusable", None, 0)
@@ -883,7 +882,7 @@ def _search_response_cache_policy(response: httpx.Response) -> _SearchResponseCa
         return _SearchResponseCachePolicy("unusable", None, age_seconds)
     return _SearchResponseCachePolicy(
         "usable",
-        max(0, freshness_lifetime_seconds - age_seconds),
+        _POSITIVE_SEARCH_FRESHNESS_SECONDS,
         age_seconds,
     )
 

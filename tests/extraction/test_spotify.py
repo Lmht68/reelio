@@ -164,6 +164,39 @@ async def test_catalog_reuses_fresh_normalized_track_candidates_without_provider
     await cache.aclose()
 
 
+async def test_catalog_uses_local_freshness_when_provider_max_age_is_zero() -> None:
+    """Keep positive Search results fresh for six hours despite Spotify's zero lifetime."""
+    clock = ManualClock()
+    cache, _ = _shared_cache(clock)
+    search_request_count = 0
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal search_request_count
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token", "expires_in": 3600},
+            )
+        search_request_count += 1
+        return httpx.Response(
+            200,
+            headers={"Cache-Control": "public, max-age=0"},
+            json={"tracks": {"items": [_track_payload("local-freshness-track")]}},
+        )
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
+
+    await catalog.search_tracks("Kiki", _MARKET)
+    clock.advance(21_599.999)
+    await catalog.search_tracks("Kiki", _MARKET)
+    clock.advance(0.002)
+    await catalog.search_tracks("Kiki", _MARKET)
+
+    assert search_request_count == 2
+    await catalog.aclose()
+    await cache.aclose()
+
+
 async def test_catalog_isolates_exact_search_identity_and_stores_only_normalized_values() -> None:
     """Separate query, type, and market while excluding Spotify-only response fields."""
     clock = ManualClock()
@@ -248,7 +281,7 @@ async def test_catalog_conditionally_revalidates_retained_etag_and_renews_on_304
         if len(requests) == 1:
             return httpx.Response(
                 200,
-                headers={"Cache-Control": "max-age=10", "ETag": '"track-v1"'},
+                headers={"Cache-Control": "no-cache", "ETag": '"track-v1"'},
                 json={"tracks": {"items": [_track_payload("first-track")]}},
             )
         assert request.headers["if-none-match"] == '"track-v1"'
@@ -260,7 +293,6 @@ async def test_catalog_conditionally_revalidates_retained_etag_and_renews_on_304
     catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
 
     first_candidates = await catalog.search_tracks("Kiki", _MARKET)
-    clock.advance(10.001)
     revalidated_candidates = await catalog.search_tracks("Kiki", _MARKET)
     fresh_candidates = await catalog.search_tracks("Kiki", _MARKET)
 
@@ -287,7 +319,7 @@ async def test_catalog_replaces_retained_etag_value_after_conditional_success() 
         if len(requests) == 1:
             return httpx.Response(
                 200,
-                headers={"Cache-Control": "max-age=10", "ETag": '"track-v1"'},
+                headers={"Cache-Control": "no-cache", "ETag": '"track-v1"'},
                 json={"tracks": {"items": [_track_payload("first-track")]}},
             )
         assert request.headers["if-none-match"] == '"track-v1"'
@@ -300,7 +332,6 @@ async def test_catalog_replaces_retained_etag_value_after_conditional_success() 
     catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
 
     assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "first-track"
-    clock.advance(10.001)
     assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "replacement-track"
     assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "replacement-track"
     assert len(requests) == 2
@@ -330,7 +361,7 @@ async def test_catalog_unconditionally_reloads_when_no_etag_reaches_physical_exp
     catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
 
     assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "track-1"
-    clock.advance(10.001)
+    clock.advance(21_600.001)
     assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "track-2"
     assert "if-none-match" not in requests[1].headers
     await catalog.aclose()
@@ -343,7 +374,7 @@ async def test_catalog_unconditionally_reloads_when_no_etag_reaches_physical_exp
         ([("Cache-Control", "max-age=60")], 1),
         ([("Cache-Control", "s-maxage=60, max-age=1")], 1),
         ([("Cache-Control", "max-age=60"), ("Age", "10")], 1),
-        ([("Cache-Control", "max-age=60"), ("Age", "60")], 2),
+        ([("Cache-Control", "max-age=60"), ("Age", "60")], 1),
         ([], 2),
         ([("Cache-Control", "no-store, max-age=60")], 2),
         ([("Cache-Control", "private, max-age=60")], 2),
@@ -353,11 +384,11 @@ async def test_catalog_unconditionally_reloads_when_no_etag_reaches_physical_exp
         ([("Cache-Control", "max-age=60"), ("Age", "invalid")], 2),
     ],
 )
-async def test_catalog_honors_explicit_provider_freshness_policy(
+async def test_catalog_uses_local_freshness_for_eligible_provider_responses(
     headers: list[tuple[str, str]],
     search_request_count: int,
 ) -> None:
-    """Cache only explicit, valid provider freshness under Cache-Control and Age rules."""
+    """Use local freshness only for responses with valid public cache metadata."""
     clock = ManualClock()
     cache, _ = _shared_cache(clock)
     requests: list[httpx.Request] = []
@@ -444,7 +475,7 @@ async def test_catalog_rejects_invalid_retained_304_metadata(
         if search_request_count == 1:
             return httpx.Response(
                 200,
-                headers={"Cache-Control": "max-age=10", "ETag": '"track-v1"'},
+                headers={"Cache-Control": "no-cache", "ETag": '"track-v1"'},
                 json={"tracks": {"items": [_track_payload("first-track")]}},
             )
         return httpx.Response(304, headers=headers)
@@ -452,7 +483,6 @@ async def test_catalog_rejects_invalid_retained_304_metadata(
     catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
 
     await catalog.search_tracks("Kiki", _MARKET)
-    clock.advance(10.001)
     with pytest.raises(CatalogProviderError):
         await catalog.search_tracks("Kiki", _MARKET)
 
@@ -484,7 +514,7 @@ async def test_catalog_discards_retained_value_after_uncacheable_304(
         if len(requests) == 1:
             return httpx.Response(
                 200,
-                headers={"Cache-Control": "max-age=10", "ETag": '"track-v1"'},
+                headers={"Cache-Control": "no-cache", "ETag": '"track-v1"'},
                 json={"tracks": {"items": [_track_payload("first-track")]}},
             )
         if len(requests) == 2:
@@ -500,7 +530,6 @@ async def test_catalog_discards_retained_value_after_uncacheable_304(
     catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), cache)
 
     assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "first-track"
-    clock.advance(10.001)
     assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "first-track"
     assert (await catalog.search_tracks("Kiki", _MARKET))[0].spotify_track_id == "fresh-track"
 
