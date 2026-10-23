@@ -20,6 +20,8 @@ _TABLE_NAME = "textify_coordination"
 
 def upgrade() -> None:
     """Create the expiration cleanup index."""
+    # Cleanup scans oldest expirations first. Appending the primary key makes equal
+    # expiration times deterministic for cursor-based batches.
     op.create_index(
         _INDEX_NAME,
         _TABLE_NAME,

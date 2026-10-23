@@ -199,6 +199,7 @@ class RedisProviderPurger:
         started_at = self._monotonic()
         deleted_count = 0
         cursor = 0
+        # Match every versioned data key and derived lease key in this provider layer.
         match_pattern = f"{self._namespace}:{_layer_for(provider, namespace_category)}:*"
         try:
             while True:

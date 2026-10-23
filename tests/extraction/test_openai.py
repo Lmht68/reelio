@@ -52,7 +52,15 @@ class _FakeOpenAIClient:
 
 def _settings(**values: object) -> OpenAIConfig:
     settings_type = cast(Callable[..., OpenAIConfig], OpenAIConfig)
-    return settings_type(_env_file=None, api_key="test-key", **values)
+    defaults: dict[str, object] = {
+        "api_key": "test-key",
+        "model": "gpt-5-nano",
+        "reasoning_effort": "low",
+        "request_timeout_seconds": 60.0,
+        "max_output_tokens": 8_192,
+        "max_retries": 2,
+    }
+    return settings_type(_env_file=None, **(defaults | values))
 
 
 def test_openai_provider_constructor_uses_configured_client_options(

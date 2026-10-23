@@ -321,6 +321,8 @@ class RedisCache:
             _emit_cache_event(entry.layer, "fail_open", "cache_closed", warning=True)
             return await self._load_without_cache(loader)
 
+        # Read before lease acquisition so healthy hits avoid coordination.
+        # Only a lease owner receives a retained value for revalidation.
         cache_read = await self._read_and_heal(entry, key, operation="read")
         if isinstance(cache_read, (_CommandUnavailable, _UnownedLoad)):
             return await self._load_without_cache(loader)
@@ -397,6 +399,7 @@ class RedisCache:
                 return await self._load_as_owner(entry, key, lease_key, ownership, loader)
 
         _emit_cache_event(entry.layer, "wait", "deadline")
+        # Close the timeout race: the prior owner may have filled or released the lease.
         ownership = await self._try_acquire_lease(entry, lease_key)
         if isinstance(ownership, _CommandUnavailable):
             return await self._load_without_cache(loader)
@@ -424,6 +427,7 @@ class RedisCache:
         if renewal_task is None:
             return await self._load_without_cache(loader)
 
+        # The previous owner may have filled the value after lease acquisition.
         ownership_read = await self._read_and_heal(entry, key, operation="read")
         if isinstance(ownership_read, (_CommandUnavailable, _UnownedLoad)):
             await self._stop_renewal(renewal_task)
@@ -699,6 +703,7 @@ class RedisCache:
             if bool(cleanup_result):
                 return _CacheRead("absent")
 
+            # A failed conditional delete may mean another writer replaced the value.
             refreshed_cache_read = await self._read_cached_value(entry, key, operation=operation)
             if isinstance(refreshed_cache_read, _CommandUnavailable):
                 return _COMMAND_UNAVAILABLE

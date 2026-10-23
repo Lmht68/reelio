@@ -187,6 +187,7 @@ def test_openai_configuration_ignores_inactive_deepseek_settings(
 ) -> None:
     """Validate OpenAI without reading an invalid inactive DeepSeek configuration."""
     monkeypatch.setenv("REELIO_DEEPSEEK_REQUEST_TIMEOUT_SECONDS", "not-a-number")
+    monkeypatch.delenv("REELIO_OPENAI_MODEL", raising=False)
 
     settings = _without_dotenv(OpenAIConfig, api_key="openai-key")
 
@@ -450,8 +451,11 @@ def test_enabled_cache_accepts_secure_managed_endpoint_options() -> None:
     assert settings.namespace == "reelio:production"
 
 
-def test_coordination_requires_nonblank_database_url_and_hmac_secret() -> None:
+def test_coordination_requires_nonblank_database_url_and_hmac_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Reject missing or blank coordination credentials at startup."""
+    monkeypatch.delenv("REELIO_COORDINATION_DATABASE_URL", raising=False)
     with pytest.raises(ValidationError):
         _without_dotenv(CoordinationConfig, hmac_secret="coordination-secret")
 

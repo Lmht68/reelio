@@ -747,10 +747,12 @@ class TMDBScreenWorkResolver:
             )
             for tv_series_mention in screen_work_mentions.tv_series
         ]
+        # Resolve from strict to permissive stages so exact year/title matches win.
         await asyncio.gather(
             *(self._resolve_movie_strict(context) for context in movie_contexts),
             *(self._resolve_tv_series_strict(context) for context in tv_series_contexts),
         )
+        # Fuzzy matching reuses strict-stage candidates before new searches.
         await asyncio.gather(
             *(
                 self._resolve_movie_direct_fuzzy(context)
@@ -763,6 +765,7 @@ class TMDBScreenWorkResolver:
                 if context.match is None
             ),
         )
+        # Fragment search is a last resort after direct candidates fail.
         await asyncio.gather(
             *(
                 self._resolve_movie_fragment_search(context)
@@ -979,6 +982,7 @@ class TMDBScreenWorkResolver:
             raise EnrichmentError(_ENRICHMENT_ERROR_MESSAGE) from exc
 
     async def _resolve_movie_strict(self, context: _MovieResolutionContext) -> None:
+        # Nearby years tolerate release-date drift without widening acceptance.
         for search_year in (
             context.mention.year,
             context.mention.year + 1,
@@ -1005,6 +1009,7 @@ class TMDBScreenWorkResolver:
                 normalize_screen_work_title(title) == context.normalized_title
                 for title in (candidate.title, candidate.original_title)
             )
+            # Fetch alternatives only if neither primary title proves the match.
             movie = await self._get_movie_details(
                 candidate.tmdb_id,
                 include_alternative_titles=not primary_titles_matched,

@@ -642,6 +642,7 @@ class SpotifyCatalog:
     ):
         """Load or conditionally revalidate one normalized Spotify Search operation."""
         deadline = self._clock() + self._request_timeout_seconds
+        # One deadline bounds token acquisition, rate-limit sleep, and search.
         try:
             async with asyncio.timeout(self._request_timeout_seconds):
                 access_token = await self._get_access_token()
@@ -650,6 +651,7 @@ class SpotifyCatalog:
                     access_token,
                     deadline,
                 )
+                # A 304 applies only to the representation identified by its ETag.
                 if response.status_code == httpx.codes.NOT_MODIFIED:
                     return self._revalidated_cache_result(search_request, response)
                 response.raise_for_status()
@@ -695,6 +697,7 @@ class SpotifyCatalog:
                 cast(int, policy.freshness_lifetime_seconds),
             )
 
+        # Age the retained lifetime when no new freshness directive is present.
         previous_lifetime = retained_value.value.freshness_lifetime_seconds
         if previous_lifetime is None:
             raise ValueError("Retained Spotify value omitted its provider lifetime")
@@ -705,6 +708,7 @@ class SpotifyCatalog:
         )
 
     async def _get_access_token(self) -> str:
+        # Serialize refreshes to prevent credential request fan-out.
         async with self._token_lock:
             if self._access_token is not None and self._clock() < self._token_refresh_at:
                 return self._access_token
@@ -740,6 +744,7 @@ class SpotifyCatalog:
         }
         headers = {"Authorization": f"Bearer {access_token}"}
         retained_value = search_request.retained_value
+        # Revalidate only the retained representation that supplied this ETag.
         if retained_value is not None and retained_value.value.etag is not None:
             headers["If-None-Match"] = retained_value.value.etag
         response = await self._client.get(
@@ -750,6 +755,7 @@ class SpotifyCatalog:
         if response.status_code != httpx.codes.TOO_MANY_REQUESTS:
             return response
 
+        # Preserve conditional headers for the one permitted rate-limit retry.
         retry_after = _retry_after_seconds(response)
         if retry_after > deadline - self._clock():
             self._raise_provider_error("rate_limit_exceeds_timeout")

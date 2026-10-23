@@ -507,6 +507,7 @@ class TextifySourceTranscriptProvider:
             result, successful_coordination = await self._acquire_uncached(submitted_url)
             return result
 
+        # Cache persistence permits safe coordination cleanup.
         cache_result = await self._cache.get_or_load_with_status(
             _textify_result_entry(
                 submitted_url,
@@ -536,6 +537,7 @@ class TextifySourceTranscriptProvider:
                 is temporarily unavailable.
             PipelineTimeoutError: If Textify communication exhausts its timeout budget.
         """
+        # Persist coordination before remote submission to preserve idempotency.
         try:
             coordination = await self._coordination_repository.get_or_create(submitted_url)
         except CoordinationUnavailableError:
@@ -564,6 +566,7 @@ class TextifySourceTranscriptProvider:
         else:
             retry_after = 0.0
 
+        # Poll only the accepted or durably stored Textify capability.
         while True:
             await self._sleeper(retry_after)
             response, inspection = await self._get(capability_link)
@@ -735,6 +738,7 @@ class TextifySourceTranscriptProvider:
                 timeout=timeout,
             )
 
+        # Separate capacity deadline prevents transport retries extending admission.
         capacity_deadline: float | None = None
         while True:
             if capacity_deadline is not None and self._clock() >= capacity_deadline:

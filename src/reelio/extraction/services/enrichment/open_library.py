@@ -579,6 +579,7 @@ class OpenLibraryBookResolver:
     async def _resolve_mention(self, book_mention: BookMention) -> BookResult:
         raw_to_canonical_work_ids: dict[str, str] = {}
         seen_work_ids: set[str] = set()
+        # Prefer the lead author, then broaden when no precise match survives.
         if book_mention.authors:
             candidates = await self._canonicalize_candidates(
                 await self._search(
@@ -662,6 +663,7 @@ class OpenLibraryBookResolver:
         return list(candidates)
 
     async def _select_preferred_edition(self, work_id: str) -> BookEdition | None:
+        # Prefer English non-audiobook, then make one language-agnostic fallback.
         english_selected_edition = await self._search_preferred_edition(
             work_id,
             require_english=True,
@@ -767,6 +769,7 @@ class OpenLibraryBookResolver:
         cache_entry: CacheEntry[ValueT],
         params: dict[str, str | int] | None = None,
     ) -> ValueT:
+        # Coalesce local lookups; shielding preserves shared work for other callers.
         request_key = _catalog_request_key(path, params)
         async with self._lookup_lock:
             if self._closed:
@@ -801,6 +804,7 @@ class OpenLibraryBookResolver:
             """Load and parse a provider value without cache ownership."""
             return await self._load_provider_value(path, parser, params)
 
+        # The shared cache coordinates cross-process fills after local coalescing.
         try:
             return await self._cache.get_or_load(cache_entry, load_provider_value)
         finally:
@@ -874,6 +878,7 @@ class OpenLibraryBookResolver:
         raw_to_canonical_work_ids: dict[str, str],
         seen_work_ids: set[str],
     ) -> list[_OpenLibraryCandidate]:
+        # Resolve redirects before selection so aliases cannot yield duplicate works.
         canonical_candidates: list[_OpenLibraryCandidate] = []
         for candidate in candidates:
             raw_work_id = candidate.open_library_work_id
@@ -890,6 +895,7 @@ class OpenLibraryBookResolver:
     async def _resolve_canonical_work_id(self, work_id: str) -> str:
         seen_redirect_ids: set[str] = set()
         current_work_id = work_id
+        # Follow each redirect once; a repeated identifier is a malformed cycle.
         while current_work_id not in seen_redirect_ids:
             seen_redirect_ids.add(current_work_id)
             path = f"/works/{current_work_id}.json"
@@ -913,6 +919,7 @@ class OpenLibraryBookResolver:
         raise CatalogProviderError(_CATALOG_ERROR_MESSAGE)
 
     async def _await_request_turn(self, deadline: float) -> None:
+        # Serialize request timing to enforce the provider rate limit.
         async with self._request_lock:
             current_time = self._clock()
             if current_time >= deadline:
