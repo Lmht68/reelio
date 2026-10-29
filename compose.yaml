@@ -25,6 +25,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    ports:
+      - "127.0.0.1:5434:5432"
 
   redis:
     image: redis:7.4.11-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
@@ -47,6 +49,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
+    ports:
+      - "127.0.0.1:6380:6379"
 
   migrate:
     <<: *reelio-image
