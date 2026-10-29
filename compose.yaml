@@ -11,7 +11,7 @@ x-coordination-environment: &coordination-environment
 
 services:
   postgres:
-    image: postgres:17
+    image: postgres@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
     restart: unless-stopped
     environment:
       POSTGRES_DB: "${REELIO_POSTGRES_DB:?REELIO_POSTGRES_DB must be set}"
