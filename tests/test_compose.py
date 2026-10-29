@@ -238,9 +238,17 @@ def test_compose_renders_local_deployment_contract() -> None:
     assert api_environment["REELIO_CACHE_REDIS_URL"] == "redis://redis:6379/0"
     assert api_environment["REELIO_TEXTIFY_ORIGIN"] == "http://textify:8182"
 
-    assert postgres["image"] == "postgres:17"
+    assert (
+        postgres["image"]
+        == "postgres@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f"
+    )
     assert postgres["restart"] == "unless-stopped"
-    assert not postgres.get("ports")
+    ports = postgres["ports"]
+    assert isinstance(ports, list)
+    assert len(ports) == 1
+    assert ports[0]["host_ip"] == "127.0.0.1"
+    assert ports[0]["target"] == 5432
+    assert str(ports[0]["published"]) == "5434"
     _assert_postgres_data_mount(postgres)
     postgres_healthcheck = _healthcheck(postgres)
     assert postgres_healthcheck["test"] == [
@@ -253,7 +261,12 @@ def test_compose_renders_local_deployment_contract() -> None:
     assert postgres_healthcheck["start_period"] == "30s"
 
     assert redis["restart"] == "unless-stopped"
-    assert not redis.get("ports")
+    ports = redis["ports"]
+    assert isinstance(ports, list)
+    assert len(ports) == 1
+    assert ports[0]["host_ip"] == "127.0.0.1"
+    assert ports[0]["target"] == 6379
+    assert str(ports[0]["published"]) == "6380"
     assert not redis.get("volumes")
     assert "mem_limit" not in redis
     assert redis["command"] == [

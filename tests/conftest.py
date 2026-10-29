@@ -47,14 +47,15 @@ async def coordination_database(
 
     database_name = f"reelio_test_{uuid4().hex}"
     database_url = admin_url.set(database=database_name)
+    database_url_string = database_url.render_as_string(hide_password=False)
     admin_engine = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
     try:
         async with admin_engine.connect() as connection:
             await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
 
-        monkeypatch.setenv("REELIO_COORDINATION_DATABASE_URL", str(database_url))
+        monkeypatch.setenv("REELIO_COORDINATION_DATABASE_URL", database_url_string)
         monkeypatch.setenv("REELIO_COORDINATION_HMAC_SECRET", "test-coordination-hmac-secret")
-        yield str(database_url)
+        yield database_url_string
     finally:
         try:
             async with admin_engine.connect() as connection:
