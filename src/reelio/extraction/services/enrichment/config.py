@@ -90,6 +90,3 @@ class OpenLibraryConfig(BaseSettings):
         ):
             raise ValueError("must be an absolute HTTP URL without credentials or query")
         return value.rstrip("/")
-
-
-tmdb_settings = TMDBConfig()  # type: ignore[call-arg]

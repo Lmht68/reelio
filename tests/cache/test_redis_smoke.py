@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from pydantic import SecretStr
 from redis.asyncio import Redis
 
+import reelio.extraction.factory as factory_module
 import reelio.main as main_module
 from reelio.cache import (
     CacheCodecError,
@@ -109,20 +110,6 @@ class _LifecycleProvider:
     async def aclose(self) -> None:
         """Record provider shutdown."""
         self._events.append("provider")
-
-
-class _LifecyclePipeline:
-    """Close its provider before reporting pipeline teardown."""
-
-    def __init__(self, provider: _LifecycleProvider, events: list[str]) -> None:
-        """Initialize the provider and pipeline event sink."""
-        self._provider = provider
-        self._events = events
-
-    async def aclose(self) -> None:
-        """Close provider-owned resources before the pipeline completes shutdown."""
-        await self._provider.aclose()
-        self._events.append("pipeline")
 
 
 def _redis_url_or_skip() -> str:
@@ -500,7 +487,7 @@ async def test_real_cache_fails_open_when_redis_is_unavailable() -> None:
 async def test_real_lifespan_closes_pipeline_provider_before_cache_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Close lightweight pipeline resources before exactly one real cache/client close."""
+    """Close factory-composed provider resources before one real cache/client close."""
     redis_url = _redis_url_or_skip()
     settings = _smoke_settings(redis_url)
     namespace = _smoke_namespace(settings)
@@ -515,45 +502,100 @@ async def test_real_lifespan_closes_pipeline_provider_before_cache_client(
         events.append("cache")
         await original_cache_close()
 
+    class _Closable(Protocol):
+        async def aclose(self) -> None: ...
+
+    class _NoopResource:
+        async def aclose(self) -> None:
+            return None
+
+    class _FactoryPipeline:
+        def __init__(
+            self,
+            source_transcript_provider: _LifecycleProvider,
+            interpretation_service: _Closable,
+            result_aggregator: _Closable,
+            default_market: SpotifyMarket,
+        ) -> None:
+            del default_market
+            self._source_transcript_provider = source_transcript_provider
+            self._interpretation_service = interpretation_service
+            self._result_aggregator = result_aggregator
+
+        async def aclose(self) -> None:
+            try:
+                await self._source_transcript_provider.aclose()
+            finally:
+                try:
+                    await self._interpretation_service.aclose()
+                finally:
+                    await self._result_aggregator.aclose()
+            events.append("pipeline")
+
     monkeypatch.setattr(cache, "aclose", close_cache)
     provider = _LifecycleProvider(events)
-    pipeline = _LifecyclePipeline(provider, events)
 
     @asynccontextmanager
     async def catalog_context(
-        settings: object,
+        configured_settings: object,
         configured_cache: object,
     ) -> AsyncGenerator[object]:
-        del settings, configured_cache
+        del configured_settings, configured_cache
         yield object()
 
-    async def create_pipeline(
-        default_market: SpotifyMarket,
-        spotify_catalog: object,
+    async def create_textify_provider(
+        textify_settings: object,
+        coordination_settings: object,
         configured_cache: RedisCache,
-    ) -> _LifecyclePipeline:
-        del default_market, spotify_catalog
+    ) -> _LifecycleProvider:
+        del textify_settings, coordination_settings
         assert configured_cache is cache
         assert await _load(configured_cache, _entry("provider:spotify", "lifespan"), "ready") == (
             "ready",
             1,
         )
-        return pipeline
+        return provider
 
-    monkeypatch.setattr(main_module, "CacheConfig", lambda environment: settings)
-    monkeypatch.setattr(main_module, "create_cache", lambda _: cache)
+    monkeypatch.setattr(factory_module, "CacheConfig", lambda environment: settings)
+    monkeypatch.setattr(factory_module, "create_cache", lambda _: cache)
     monkeypatch.setattr(
-        main_module,
+        factory_module,
         "SpotifyConfig",
         lambda: SimpleNamespace(default_market=SpotifyMarket("US")),
     )
-    monkeypatch.setattr(main_module, "create_spotify_catalog", catalog_context)
-    monkeypatch.setattr(main_module, "_create_production_pipeline", create_pipeline)
+    monkeypatch.setattr(factory_module, "create_spotify_catalog", catalog_context)
+    monkeypatch.setattr(factory_module, "InterpretationConfig", SimpleNamespace)
+    monkeypatch.setattr(factory_module, "LLMProviderSelectionConfig", SimpleNamespace)
+    monkeypatch.setattr(
+        factory_module,
+        "create_mention_interpretation_provider",
+        lambda _: _NoopResource(),
+    )
+    monkeypatch.setattr(factory_module, "TextifyConfig", SimpleNamespace)
+    monkeypatch.setattr(factory_module, "CoordinationConfig", SimpleNamespace)
+    monkeypatch.setattr(
+        factory_module,
+        "create_textify_source_transcript_provider",
+        create_textify_provider,
+    )
+    monkeypatch.setattr(factory_module, "TMDBConfig", SimpleNamespace)
+    monkeypatch.setattr(
+        factory_module,
+        "create_tmdb_screen_work_resolver",
+        lambda *_: _NoopResource(),
+    )
+    monkeypatch.setattr(factory_module, "OpenLibraryConfig", SimpleNamespace)
+    monkeypatch.setattr(
+        factory_module,
+        "create_open_library_book_resolver",
+        lambda *_: _NoopResource(),
+    )
+    monkeypatch.setattr(factory_module, "ExtractionPipeline", _FactoryPipeline)
     application: FastAPI = main_module.create_app()
 
     try:
         async with application.router.lifespan_context(application):
-            assert application.state.extraction_pipeline is pipeline
+            assert isinstance(application.state.extraction_pipeline, _FactoryPipeline)
 
         assert events == ["provider", "pipeline", "cache", "client"]
         assert events.count("cache") == 1
