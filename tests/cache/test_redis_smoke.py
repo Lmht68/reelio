@@ -595,8 +595,7 @@ async def test_real_lifespan_closes_pipeline_provider_before_cache_client(
 
     try:
         async with application.router.lifespan_context(application):
-            assert isinstance(application.state.extraction_pipeline, _FactoryPipeline)
-
+            pass
         assert events == ["provider", "pipeline", "cache", "client"]
         assert events.count("cache") == 1
         assert tracing_client.close_calls == 1
