@@ -5,6 +5,7 @@ from httpx import ASGITransport, AsyncClient
 
 import reelio.main as main_module
 from reelio.config import Environment, app_settings
+from reelio.extraction.job_store import InMemoryExtractionJobStore
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.types import (
     BookResults,
@@ -53,6 +54,28 @@ class _FakePipeline:
 
     async def aclose(self) -> None:
         self.close_calls += 1
+
+
+class _FakeJobStore(InMemoryExtractionJobStore):
+    def __init__(self, close_events: list[str] | None = None) -> None:
+        super().__init__()
+        self.close_calls = 0
+        self._close_events = close_events
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        if self._close_events is not None:
+            self._close_events.append("store")
+
+
+class _CloseRecordingPipeline(_FakePipeline):
+    def __init__(self, close_events: list[str]) -> None:
+        super().__init__()
+        self._close_events = close_events
+
+    async def aclose(self) -> None:
+        await super().aclose()
+        self._close_events.append("pipeline")
 
 
 @pytest.mark.parametrize(
@@ -114,65 +137,140 @@ async def test_internal_transcript_route_is_gated_by_environment(
     assert pipeline.transcript_calls == expected_calls
 
 
-async def test_injected_pipeline_factory_owns_one_pipeline_per_lifespan() -> None:
-    """Store one factory result during lifespan and release it on shutdown."""
+async def test_injected_resource_factories_own_one_resource_per_lifespan() -> None:
+    """Publish both resources only during lifespan and release each on shutdown."""
     pipeline = _FakePipeline()
-    calls = 0
+    store = _FakeJobStore()
+    pipeline_calls = 0
+    store_calls = 0
 
-    async def factory() -> _FakePipeline:
-        nonlocal calls
-        calls += 1
+    async def pipeline_factory() -> _FakePipeline:
+        nonlocal pipeline_calls
+        pipeline_calls += 1
         return pipeline
 
-    application = create_app(pipeline_factory=factory)
+    async def job_store_factory() -> _FakeJobStore:
+        nonlocal store_calls
+        store_calls += 1
+        return store
+
+    application = create_app(
+        pipeline_factory=pipeline_factory,
+        job_store_factory=job_store_factory,
+    )
     assert not hasattr(application.state, "extraction_pipeline")
+    assert not hasattr(application.state, "extraction_job_store")
 
     async with application.router.lifespan_context(application):
         assert application.state.extraction_pipeline is pipeline
-        assert calls == 1
+        assert application.state.extraction_job_store is store
+        assert pipeline_calls == 1
+        assert store_calls == 1
 
     assert not hasattr(application.state, "extraction_pipeline")
+    assert not hasattr(application.state, "extraction_job_store")
     assert pipeline.close_calls == 1
+    assert store.close_calls == 1
 
     async with application.router.lifespan_context(application):
         assert application.state.extraction_pipeline is pipeline
-        assert calls == 2
+        assert application.state.extraction_job_store is store
+        assert pipeline_calls == 2
+        assert store_calls == 2
     assert pipeline.close_calls == 2
+    assert store.close_calls == 2
 
 
-async def test_pipeline_factory_failure_aborts_lifespan() -> None:
-    """Propagate provider construction failures during startup."""
+async def test_pipeline_factory_failure_closes_the_created_store() -> None:
+    """Close the job store and publish no state when pipeline construction fails."""
+    store = _FakeJobStore()
 
     async def failing_factory() -> _FakePipeline:
         raise RuntimeError("provider construction failed")
 
-    application = create_app(pipeline_factory=failing_factory)
+    async def job_store_factory() -> _FakeJobStore:
+        return store
+
+    application = create_app(
+        pipeline_factory=failing_factory,
+        job_store_factory=job_store_factory,
+    )
     context = application.router.lifespan_context(application)
 
     with pytest.raises(RuntimeError, match="provider construction failed"):
         await context.__aenter__()
 
     assert not hasattr(application.state, "extraction_pipeline")
+    assert not hasattr(application.state, "extraction_job_store")
+    assert store.close_calls == 1
 
 
-async def test_production_lifespan_delegates_to_the_public_factory(
+async def test_production_lifespan_delegates_to_both_public_factories(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Use the process-independent production factory for application lifecycle ownership."""
+    """Use process-independent production factories for lifespan resource ownership."""
     pipeline = _FakePipeline()
-    calls = 0
+    store = _FakeJobStore()
+    pipeline_calls = 0
+    store_calls = 0
 
-    async def factory() -> _FakePipeline:
-        nonlocal calls
-        calls += 1
+    async def pipeline_factory() -> _FakePipeline:
+        nonlocal pipeline_calls
+        pipeline_calls += 1
         return pipeline
 
-    monkeypatch.setattr(main_module, "create_production_extraction_pipeline", factory)
+    async def job_store_factory() -> _FakeJobStore:
+        nonlocal store_calls
+        store_calls += 1
+        return store
+
+    monkeypatch.setattr(
+        main_module,
+        "create_production_extraction_pipeline",
+        pipeline_factory,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "create_production_extraction_job_store",
+        job_store_factory,
+    )
     application = create_app()
 
     async with application.router.lifespan_context(application):
         assert application.state.extraction_pipeline is pipeline
-        assert calls == 1
+        assert application.state.extraction_job_store is store
+        assert pipeline_calls == 1
+        assert store_calls == 1
 
     assert not hasattr(application.state, "extraction_pipeline")
+    assert not hasattr(application.state, "extraction_job_store")
     assert pipeline.close_calls == 1
+    assert store.close_calls == 1
+
+
+async def test_lifespan_closes_pipeline_before_its_job_store() -> None:
+    """Close pipeline resources before the store that records their work."""
+    close_events: list[str] = []
+    pipeline = _CloseRecordingPipeline(close_events)
+    store = _FakeJobStore(close_events)
+    application = create_app(
+        pipeline_factory=lambda: _completed(pipeline),
+        job_store_factory=lambda: _completed(store),
+    )
+
+    async with application.router.lifespan_context(application):
+        pass
+
+    assert close_events == ["pipeline", "store"]
+
+
+async def _completed[ValueType](value: ValueType) -> ValueType:
+    """Return one preconstructed asynchronous factory value.
+
+    Args:
+        value: Value returned by the asynchronous factory.
+
+    Returns:
+        The same value.
+    """
+    return value

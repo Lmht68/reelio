@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings
 
 from reelio.cache import CacheConfig
 from reelio.config import AppConfig, Environment
+from reelio.database import DatabaseConfig
 from reelio.extraction.coordination import CoordinationConfig
 from reelio.extraction.services.enrichment.config import OpenLibraryConfig, TMDBConfig
 from reelio.extraction.services.interpretation.config import (
@@ -449,6 +450,40 @@ def test_enabled_cache_accepts_secure_managed_endpoint_options() -> None:
     )
 
     assert settings.namespace == "reelio:production"
+
+
+def test_database_config_requires_a_valid_asyncpg_database_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Require the shared durable PostgreSQL URL without Textify credentials."""
+    monkeypatch.delenv("REELIO_COORDINATION_DATABASE_URL", raising=False)
+    with pytest.raises(ValidationError):
+        _without_dotenv(DatabaseConfig)
+
+    settings = _without_dotenv(
+        DatabaseConfig,
+        database_url="postgresql+asyncpg://reelio:password@localhost/reelio",
+    )
+
+    assert settings.database_url.get_secret_value().endswith("/reelio")
+
+
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql://reelio:password@localhost/reelio",
+        "postgresql+psycopg://reelio:password@localhost/reelio",
+        "mysql+asyncmy://reelio:password@localhost/reelio",
+        "postgresql+asyncpg:///reelio",
+        "postgresql+asyncpg://reelio:password@localhost",
+    ],
+)
+def test_database_config_rejects_non_asyncpg_or_incomplete_urls(
+    database_url: str,
+) -> None:
+    """Keep all durable adapters on one complete asynchronous PostgreSQL endpoint."""
+    with pytest.raises(ValidationError):
+        _without_dotenv(DatabaseConfig, database_url=database_url)
 
 
 def test_coordination_requires_nonblank_database_url_and_hmac_secret(

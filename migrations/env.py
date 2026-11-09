@@ -1,4 +1,4 @@
-"""Alembic environment for Reelio Textify coordination."""
+"""Alembic environment for durable Reelio PostgreSQL resources."""
 
 import asyncio
 
@@ -7,19 +7,19 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from reelio.extraction.coordination import CoordinationConfig
+from reelio.database import DatabaseConfig
 
 config = context.config
 target_metadata = None
 
 
 def _configured_database_url() -> str:
-    """Load the coordination migration target from dedicated settings.
+    """Load the durable migration target from shared database settings.
 
     Returns:
         The configured PostgreSQL asyncpg URL.
     """
-    return CoordinationConfig().database_url.get_secret_value()
+    return DatabaseConfig().database_url.get_secret_value()
 
 
 def run_migrations_offline() -> None:

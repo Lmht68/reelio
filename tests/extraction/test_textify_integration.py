@@ -44,6 +44,7 @@ from reelio.extraction.coordination import (
     TextifyCoordinationRepository,
     create_postgres_textify_coordination,
 )
+from reelio.extraction.job_store import InMemoryExtractionJobStore
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.service import ExtractionPipeline
 from reelio.extraction.services.textify import (
@@ -753,6 +754,11 @@ async def _pipeline_factory(pipeline: ExtractionPipeline) -> ExtractionPipeline:
     return pipeline
 
 
+async def _job_store_factory() -> InMemoryExtractionJobStore:
+    """Return one isolated deterministic store for synchronous pipeline tests."""
+    return InMemoryExtractionJobStore()
+
+
 async def _request_public_extraction(
     pipeline: ExtractionPipeline,
     submitted_url: str = _SUBMITTED_URL,
@@ -768,7 +774,10 @@ async def _request_public_extraction(
     Returns:
         Public Extraction HTTP response.
     """
-    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+    application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(pipeline),
+        job_store_factory=_job_store_factory,
+    )
     adapter_logger = logging.getLogger("reelio.extraction.services.textify")
     if adapter_log_handler is not None:
         adapter_logger.addHandler(adapter_log_handler)
@@ -891,7 +900,10 @@ async def test_public_extraction_uses_textify_whisper_and_durable_coordination(
         waits.append(seconds)
 
     pipeline = await _create_pipeline(migrated_coordination_database, server, sleeper)
-    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+    application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(pipeline),
+        job_store_factory=_job_store_factory,
+    )
 
     async with application.router.lifespan_context(application):
         transport = httpx.ASGITransport(app=application)
@@ -980,7 +992,10 @@ async def test_repeated_public_extraction_uses_confirmed_textify_result_cache(
             textify_settings=_textify_settings(result_retention_seconds=120),
             cache=cache,
         )
-        application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+        application = create_app(
+            pipeline_factory=lambda: _pipeline_factory(pipeline),
+            job_store_factory=_job_store_factory,
+        )
 
         async with application.router.lifespan_context(application):
             transport = httpx.ASGITransport(app=application)
@@ -1026,7 +1041,10 @@ async def test_public_extraction_preserves_textify_youtube_captions(
         assert seconds == 0
 
     pipeline = await _create_pipeline(migrated_coordination_database, server, sleeper)
-    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+    application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(pipeline),
+        job_store_factory=_job_store_factory,
+    )
 
     async with application.router.lifespan_context(application):
         transport = httpx.ASGITransport(app=application)
@@ -1069,8 +1087,14 @@ async def test_concurrent_public_extractions_share_one_textify_job(
         server,
         sleeper,
     )
-    first_application = create_app(pipeline_factory=lambda: _pipeline_factory(first_pipeline))
-    second_application = create_app(pipeline_factory=lambda: _pipeline_factory(second_pipeline))
+    first_application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(first_pipeline),
+        job_store_factory=_job_store_factory,
+    )
+    second_application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(second_pipeline),
+        job_store_factory=_job_store_factory,
+    )
 
     async with (
         first_application.router.lifespan_context(first_application),
@@ -1124,7 +1148,10 @@ async def test_ambiguous_admission_retries_the_durable_textify_identity(
         sleeper,
         lost_response_transport,
     )
-    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+    application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(pipeline),
+        job_store_factory=_job_store_factory,
+    )
 
     async with application.router.lifespan_context(application):
         transport = httpx.ASGITransport(app=application)
@@ -1172,7 +1199,10 @@ async def test_restart_after_request_cancellation_resumes_the_active_textify_job
         server,
         blocking_sleeper,
     )
-    first_application = create_app(pipeline_factory=lambda: _pipeline_factory(first_pipeline))
+    first_application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(first_pipeline),
+        job_store_factory=_job_store_factory,
+    )
 
     async with first_application.router.lifespan_context(first_application):
         transport = httpx.ASGITransport(app=first_application)
@@ -1201,7 +1231,10 @@ async def test_restart_after_request_cancellation_resumes_the_active_textify_job
         server,
         resumed_sleeper,
     )
-    resumed_application = create_app(pipeline_factory=lambda: _pipeline_factory(resumed_pipeline))
+    resumed_application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(resumed_pipeline),
+        job_store_factory=_job_store_factory,
+    )
 
     async with resumed_application.router.lifespan_context(resumed_application):
         transport = httpx.ASGITransport(app=resumed_application)
@@ -1240,7 +1273,10 @@ async def test_distinct_exact_urls_receive_distinct_textify_coordination_identit
         assert seconds == 0
 
     pipeline = await _create_pipeline(migrated_coordination_database, server, sleeper)
-    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+    application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(pipeline),
+        job_store_factory=_job_store_factory,
+    )
 
     async with application.router.lifespan_context(application):
         transport = httpx.ASGITransport(app=application)
@@ -1307,7 +1343,10 @@ async def test_distinct_exact_urls_create_independent_textify_result_cache_entri
             sleeper,
             cache=cache,
         )
-        application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+        application = create_app(
+            pipeline_factory=lambda: _pipeline_factory(pipeline),
+            job_store_factory=_job_store_factory,
+        )
 
         async with application.router.lifespan_context(application):
             transport = httpx.ASGITransport(app=application)
@@ -1383,7 +1422,10 @@ async def test_active_textify_coordination_has_no_result_cache_until_completion(
             sleeper,
             cache=cache,
         )
-        application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+        application = create_app(
+            pipeline_factory=lambda: _pipeline_factory(pipeline),
+            job_store_factory=_job_store_factory,
+        )
 
         async with application.router.lifespan_context(application):
             transport = httpx.ASGITransport(app=application)
@@ -1626,7 +1668,10 @@ async def test_public_extraction_retires_terminal_textify_coordination(
         assert seconds == 0
 
     pipeline = await _create_pipeline(migrated_coordination_database, server, sleeper)
-    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+    application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(pipeline),
+        job_store_factory=_job_store_factory,
+    )
 
     async with application.router.lifespan_context(application):
         transport = httpx.ASGITransport(app=application)
@@ -1667,7 +1712,10 @@ async def test_public_extraction_retires_stale_capability_without_resubmitting(
         assert seconds == 0
 
     pipeline = await _create_pipeline(migrated_coordination_database, server, sleeper)
-    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+    application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(pipeline),
+        job_store_factory=_job_store_factory,
+    )
 
     async with application.router.lifespan_context(application):
         transport = httpx.ASGITransport(app=application)
@@ -1784,7 +1832,10 @@ async def test_public_extraction_replaces_expired_matching_coordination_after_bo
     )
 
     pipeline = await _create_pipeline(migrated_coordination_database, server, sleeper)
-    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+    application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(pipeline),
+        job_store_factory=_job_store_factory,
+    )
 
     async with application.router.lifespan_context(application):
         transport = httpx.ASGITransport(app=application)
@@ -1838,7 +1889,10 @@ async def test_public_extraction_returns_unavailable_before_textify_when_postgre
         assert seconds == 0
 
     pipeline = await _create_pipeline(migrated_coordination_database, server, sleeper)
-    application = create_app(pipeline_factory=lambda: _pipeline_factory(pipeline))
+    application = create_app(
+        pipeline_factory=lambda: _pipeline_factory(pipeline),
+        job_store_factory=_job_store_factory,
+    )
     coordination_url = make_url(migrated_coordination_database)
     database_name = coordination_url.database
     assert database_name is not None

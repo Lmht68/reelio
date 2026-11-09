@@ -8,7 +8,6 @@ from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from pydantic import Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -23,13 +22,14 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.engine import RowMapping, make_url
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from reelio.database import CURRENT_SCHEMA_REVISION, DatabaseConfig
+
 _MAX_COORDINATION_RETENTION_SECONDS = 86_400
 _EXPIRATION_CLEANUP_BATCH_SIZE = 100
-_COORDINATION_REVISION = "0002_coordination_expiration"
 _CAPABILITY_LINK_PATTERN = re.compile(
     r"/api/v1/transcription-jobs/"
     r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
@@ -47,18 +47,9 @@ _COORDINATION_TABLE = Table(
 )
 
 
-class CoordinationConfig(BaseSettings):
-    """Validate the dedicated PostgreSQL coordination configuration."""
+class CoordinationConfig(DatabaseConfig):
+    """Validate Textify coordination's shared database URL and HMAC settings."""
 
-    model_config = SettingsConfigDict(
-        env_prefix="REELIO_COORDINATION_",
-        env_file=".env",
-        extra="ignore",
-        hide_input_in_errors=True,
-        validate_default=True,
-    )
-
-    database_url: SecretStr
     hmac_secret: SecretStr
     retention_seconds: int = Field(
         default=_MAX_COORDINATION_RETENTION_SECONDS,
@@ -67,23 +58,15 @@ class CoordinationConfig(BaseSettings):
     )
 
     @model_validator(mode="after")
-    def _validate_database_and_hmac_secret(self) -> "CoordinationConfig":
-        """Require an async PostgreSQL endpoint and nonblank HMAC secret.
+    def _validate_hmac_secret(self) -> "CoordinationConfig":
+        """Require the nonblank HMAC secret unique to Textify coordination.
+
+        Returns:
+            The validated coordination settings.
 
         Raises:
-            ValueError: If the endpoint is incomplete or not PostgreSQL through asyncpg,
-                or if the HMAC secret is blank.
+            ValueError: If the HMAC secret is blank.
         """
-        database_url = self.database_url.get_secret_value()
-        endpoint = make_url(database_url)
-        if (
-            endpoint.drivername != "postgresql+asyncpg"
-            or endpoint.host is None
-            or endpoint.database is None
-        ):
-            raise ValueError(
-                "coordination database URL must use postgresql+asyncpg with a host and database"
-            )
         if not self.hmac_secret.get_secret_value().strip():
             raise ValueError("coordination HMAC secret must not be blank")
         return self
@@ -395,7 +378,7 @@ class PostgresTextifyCoordinationRepository:
                 revisions = (
                     await connection.scalars(text("SELECT version_num FROM alembic_version"))
                 ).all()
-                if revisions != [_COORDINATION_REVISION]:
+                if revisions != [CURRENT_SCHEMA_REVISION]:
                     raise CoordinationError("Textify coordination schema revision is unavailable")
         except SQLAlchemyError as exc:
             raise CoordinationUnavailableError(

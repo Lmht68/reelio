@@ -12,9 +12,13 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-_REVISION = "0002_coordination_expiration"
-_TABLE_NAME = "textify_coordination"
+from reelio.database import CURRENT_SCHEMA_REVISION
+
+_REVISION = CURRENT_SCHEMA_REVISION
+_COORDINATION_TABLE_NAME = "textify_coordination"
+_EXTRACTION_JOB_TABLE_NAME = "extraction_job"
 _EXPIRATION_INDEX = "textify_coordination_expires_at_id_idx"
+_QUEUED_INDEX = "extraction_job_queued_submitted_at_job_id_idx"
 _CAPABILITY_PATH_PREFIX = "/api/v1/transcription-jobs/"
 
 
@@ -98,7 +102,7 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
                     "WHERE table_schema = 'public' AND table_name = :table_name "
                     "ORDER BY ordinal_position"
                 ),
-                {"table_name": _TABLE_NAME},
+                {"table_name": _COORDINATION_TABLE_NAME},
             )
             constraint_names = await connection.scalars(
                 text(
@@ -111,9 +115,30 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             expiration_index = await connection.scalar(
                 text(f"SELECT to_regclass('public.{_EXPIRATION_INDEX}')")
             )
+            extraction_job_columns = await connection.execute(
+                text(
+                    "SELECT column_name, data_type, is_nullable, identity_generation "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = :table_name "
+                    "ORDER BY ordinal_position"
+                ),
+                {"table_name": _EXTRACTION_JOB_TABLE_NAME},
+            )
+            extraction_job_constraint_names = await connection.scalars(
+                text(
+                    "SELECT conname "
+                    "FROM pg_constraint "
+                    "WHERE conrelid = 'public.extraction_job'::regclass "
+                    "AND contype IN ('p', 'u', 'c')"
+                )
+            )
+            queued_index = await connection.scalar(
+                text(f"SELECT to_regclass('public.{_QUEUED_INDEX}')")
+            )
 
         assert revision == _REVISION
         assert expiration_index == _EXPIRATION_INDEX
+        assert queued_index == _QUEUED_INDEX
         assert columns.all() == [
             ("id", "bigint", "NO", "ALWAYS"),
             ("url_identity", "bytea", "NO", None),
@@ -123,6 +148,31 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             ("updated_at", "timestamp with time zone", "NO", None),
             ("expires_at", "timestamp with time zone", "NO", None),
         ]
+        assert extraction_job_columns.all() == [
+            ("job_id", "uuid", "NO", None),
+            ("source_url", "text", "NO", None),
+            ("market", "character varying", "YES", None),
+            ("status", "text", "NO", None),
+            ("submitted_at", "timestamp with time zone", "NO", None),
+            ("updated_at", "timestamp with time zone", "NO", None),
+            ("started_at", "timestamp with time zone", "YES", None),
+            ("finished_at", "timestamp with time zone", "YES", None),
+            ("result_version", "text", "YES", None),
+            ("result", "jsonb", "YES", None),
+            ("error_code", "text", "YES", None),
+            ("error_message", "text", "YES", None),
+        ]
+        assert set(extraction_job_constraint_names.all()) == {
+            "extraction_job_pkey",
+            "extraction_job_job_id_uuid4_check",
+            "extraction_job_source_url_length_check",
+            "extraction_job_market_check",
+            "extraction_job_status_check",
+            "extraction_job_timestamp_order_check",
+            "extraction_job_result_object_check",
+            "extraction_job_terminal_text_check",
+            "extraction_job_lifecycle_state_check",
+        }
         assert set(constraint_names.all()) == {
             "textify_coordination_pkey",
             "textify_coordination_url_identity_key",
@@ -143,10 +193,18 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             expiration_index = await connection.scalar(
                 text(f"SELECT to_regclass('public.{_EXPIRATION_INDEX}')")
             )
+            extraction_job_table = await connection.scalar(
+                text("SELECT to_regclass('public.extraction_job')")
+            )
+            queued_index = await connection.scalar(
+                text(f"SELECT to_regclass('public.{_QUEUED_INDEX}')")
+            )
 
         assert table is None
         assert revision is None
         assert expiration_index is None
+        assert extraction_job_table is None
+        assert queued_index is None
 
         await asyncio.to_thread(_upgrade_head)
 
@@ -158,10 +216,18 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             expiration_index = await connection.scalar(
                 text(f"SELECT to_regclass('public.{_EXPIRATION_INDEX}')")
             )
+            extraction_job_table = await connection.scalar(
+                text("SELECT to_regclass('public.extraction_job')")
+            )
+            queued_index = await connection.scalar(
+                text(f"SELECT to_regclass('public.{_QUEUED_INDEX}')")
+            )
 
         assert revision == _REVISION
-        assert table == _TABLE_NAME
+        assert table == _COORDINATION_TABLE_NAME
         assert expiration_index == _EXPIRATION_INDEX
+        assert extraction_job_table == _EXTRACTION_JOB_TABLE_NAME
+        assert queued_index == _QUEUED_INDEX
     finally:
         await engine.dispose()
 

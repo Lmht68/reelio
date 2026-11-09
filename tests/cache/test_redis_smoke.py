@@ -41,6 +41,7 @@ from reelio.cache.redis import (
     _RedisClient,
 )
 from reelio.config import Environment
+from reelio.extraction.job_store import InMemoryExtractionJobStore
 from reelio.extraction.market import SpotifyMarket
 
 pytestmark = pytest.mark.redis_smoke
@@ -591,7 +592,11 @@ async def test_real_lifespan_closes_pipeline_provider_before_cache_client(
         lambda *_: _NoopResource(),
     )
     monkeypatch.setattr(factory_module, "ExtractionPipeline", _FactoryPipeline)
-    application: FastAPI = main_module.create_app()
+
+    async def job_store_factory() -> InMemoryExtractionJobStore:
+        return InMemoryExtractionJobStore()
+
+    application: FastAPI = main_module.create_app(job_store_factory=job_store_factory)
 
     try:
         async with application.router.lifespan_context(application):
