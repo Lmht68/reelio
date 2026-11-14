@@ -4,7 +4,7 @@ from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 
-CURRENT_SCHEMA_REVISION = "0003_extraction_job"
+CURRENT_SCHEMA_REVISION = "0004_anonymous_job_ownership"
 
 
 class DatabaseConfig(BaseSettings):

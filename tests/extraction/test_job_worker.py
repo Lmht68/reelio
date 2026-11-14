@@ -27,6 +27,9 @@ from tests.extraction.fakes import FakeInterpretationService, FakeResultAggregat
 
 _SUBMITTED_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
+_OWNER_DIGEST = b"worker-owner-digest-012345678901"
+_IDEMPOTENCY_KEY = UUID("00000000-0000-4000-8000-000000000001")
+
 
 def _pipeline_result(market: SpotifyMarket) -> PipelineResult:
     """Build one known Source result with no resolved or unresolved mentions."""
@@ -105,7 +108,12 @@ async def test_run_once_delivers_the_exact_source_and_requested_market() -> None
     store = InMemoryExtractionJobStore(
         uuid_factory=lambda: UUID("00000000-0000-4000-8000-000000000001")
     )
-    await store.admit_source(_SUBMITTED_URL, SpotifyMarket("JP"))
+    await store.admit_source(
+        _SUBMITTED_URL,
+        SpotifyMarket("JP"),
+        _OWNER_DIGEST,
+        _IDEMPOTENCY_KEY,
+    )
     pipeline = _RecordingPipeline(_pipeline_result(SpotifyMarket("JP")))
     worker = ExtractionJobWorker(store, pipeline)
 
@@ -119,11 +127,11 @@ async def test_run_once_persists_the_existing_mapper_response() -> None:
     """Store the public response mapped from the pipeline's Source result."""
     job_id = UUID("00000000-0000-4000-8000-000000000001")
     store = InMemoryExtractionJobStore(uuid_factory=lambda: job_id)
-    await store.admit_source(_SUBMITTED_URL, None)
+    await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
     worker = ExtractionJobWorker(store, _RecordingPipeline(_pipeline_result(SpotifyMarket("US"))))
 
     assert await worker.run_once() is True
-    stored = await store.get(job_id)
+    stored = await store.get_for_owner(job_id, _OWNER_DIGEST)
 
     assert isinstance(stored, SucceededSourceJob)
     assert stored.result.model_dump(mode="json") == {
@@ -167,11 +175,11 @@ async def test_run_once_commits_an_empty_successful_result() -> None:
     """Retain a successful Source result that has no grouped mentions."""
     job_id = UUID("00000000-0000-4000-8000-000000000001")
     store = InMemoryExtractionJobStore(uuid_factory=lambda: job_id)
-    await store.admit_source(_SUBMITTED_URL, None)
+    await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
     worker = ExtractionJobWorker(store, _RecordingPipeline(_pipeline_result(SpotifyMarket("US"))))
 
     assert await worker.run_once() is True
-    stored = await store.get(job_id)
+    stored = await store.get_for_owner(job_id, _OWNER_DIGEST)
 
     assert isinstance(stored, SucceededSourceJob)
     assert stored.result.results.movies == []
@@ -258,7 +266,7 @@ async def test_concurrent_run_once_calls_do_not_overlap_pipeline_execution() -> 
     store = InMemoryExtractionJobStore(
         uuid_factory=lambda: UUID("00000000-0000-4000-8000-000000000001")
     )
-    await store.admit_source(_SUBMITTED_URL, None)
+    await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
     pipeline = _BlockingPipeline(_pipeline_result(SpotifyMarket("US")))
     worker = ExtractionJobWorker(store, pipeline)
 
@@ -339,6 +347,7 @@ async def test_public_job_lifecycle_runs_the_real_pipeline_and_mapper() -> None:
             admitted = await client.post(
                 "/api/extraction-jobs",
                 json={"url": _SUBMITTED_URL, "market": "JP"},
+                headers={"Idempotency-Key": str(_IDEMPOTENCY_KEY)},
             )
             queued = await client.get(f"/api/extraction-jobs/{job_id}")
             worker_run = asyncio.create_task(worker.run_once())

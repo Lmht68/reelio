@@ -45,7 +45,7 @@ REELIO_OPEN_LIBRARY_CONTACT_EMAIL=you@example.com
 ```
 
 Use `REELIO_LLM_PROVIDER=deepseek` with `REELIO_DEEPSEEK_API_KEY` to select DeepSeek.
-See [`.env.example`](.env.example) for the exact Textify origin, admission and transport retry budgets, result and coordination retention, PostgreSQL coordination, HMAC, cache, LLM, and catalog settings.
+See [`.env.example`](.env.example) for the exact anonymous-owner HMAC, Textify origin, admission and transport retry budgets, result and coordination retention, PostgreSQL coordination, cache, LLM, and catalog settings.
 
 ```bash
 uv run uvicorn reelio.main:app --reload
@@ -66,7 +66,7 @@ cp .env.example .env
 ```
 
 `REELIO_POSTGRES_PASSWORD` is required and must be URL-safe because Compose interpolates it into Reelio's asyncpg URL.
-Compose also requires nonblank values for `REELIO_COORDINATION_HMAC_SECRET`, `REELIO_CACHE_KEY_SECRET`, `REELIO_LLM_PROVIDER`, `REELIO_TMDB_API_KEY`, `REELIO_SPOTIFY_CLIENT_ID`, `REELIO_SPOTIFY_CLIENT_SECRET`, and `REELIO_OPEN_LIBRARY_CONTACT_EMAIL`.
+Compose also requires nonblank values for `REELIO_ANONYMOUS_OWNER_HMAC_SECRET`, `REELIO_COORDINATION_HMAC_SECRET`, `REELIO_CACHE_KEY_SECRET`, `REELIO_LLM_PROVIDER`, `REELIO_TMDB_API_KEY`, `REELIO_SPOTIFY_CLIENT_ID`, `REELIO_SPOTIFY_CLIENT_SECRET`, and `REELIO_OPEN_LIBRARY_CONTACT_EMAIL`.
 Every real secret in `.env.example` is blank.
 Set only the selected provider's key: `REELIO_OPENAI_API_KEY` for `REELIO_LLM_PROVIDER=openai`, or `REELIO_DEEPSEEK_API_KEY` for `REELIO_LLM_PROVIDER=deepseek`.
 

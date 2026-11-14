@@ -46,23 +46,34 @@ class InMemoryExtractionJobStore:
         self._clock = clock
         self._uuid_factory = uuid_factory
         self._jobs: dict[UUID, SourceExtractionJob] = {}
+        self._owners: dict[UUID, bytes] = {}
+        self._admissions: dict[tuple[bytes, UUID], QueuedSourceJob] = {}
         self._lock = asyncio.Lock()
 
     async def admit_source(
         self,
         source_url: str,
         market: SpotifyMarket | None,
+        owner_digest: bytes,
+        idempotency_key: UUID,
     ) -> QueuedSourceJob:
-        """Commit one queued Source Extraction job.
+        """Commit or replay one owner-scoped queued Source Extraction job.
 
         Args:
             source_url: Validated public Source URL submitted by the caller.
             market: Optional requested Effective Market.
+            owner_digest: HMAC-derived anonymous owner identity.
+            idempotency_key: Caller-supplied owner-scoped replay identity.
 
         Returns:
-            The committed queued job snapshot.
+            The original queued job snapshot for this owner and idempotency key.
         """
         async with self._lock:
+            admission_key = (owner_digest, idempotency_key)
+            admitted_job = self._admissions.get(admission_key)
+            if admitted_job is not None:
+                return _copy_queued_job(admitted_job)
+
             submitted_at = self._clock()
             job = QueuedSourceJob(
                 job_id=self._uuid_factory(),
@@ -72,18 +83,27 @@ class InMemoryExtractionJobStore:
                 updated_at=submitted_at,
             )
             self._jobs[job.job_id] = job
-            return job
+            self._owners[job.job_id] = owner_digest
+            self._admissions[admission_key] = job
+            return _copy_queued_job(job)
 
-    async def get(self, job_id: UUID) -> SourceExtractionJob | None:
-        """Return one immutable Source Extraction job snapshot when it exists.
+    async def get_for_owner(
+        self,
+        job_id: UUID,
+        owner_digest: bytes,
+    ) -> SourceExtractionJob | None:
+        """Return one immutable Source Extraction job snapshot for its owner.
 
         Args:
             job_id: Opaque Source Extraction job identity.
+            owner_digest: HMAC-derived anonymous owner identity.
 
         Returns:
-            The current snapshot, or None when no job has that identity.
+            The current snapshot, or None when the job is absent or has another owner.
         """
         async with self._lock:
+            if self._owners.get(job_id) != owner_digest:
+                return None
             job = self._jobs.get(job_id)
             return _copy_job(job) if job is not None else None
 
@@ -192,6 +212,17 @@ def _copy_job(job: SourceExtractionJob) -> SourceExtractionJob:
     return job
 
 
+def _copy_queued_job(job: QueuedSourceJob) -> QueuedSourceJob:
+    """Return the immutable original admission snapshot."""
+    return QueuedSourceJob(
+        job_id=job.job_id,
+        source_url=job.source_url,
+        market=job.market,
+        submitted_at=job.submitted_at,
+        updated_at=job.updated_at,
+    )
+
+
 _EXTRACTION_JOB_TABLE = Table(
     "extraction_job",
     MetaData(),
@@ -207,6 +238,8 @@ _EXTRACTION_JOB_TABLE = Table(
     Column("result", postgresql.JSONB(), nullable=True),
     Column("error_code", Text(), nullable=True),
     Column("error_message", Text(), nullable=True),
+    Column("owner_digest", postgresql.BYTEA(), nullable=False),
+    Column("idempotency_key", postgresql.UUID(as_uuid=True), nullable=False),
 )
 
 
@@ -225,15 +258,19 @@ class PostgresExtractionJobStore:
         self,
         source_url: str,
         market: SpotifyMarket | None,
+        owner_digest: bytes,
+        idempotency_key: UUID,
     ) -> QueuedSourceJob:
-        """Commit one queued Source Extraction job before returning it.
+        """Commit or replay one owner-scoped queued Source Extraction job.
 
         Args:
             source_url: Validated public Source URL submitted by the caller.
             market: Optional requested Effective Market.
+            owner_digest: HMAC-derived anonymous owner identity.
+            idempotency_key: Caller-supplied owner-scoped replay identity.
 
         Returns:
-            The committed queued job snapshot.
+            The original queued job snapshot for this owner and idempotency key.
 
         Raises:
             ExtractionJobStoreUnavailableError: If PostgreSQL cannot commit admission.
@@ -241,38 +278,54 @@ class PostgresExtractionJobStore:
         submitted_at = datetime.now(UTC)
         try:
             async with self._engine.begin() as connection:
-                result = await connection.execute(
+                inserted = await connection.execute(
                     postgresql.insert(_EXTRACTION_JOB_TABLE)
                     .values(
                         job_id=uuid4(),
                         source_url=source_url,
                         market=market,
+                        owner_digest=owner_digest,
+                        idempotency_key=idempotency_key,
                         status=ExtractionJobStatus.QUEUED.value,
                         submitted_at=submitted_at,
                         updated_at=submitted_at,
                     )
+                    .on_conflict_do_nothing(
+                        index_elements=(
+                            _EXTRACTION_JOB_TABLE.c.owner_digest,
+                            _EXTRACTION_JOB_TABLE.c.idempotency_key,
+                        )
+                    )
                     .returning(*_EXTRACTION_JOB_TABLE.c)
                 )
-                row = result.mappings().one()
+                row = inserted.mappings().one_or_none()
+                if row is None:
+                    replay = await connection.execute(
+                        select(_EXTRACTION_JOB_TABLE).where(
+                            _EXTRACTION_JOB_TABLE.c.owner_digest == owner_digest,
+                            _EXTRACTION_JOB_TABLE.c.idempotency_key == idempotency_key,
+                        )
+                    )
+                    row = replay.mappings().one()
         except SQLAlchemyError as exc:
             raise ExtractionJobStoreUnavailableError(
                 "Source Extraction job storage is temporarily unavailable"
             ) from exc
-        job = _to_source_extraction_job(row)
-        if not isinstance(job, QueuedSourceJob):
-            raise ExtractionJobStateError(
-                "Source Extraction job admission did not return a queued job"
-            )
-        return job
+        return _to_queued_admission(row)
 
-    async def get(self, job_id: UUID) -> SourceExtractionJob | None:
-        """Return one current Source Extraction job snapshot.
+    async def get_for_owner(
+        self,
+        job_id: UUID,
+        owner_digest: bytes,
+    ) -> SourceExtractionJob | None:
+        """Return one current Source Extraction job snapshot for its owner.
 
         Args:
             job_id: Opaque Source Extraction job identity.
+            owner_digest: HMAC-derived anonymous owner identity.
 
         Returns:
-            The current snapshot, or None when no job has that identity.
+            The current snapshot, or None when no matching job has that identity.
 
         Raises:
             ExtractionJobStoreUnavailableError: If PostgreSQL cannot complete the read.
@@ -280,7 +333,10 @@ class PostgresExtractionJobStore:
         try:
             async with self._engine.connect() as connection:
                 result = await connection.execute(
-                    select(_EXTRACTION_JOB_TABLE).where(_EXTRACTION_JOB_TABLE.c.job_id == job_id)
+                    select(_EXTRACTION_JOB_TABLE).where(
+                        _EXTRACTION_JOB_TABLE.c.job_id == job_id,
+                        _EXTRACTION_JOB_TABLE.c.owner_digest == owner_digest,
+                    )
                 )
                 row = result.mappings().one_or_none()
         except SQLAlchemyError as exc:
@@ -452,6 +508,18 @@ async def create_production_extraction_job_store() -> PostgresExtractionJobStore
         await engine.dispose()
         raise
     return store
+
+
+def _to_queued_admission(row: RowMapping) -> QueuedSourceJob:
+    """Project one stored admission as its immutable original queued snapshot."""
+    market_value = cast(str | None, row["market"])
+    return QueuedSourceJob(
+        job_id=cast(UUID, row["job_id"]),
+        source_url=cast(str, row["source_url"]),
+        market=SpotifyMarket(market_value) if market_value is not None else None,
+        submitted_at=cast(datetime, row["submitted_at"]),
+        updated_at=cast(datetime, row["submitted_at"]),
+    )
 
 
 def _to_source_extraction_job(row: RowMapping) -> SourceExtractionJob:

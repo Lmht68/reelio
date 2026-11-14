@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings
 from reelio.cache import CacheConfig
 from reelio.config import AppConfig, Environment
 from reelio.database import DatabaseConfig
+from reelio.extraction.anonymous_owner import AnonymousOwnerConfig, AnonymousOwnerManager
 from reelio.extraction.coordination import CoordinationConfig
 from reelio.extraction.services.enrichment.config import OpenLibraryConfig, TMDBConfig
 from reelio.extraction.services.interpretation.config import (
@@ -20,6 +21,7 @@ from reelio.extraction.services.interpretation.config import (
     OpenAIConfig,
 )
 from reelio.extraction.services.textify import TextifyConfig
+from reelio.main import create_app
 
 
 def _without_dotenv[SettingsType: BaseSettings](
@@ -622,3 +624,38 @@ def test_textify_uses_thirty_day_result_retention_by_default() -> None:
     settings = _without_dotenv(TextifyConfig)
 
     assert settings.result_retention_seconds == 2_592_000
+
+
+def test_anonymous_owner_requires_a_nonblank_hmac_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject missing and blank anonymous-owner credentials at startup."""
+    monkeypatch.delenv("REELIO_ANONYMOUS_OWNER_HMAC_SECRET", raising=False)
+    with pytest.raises(ValidationError):
+        _without_dotenv(AnonymousOwnerConfig)
+
+    with pytest.raises(ValidationError, match="must not be blank"):
+        _without_dotenv(AnonymousOwnerConfig, hmac_secret="   ")
+
+    settings = _without_dotenv(
+        AnonymousOwnerConfig,
+        hmac_secret="anonymous-owner-secret",
+        environment=Environment.PRODUCTION,
+    )
+
+    assert settings.hmac_secret.get_secret_value() == "anonymous-owner-secret"
+    assert settings.environment is Environment.PRODUCTION
+
+
+def test_create_app_retains_the_injected_anonymous_owner_manager() -> None:
+    """Keep deterministic anonymous-owner configuration on application state."""
+    manager = AnonymousOwnerManager(
+        _without_dotenv(
+            AnonymousOwnerConfig,
+            hmac_secret="anonymous-owner-secret",
+        )
+    )
+
+    application = create_app(anonymous_owner_manager=manager)
+
+    assert application.state.anonymous_owner_manager is manager

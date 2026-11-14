@@ -19,6 +19,8 @@ _COORDINATION_TABLE_NAME = "textify_coordination"
 _EXTRACTION_JOB_TABLE_NAME = "extraction_job"
 _EXPIRATION_INDEX = "textify_coordination_expires_at_id_idx"
 _QUEUED_INDEX = "extraction_job_queued_submitted_at_job_id_idx"
+_OWNER_DIGEST_LENGTH_CONSTRAINT = "extraction_job_owner_digest_length_check"
+_OWNER_IDEMPOTENCY_UNIQUE = "extraction_job_owner_idempotency_key_key"
 _CAPABILITY_PATH_PREFIX = "/api/v1/transcription-jobs/"
 
 
@@ -161,6 +163,8 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             ("result", "jsonb", "YES", None),
             ("error_code", "text", "YES", None),
             ("error_message", "text", "YES", None),
+            ("owner_digest", "bytea", "NO", None),
+            ("idempotency_key", "uuid", "NO", None),
         ]
         assert set(extraction_job_constraint_names.all()) == {
             "extraction_job_pkey",
@@ -172,6 +176,8 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             "extraction_job_result_object_check",
             "extraction_job_terminal_text_check",
             "extraction_job_lifecycle_state_check",
+            _OWNER_DIGEST_LENGTH_CONSTRAINT,
+            _OWNER_IDEMPOTENCY_UNIQUE,
         }
         assert set(constraint_names.all()) == {
             "textify_coordination_pkey",
@@ -332,5 +338,82 @@ async def test_coordination_migration_enforces_persisted_invariants(
                 expires_at=accepted_updated_at,
             ),
         )
+    finally:
+        await engine.dispose()
+
+
+async def test_anonymous_job_ownership_migration_backfills_and_scopes_idempotency(
+    coordination_database: str,
+) -> None:
+    """Backfill unclaimable owners and enforce owner-scoped replay identities."""
+    await asyncio.to_thread(command.upgrade, _alembic_config(), "0003_extraction_job")
+    engine = create_async_engine(coordination_database)
+    submitted_at = datetime(2026, 10, 15, tzinfo=UTC)
+    legacy_job_id = uuid4()
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO extraction_job "
+                    "(job_id, source_url, status, submitted_at, updated_at) "
+                    "VALUES (:job_id, :source_url, 'queued', :submitted_at, :updated_at)"
+                ),
+                {
+                    "job_id": legacy_job_id,
+                    "source_url": "https://www.youtube.com/watch?v=legacy",
+                    "submitted_at": submitted_at,
+                    "updated_at": submitted_at,
+                },
+            )
+
+        await asyncio.to_thread(_upgrade_head)
+
+        async with engine.connect() as connection:
+            legacy_owner_digest, legacy_idempotency_key = (
+                await connection.execute(
+                    text(
+                        "SELECT owner_digest, idempotency_key FROM extraction_job "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {"job_id": legacy_job_id},
+                )
+            ).one()
+
+        assert isinstance(legacy_owner_digest, bytes)
+        assert len(legacy_owner_digest) == 32
+        assert isinstance(legacy_idempotency_key, UUID)
+        assert legacy_idempotency_key.version == 4
+
+        async def insert_job(owner_digest: bytes, idempotency_key: UUID) -> None:
+            """Insert one minimally valid owner-bound queued job."""
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO extraction_job "
+                        "(job_id, source_url, status, submitted_at, updated_at, "
+                        "owner_digest, idempotency_key) "
+                        "VALUES (:job_id, :source_url, 'queued', :submitted_at, "
+                        ":updated_at, :owner_digest, :idempotency_key)"
+                    ),
+                    {
+                        "job_id": uuid4(),
+                        "source_url": "https://www.youtube.com/watch?v=owner-bound",
+                        "submitted_at": submitted_at,
+                        "updated_at": submitted_at,
+                        "owner_digest": owner_digest,
+                        "idempotency_key": idempotency_key,
+                    },
+                )
+
+        owner_a = b"a" * 32
+        owner_b = b"b" * 32
+        idempotency_key = uuid4()
+        await insert_job(owner_a, idempotency_key)
+        await insert_job(owner_b, idempotency_key)
+
+        with pytest.raises(IntegrityError):
+            await insert_job(owner_a, idempotency_key)
+        with pytest.raises(IntegrityError):
+            await insert_job(b"short-owner-digest", uuid4())
     finally:
         await engine.dispose()

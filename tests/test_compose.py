@@ -18,6 +18,7 @@ _REQUIRED_ENVIRONMENT = {
     "REELIO_POSTGRES_USER": "reelio",
     "REELIO_POSTGRES_PASSWORD": "url-safe-postgres-password",
     "REELIO_COORDINATION_HMAC_SECRET": "coordination-hmac-secret",
+    "REELIO_ANONYMOUS_OWNER_HMAC_SECRET": "anonymous-owner-hmac-secret",
     "REELIO_CACHE_KEY_SECRET": "cache-key-secret",
     "REELIO_LLM_PROVIDER": "deepseek",
     "REELIO_TMDB_API_KEY": "tmdb-api-key",
@@ -234,6 +235,7 @@ def test_compose_renders_local_deployment_contract() -> None:
     api_environment = api["environment"]
     assert isinstance(api_environment, dict)
     assert api_environment["REELIO_ENVIRONMENT"] == "local"
+    assert api_environment["REELIO_ANONYMOUS_OWNER_HMAC_SECRET"] == ("anonymous-owner-hmac-secret")
     assert api_environment["REELIO_CACHE_ENABLED"] == "true"
     assert api_environment["REELIO_CACHE_REDIS_URL"] == "redis://redis:6379/0"
     assert api_environment["REELIO_TEXTIFY_ORIGIN"] == "http://textify:8182"

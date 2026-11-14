@@ -99,29 +99,38 @@ class ExtractionJobStore(Protocol):
         self,
         source_url: str,
         market: SpotifyMarket | None,
+        owner_digest: bytes,
+        idempotency_key: UUID,
     ) -> QueuedSourceJob:
-        """Commit one queued Source Extraction job.
+        """Commit or replay one owner-scoped queued Source Extraction job.
 
         Args:
             source_url: Validated public Source URL submitted by the caller.
             market: Optional requested Effective Market.
+            owner_digest: HMAC-derived anonymous owner identity.
+            idempotency_key: Caller-supplied owner-scoped replay identity.
 
         Returns:
-            The committed queued job snapshot.
+            The original queued job snapshot for this owner and idempotency key.
 
         Raises:
             ExtractionJobStoreUnavailableError: If durable admission cannot commit.
         """
         ...
 
-    async def get(self, job_id: UUID) -> SourceExtractionJob | None:
-        """Return one current Source Extraction job snapshot when it exists.
+    async def get_for_owner(
+        self,
+        job_id: UUID,
+        owner_digest: bytes,
+    ) -> SourceExtractionJob | None:
+        """Return one current Source Extraction job for its anonymous owner.
 
         Args:
             job_id: Opaque Source Extraction job identity.
+            owner_digest: HMAC-derived anonymous owner identity.
 
         Returns:
-            The current snapshot, or None when no job has that identity.
+            The current snapshot, or None when the job is absent or has another owner.
 
         Raises:
             ExtractionJobStoreUnavailableError: If storage cannot complete the read.

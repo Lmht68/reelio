@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from reelio.config import Environment, app_settings
+from reelio.extraction.anonymous_owner import AnonymousOwnerConfig, AnonymousOwnerManager
 from reelio.extraction.exceptions import (
     ExtractionError,
     extraction_error_handler,
@@ -83,6 +84,7 @@ def _lifespan_for(
 def create_app(
     pipeline_factory: _PipelineFactory | None = None,
     job_store_factory: _JobStoreFactory | None = None,
+    anonymous_owner_manager: AnonymousOwnerManager | None = None,
 ) -> FastAPI:
     """Build and configure the Reelio FastAPI application.
 
@@ -92,6 +94,8 @@ def create_app(
         job_store_factory: Optional asynchronous factory used to compose the
             lifespan-owned durable Source Extraction job store. The production factory
             is used when omitted.
+        anonymous_owner_manager: Optional owner-cookie manager used by extraction-job
+            routes. The environment-configured production manager is used when omitted.
 
     Returns:
         FastAPI: The composed application instance.
@@ -104,6 +108,9 @@ def create_app(
             job_store_factory or create_production_extraction_job_store,
         )
     )
+    owner_manager = anonymous_owner_manager or AnonymousOwnerManager(
+        AnonymousOwnerConfig()  # type: ignore[call-arg]  # BaseSettings resolves the required secret.
+    )
     configure_logging(app_settings.log_level)
     application = FastAPI(
         title="Reelio API",
@@ -112,6 +119,7 @@ def create_app(
         openapi_url=("/openapi.json" if app_settings.environment in _DOCS_ENVIRONMENTS else None),
         lifespan=configured_lifespan,
     )
+    application.state.anonymous_owner_manager = owner_manager
     application.include_router(ops_router)
     application.include_router(extraction_router)
     application.include_router(extraction_job_router)

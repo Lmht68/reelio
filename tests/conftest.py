@@ -15,6 +15,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 os.environ.setdefault("REELIO_LLM_PROVIDER", "deepseek")
+os.environ.setdefault("REELIO_ANONYMOUS_OWNER_HMAC_SECRET", "test-anonymous-owner-hmac-secret")
 os.environ.setdefault("REELIO_DEEPSEEK_API_KEY", "test-deepseek-key")
 os.environ.setdefault("REELIO_TMDB_API_KEY", "test-tmdb-key")
 os.environ.setdefault("REELIO_SPOTIFY_CLIENT_ID", "test-spotify-client-id")
