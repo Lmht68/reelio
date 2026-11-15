@@ -12,6 +12,7 @@ from reelio.config import AppConfig, Environment
 from reelio.database import DatabaseConfig
 from reelio.extraction.anonymous_owner import AnonymousOwnerConfig, AnonymousOwnerManager
 from reelio.extraction.coordination import CoordinationConfig
+from reelio.extraction.job_config import ExtractionJobConfig
 from reelio.extraction.services.enrichment.config import OpenLibraryConfig, TMDBConfig
 from reelio.extraction.services.interpretation.config import (
     DeepSeekConfig,
@@ -31,6 +32,45 @@ def _without_dotenv[SettingsType: BaseSettings](
     """Instantiate a settings class without reading the repository .env file."""
     constructor = cast(Callable[..., SettingsType], settings_type)
     return constructor(_env_file=None, **values)
+
+
+def test_extraction_job_configuration_defaults() -> None:
+    """Use the documented worker concurrency and active admission defaults."""
+    settings = _without_dotenv(ExtractionJobConfig)
+
+    assert settings.worker_concurrency == 2
+    assert settings.active_job_cap == 10
+
+
+def test_extraction_job_configuration_reads_exact_environment_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read only the extraction job worker and active-cap environment settings."""
+    monkeypatch.setenv("REELIO_EXTRACTION_WORKER_CONCURRENCY", "3")
+    monkeypatch.setenv("REELIO_EXTRACTION_ACTIVE_JOB_CAP", "11")
+
+    settings = _without_dotenv(ExtractionJobConfig)
+
+    assert settings.worker_concurrency == 3
+    assert settings.active_job_cap == 11
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("worker_concurrency", 0),
+        ("worker_concurrency", -1),
+        ("active_job_cap", 0),
+        ("active_job_cap", -1),
+    ],
+)
+def test_extraction_job_configuration_rejects_nonpositive_capacity(
+    field_name: str,
+    value: int,
+) -> None:
+    """Require positive worker and admission capacity settings."""
+    with pytest.raises(ValidationError):
+        _without_dotenv(ExtractionJobConfig, **{field_name: value})
 
 
 def test_tmdb_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,5 +1,6 @@
 """Deterministic contract tests for Source Extraction job storage."""
 
+import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import UUID
@@ -9,6 +10,7 @@ import pytest
 from reelio.extraction.job_store import InMemoryExtractionJobStore
 from reelio.extraction.jobs import (
     EXTRACTION_RESPONSE_VERSION,
+    ExtractionJobCapacityExceededError,
     ExtractionJobStateError,
     ExtractionJobStatus,
     QueuedSourceJob,
@@ -101,6 +103,82 @@ async def _admit(
         owner_digest=owner_digest,
         idempotency_key=idempotency_key,
     )
+
+
+@pytest.mark.parametrize("active_job_cap", [0, -1])
+def test_in_memory_store_rejects_nonpositive_active_job_capacity(active_job_cap: int) -> None:
+    """Require a positive direct active job capacity."""
+    with pytest.raises(ValueError, match="active_job_cap must be positive"):
+        InMemoryExtractionJobStore(active_job_cap=active_job_cap)
+
+
+async def test_concurrent_admission_caps_active_jobs_and_releases_rejected_keys() -> None:
+    """Admit ten active jobs, replay them, then release a rejected key after success."""
+    idempotency_keys = tuple(_idempotency_key(number) for number in range(1, 12))
+    job_ids = tuple(UUID(f"10000000-0000-4000-8000-{number:012d}") for number in range(1, 12))
+    store = InMemoryExtractionJobStore(
+        clock=lambda: _SUBMITTED_AT,
+        uuid_factory=_uuid_factory(*job_ids),
+        active_job_cap=10,
+    )
+
+    outcomes = await asyncio.gather(
+        *(_admit(store, idempotency_key=idempotency_key) for idempotency_key in idempotency_keys),
+        return_exceptions=True,
+    )
+    admitted = [
+        (idempotency_key, outcome)
+        for idempotency_key, outcome in zip(idempotency_keys, outcomes, strict=True)
+        if isinstance(outcome, QueuedSourceJob)
+    ]
+    rejected_keys = [
+        idempotency_key
+        for idempotency_key, outcome in zip(idempotency_keys, outcomes, strict=True)
+        if isinstance(outcome, ExtractionJobCapacityExceededError)
+    ]
+
+    assert len(admitted) == 10
+    assert all(job.status is ExtractionJobStatus.QUEUED for _, job in admitted)
+    assert len(rejected_keys) == 1
+
+    replayed = await _admit(store, idempotency_key=admitted[0][0])
+    assert replayed == admitted[0][1]
+
+    running = await store.claim_next_source()
+    assert running is not None
+    await store.complete_success(running.job_id, _response())
+
+    admitted_after_completion = await _admit(store, idempotency_key=rejected_keys[0])
+    assert admitted_after_completion.job_id == job_ids[10]
+
+
+async def test_capacity_rejection_does_not_read_clock_or_identity() -> None:
+    """Reject a full admission before consuming time or a Source job identifier."""
+    clock_calls = 0
+    identity_calls = 0
+
+    def clock() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        return _SUBMITTED_AT
+
+    def uuid_factory() -> UUID:
+        nonlocal identity_calls
+        identity_calls += 1
+        return UUID("00000000-0000-4000-8000-000000000001")
+
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=uuid_factory,
+        active_job_cap=1,
+    )
+    await _admit(store, idempotency_key=_idempotency_key(1))
+
+    with pytest.raises(ExtractionJobCapacityExceededError):
+        await _admit(store, idempotency_key=_idempotency_key(2))
+
+    assert clock_calls == 1
+    assert identity_calls == 1
 
 
 async def test_admission_returns_one_deterministic_queued_snapshot() -> None:

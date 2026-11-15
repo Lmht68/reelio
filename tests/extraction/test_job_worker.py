@@ -1,12 +1,13 @@
-"""Behavioral tests for one-slot Source Extraction job execution."""
+"""Behavioral tests for bounded Source Extraction job execution."""
 
 import asyncio
 from uuid import UUID
 
+import pytest
 from httpx import ASGITransport, AsyncClient
 
 from reelio.extraction.job_store import InMemoryExtractionJobStore
-from reelio.extraction.jobs import SucceededSourceJob
+from reelio.extraction.jobs import QueuedSourceJob, SucceededSourceJob
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.service import ExtractionPipeline
 from reelio.extraction.types import (
@@ -219,6 +220,46 @@ class _BlockingPipeline(_RecordingPipeline):
         return self._result
 
 
+class _ThreeJobBlockingPipeline(_RecordingPipeline):
+    """Block three Source jobs to observe a two-slot scheduler."""
+
+    def __init__(self, result: PipelineResult) -> None:
+        """Initialize controls for two blocked jobs followed by one queued job.
+
+        Args:
+            result: Result returned after each job is released.
+        """
+        super().__init__(result)
+        self.first_two_started = asyncio.Event()
+        self.third_started = asyncio.Event()
+        self.release_first_calls = (asyncio.Event(), asyncio.Event())
+        self.release_third = asyncio.Event()
+        self.running_calls = 0
+        self.peak_overlap = 0
+
+    async def run(
+        self,
+        url: str,
+        market: SpotifyMarket | None = None,
+    ) -> PipelineResult:
+        """Block each call until its deterministic test release."""
+        call_index = len(self.calls)
+        self.calls.append((url, market))
+        self.running_calls += 1
+        self.peak_overlap = max(self.peak_overlap, self.running_calls)
+        if call_index == 1:
+            self.first_two_started.set()
+
+        if call_index < 2:
+            await self.release_first_calls[call_index].wait()
+        else:
+            self.third_started.set()
+            await self.release_third.wait()
+
+        self.running_calls -= 1
+        return self._result
+
+
 class _BlockingSourceTranscriptProvider:
     """Block real pipeline acquisition until the lifecycle test releases it."""
 
@@ -261,26 +302,81 @@ class _BlockingSourceTranscriptProvider:
         """Release no resources for the blocked deterministic provider."""
 
 
-async def test_concurrent_run_once_calls_do_not_overlap_pipeline_execution() -> None:
-    """Serialize calls made concurrently to one one-slot worker instance."""
-    store = InMemoryExtractionJobStore(
-        uuid_factory=lambda: UUID("00000000-0000-4000-8000-000000000001")
+@pytest.mark.parametrize("concurrency", [0, -1])
+def test_worker_rejects_nonpositive_concurrency(concurrency: int) -> None:
+    """Require a positive worker slot count."""
+    with pytest.raises(ValueError, match="concurrency must be positive"):
+        ExtractionJobWorker(
+            InMemoryExtractionJobStore(),
+            _RecordingPipeline(_pipeline_result(SpotifyMarket("US"))),
+            concurrency=concurrency,
+        )
+
+
+async def test_run_until_idle_honors_a_configured_single_slot() -> None:
+    """Keep a second job queued until the configured single slot completes."""
+    job_ids = (
+        UUID("00000000-0000-4000-8000-000000000001"),
+        UUID("00000000-0000-4000-8000-000000000002"),
     )
+    store = InMemoryExtractionJobStore(uuid_factory=iter(job_ids).__next__)
     await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
+    await store.admit_source(
+        "https://www.youtube.com/watch?v=second",
+        None,
+        _OWNER_DIGEST,
+        UUID("00000000-0000-4000-8000-000000000002"),
+    )
     pipeline = _BlockingPipeline(_pipeline_result(SpotifyMarket("US")))
-    worker = ExtractionJobWorker(store, pipeline)
+    worker = ExtractionJobWorker(store, pipeline, concurrency=1)
 
-    first_run = asyncio.create_task(worker.run_once())
+    worker_run = asyncio.create_task(worker.run_until_idle())
     await pipeline.started.wait()
-    second_run = asyncio.create_task(worker.run_once())
-    await asyncio.sleep(0)
 
+    second_job = await store.get_for_owner(job_ids[1], _OWNER_DIGEST)
+    assert isinstance(second_job, QueuedSourceJob)
     assert pipeline.calls == [(_SUBMITTED_URL, None)]
+
     pipeline.release.set()
 
-    assert await first_run is True
-    assert await second_run is False
+    assert await worker_run == 2
     assert pipeline.overlapped is False
+
+
+async def test_run_until_idle_uses_two_slots_then_claims_the_third_job() -> None:
+    """Hold two jobs running until either completion frees the third queued job."""
+    job_ids = tuple(UUID(f"00000000-0000-4000-8000-{number:012d}") for number in range(1, 4))
+    store = InMemoryExtractionJobStore(uuid_factory=iter(job_ids).__next__)
+    for number in range(1, 4):
+        await store.admit_source(
+            f"https://www.youtube.com/watch?v=job-{number}",
+            None,
+            _OWNER_DIGEST,
+            UUID(f"10000000-0000-4000-8000-{number:012d}"),
+        )
+    pipeline = _ThreeJobBlockingPipeline(_pipeline_result(SpotifyMarket("US")))
+    worker = ExtractionJobWorker(store, pipeline)
+
+    worker_run = asyncio.create_task(worker.run_until_idle())
+    await pipeline.first_two_started.wait()
+
+    third_job = await store.get_for_owner(job_ids[2], _OWNER_DIGEST)
+    assert isinstance(third_job, QueuedSourceJob)
+    assert pipeline.running_calls == 2
+    assert pipeline.peak_overlap == 2
+
+    pipeline.release_first_calls[0].set()
+    await pipeline.third_started.wait()
+
+    assert pipeline.peak_overlap == 2
+
+    pipeline.release_first_calls[1].set()
+    pipeline.release_third.set()
+
+    assert await worker_run == 3
+    for job_id in job_ids:
+        completed_job = await store.get_for_owner(job_id, _OWNER_DIGEST)
+        assert isinstance(completed_job, SucceededSourceJob)
 
 
 async def test_public_job_lifecycle_runs_the_real_pipeline_and_mapper() -> None:
@@ -350,11 +446,11 @@ async def test_public_job_lifecycle_runs_the_real_pipeline_and_mapper() -> None:
                 headers={"Idempotency-Key": str(_IDEMPOTENCY_KEY)},
             )
             queued = await client.get(f"/api/extraction-jobs/{job_id}")
-            worker_run = asyncio.create_task(worker.run_once())
+            worker_run = asyncio.create_task(worker.run_until_idle())
             await source_provider.started.wait()
             running = await client.get(f"/api/extraction-jobs/{job_id}")
             source_provider.release.set()
-            assert await worker_run is True
+            assert await worker_run == 1
             succeeded = await client.get(f"/api/extraction-jobs/{job_id}")
 
     assert admitted.status_code == 202

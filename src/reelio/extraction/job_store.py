@@ -6,15 +6,17 @@ from datetime import UTC, datetime
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import Column, DateTime, MetaData, String, Table, Text, select, text, update
+from sqlalchemy import Column, DateTime, MetaData, String, Table, Text, func, select, text, update
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from reelio.database import CURRENT_SCHEMA_REVISION, DatabaseConfig
+from reelio.extraction.job_config import ExtractionJobConfig
 from reelio.extraction.jobs import (
     EXTRACTION_RESPONSE_VERSION,
+    ExtractionJobCapacityExceededError,
     ExtractionJobStateError,
     ExtractionJobStatus,
     ExtractionJobStoreUnavailableError,
@@ -36,15 +38,24 @@ class InMemoryExtractionJobStore:
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         uuid_factory: Callable[[], UUID] = uuid4,
+        active_job_cap: int = 10,
     ) -> None:
         """Initialize an empty store with injectable identity and UTC time sources.
 
         Args:
             clock: UTC clock used for every committed lifecycle timestamp.
             uuid_factory: UUID4 factory used when admitting Source jobs.
+            active_job_cap: Maximum queued and running Source jobs admitted at once.
+
+        Raises:
+            ValueError: If active_job_cap is not positive.
         """
+        if active_job_cap <= 0:
+            raise ValueError("active_job_cap must be positive")
+
         self._clock = clock
         self._uuid_factory = uuid_factory
+        self._active_job_cap = active_job_cap
         self._jobs: dict[UUID, SourceExtractionJob] = {}
         self._owners: dict[UUID, bytes] = {}
         self._admissions: dict[tuple[bytes, UUID], QueuedSourceJob] = {}
@@ -67,12 +78,23 @@ class InMemoryExtractionJobStore:
 
         Returns:
             The original queued job snapshot for this owner and idempotency key.
+
+        Raises:
+            ExtractionJobCapacityExceededError: If active job capacity is full.
         """
         async with self._lock:
             admission_key = (owner_digest, idempotency_key)
             admitted_job = self._admissions.get(admission_key)
             if admitted_job is not None:
                 return _copy_queued_job(admitted_job)
+
+            active_job_count = sum(
+                isinstance(job, QueuedSourceJob | RunningSourceJob) for job in self._jobs.values()
+            )
+            if active_job_count >= self._active_job_cap:
+                raise ExtractionJobCapacityExceededError(
+                    "Source Extraction job capacity is temporarily full"
+                )
 
             submitted_at = self._clock()
             job = QueuedSourceJob(
@@ -246,13 +268,21 @@ _EXTRACTION_JOB_TABLE = Table(
 class PostgresExtractionJobStore:
     """Persist Source Extraction jobs through an owned async SQLAlchemy engine."""
 
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(self, engine: AsyncEngine, *, active_job_cap: int = 10) -> None:
         """Initialize the store with an exclusively owned database engine.
 
         Args:
             engine: Async engine used only for Source Extraction job storage.
+            active_job_cap: Maximum queued and running Source jobs admitted at once.
+
+        Raises:
+            ValueError: If active_job_cap is not positive.
         """
+        if active_job_cap <= 0:
+            raise ValueError("active_job_cap must be positive")
+
         self._engine = engine
+        self._active_job_cap = active_job_cap
 
     async def admit_source(
         self,
@@ -273,11 +303,47 @@ class PostgresExtractionJobStore:
             The original queued job snapshot for this owner and idempotency key.
 
         Raises:
+            ExtractionJobCapacityExceededError: If active job capacity is full.
             ExtractionJobStoreUnavailableError: If PostgreSQL cannot commit admission.
         """
-        submitted_at = datetime.now(UTC)
         try:
             async with self._engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtextextended('reelio.extraction_job.admission', 0))"
+                    )
+                )
+                replay = await connection.execute(
+                    select(_EXTRACTION_JOB_TABLE).where(
+                        _EXTRACTION_JOB_TABLE.c.owner_digest == owner_digest,
+                        _EXTRACTION_JOB_TABLE.c.idempotency_key == idempotency_key,
+                    )
+                )
+                replay_row = replay.mappings().one_or_none()
+                if replay_row is not None:
+                    return _to_queued_admission(replay_row)
+
+                active_job_count = (
+                    await connection.execute(
+                        select(func.count())
+                        .select_from(_EXTRACTION_JOB_TABLE)
+                        .where(
+                            _EXTRACTION_JOB_TABLE.c.status.in_(
+                                (
+                                    ExtractionJobStatus.QUEUED.value,
+                                    ExtractionJobStatus.RUNNING.value,
+                                )
+                            )
+                        )
+                    )
+                ).scalar_one()
+                if active_job_count >= self._active_job_cap:
+                    raise ExtractionJobCapacityExceededError(
+                        "Source Extraction job capacity is temporarily full"
+                    )
+
+                submitted_at = datetime.now(UTC)
                 inserted = await connection.execute(
                     postgresql.insert(_EXTRACTION_JOB_TABLE)
                     .values(
@@ -495,13 +561,14 @@ async def create_production_extraction_job_store() -> PostgresExtractionJobStore
         ExtractionJobStoreUnavailableError: If PostgreSQL cannot provide the required
             writable schema.
     """
-    settings = DatabaseConfig()  # type: ignore[call-arg]
+    database_settings = DatabaseConfig()  # type: ignore[call-arg]
+    job_settings = ExtractionJobConfig()
     engine = create_async_engine(
-        settings.database_url.get_secret_value(),
+        database_settings.database_url.get_secret_value(),
         hide_parameters=True,
         pool_pre_ping=True,
     )
-    store = PostgresExtractionJobStore(engine)
+    store = PostgresExtractionJobStore(engine, active_job_cap=job_settings.active_job_cap)
     try:
         await store._verify_ready()
     except BaseException:

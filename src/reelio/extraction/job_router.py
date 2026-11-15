@@ -13,6 +13,7 @@ from reelio.extraction.anonymous_owner import (
     AnonymousOwnerManager,
 )
 from reelio.extraction.jobs import (
+    ExtractionJobCapacityExceededError,
     ExtractionJobStore,
     ExtractionJobStoreUnavailableError,
     FailedSourceJob,
@@ -70,7 +71,10 @@ IdempotencyKeyHeader = Annotated[UUID, Header(alias="Idempotency-Key")]
     responses={
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "model": extraction_schemas.ErrorResponse,
-            "description": "Durable Source Extraction job storage is temporarily unavailable.",
+            "description": (
+                "Source Extraction admission is temporarily unavailable because service "
+                "capacity is full or durable storage is unavailable."
+            ),
         },
     },
 )
@@ -102,6 +106,10 @@ async def admit_source_extraction_job(
             owner.digest,
             idempotency_key,
         )
+    except ExtractionJobCapacityExceededError:
+        response = _capacity_response()
+        owner_manager.set_cookie(response, owner)
+        return response
     except ExtractionJobStoreUnavailableError:
         response = _unavailable_response()
         owner_manager.set_cookie(response, owner)
@@ -239,6 +247,24 @@ def _unavailable_response() -> JSONResponse:
             "error": {
                 "code": "extraction_unavailable",
                 "message": "Extraction is temporarily unavailable.",
+            }
+        },
+        headers=_UNAVAILABLE_HEADERS,
+    )
+
+
+def _capacity_response() -> JSONResponse:
+    """Return the safe retryable response for temporarily full job capacity.
+
+    Returns:
+        Retryable no-store extraction-capacity error response.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "error": {
+                "code": "extraction_capacity_exceeded",
+                "message": "Extraction capacity is temporarily full.",
             }
         },
         headers=_UNAVAILABLE_HEADERS,

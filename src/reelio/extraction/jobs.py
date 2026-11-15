@@ -21,6 +21,10 @@ class ExtractionJobStatus(StrEnum):
     FAILED = "failed"
 
 
+class ExtractionJobCapacityExceededError(RuntimeError):
+    """Indicate that active Source Extraction job capacity is full."""
+
+
 class ExtractionJobStoreUnavailableError(RuntimeError):
     """Indicate that durable Source Extraction job storage is unavailable."""
 
@@ -114,6 +118,7 @@ class ExtractionJobStore(Protocol):
             The original queued job snapshot for this owner and idempotency key.
 
         Raises:
+            ExtractionJobCapacityExceededError: If active admission capacity is full.
             ExtractionJobStoreUnavailableError: If durable admission cannot commit.
         """
         ...

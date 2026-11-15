@@ -139,6 +139,57 @@ async def test_submission_commits_and_exposes_a_queued_job() -> None:
     assert observed.headers["Retry-After"] == "1"
 
 
+async def test_submission_returns_capacity_response_and_retries_rejected_key() -> None:
+    """Return safe capacity guidance without consuming the rejected idempotency key."""
+    idempotency_keys = tuple(
+        UUID(f"00000000-0000-4000-8000-{number:012d}") for number in range(1, 12)
+    )
+    job_ids = tuple(UUID(f"10000000-0000-4000-8000-{number:012d}") for number in range(1, 12))
+    store = InMemoryExtractionJobStore(
+        active_job_cap=10,
+        uuid_factory=iter(job_ids).__next__,
+    )
+    application = _application(store)
+    transport = ASGITransport(app=application)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        admitted = [
+            await client.post(
+                "/api/extraction-jobs",
+                json={"url": _SUBMITTED_URL},
+                headers=_headers(idempotency_key),
+            )
+            for idempotency_key in idempotency_keys[:10]
+        ]
+        rejected = await client.post(
+            "/api/extraction-jobs",
+            json={"url": _SUBMITTED_URL},
+            headers=_headers(idempotency_keys[10]),
+        )
+        running = await store.claim_next_source()
+        assert running is not None
+        await store.complete_success(running.job_id, _response())
+        retried = await client.post(
+            "/api/extraction-jobs",
+            json={"url": _SUBMITTED_URL},
+            headers=_headers(idempotency_keys[10]),
+        )
+
+    assert [response.status_code for response in admitted] == [202] * 10
+    assert rejected.status_code == 503
+    assert rejected.json() == {
+        "error": {
+            "code": "extraction_capacity_exceeded",
+            "message": "Extraction capacity is temporarily full.",
+        }
+    }
+    assert rejected.headers["Cache-Control"] == "no-store"
+    assert rejected.headers["Retry-After"] == "2"
+    assert _OWNER_COOKIE_NAME in rejected.headers["set-cookie"]
+    assert retried.status_code == 202
+    assert retried.json() == {"job_id": str(job_ids[10]), "status": "queued"}
+
+
 async def test_status_projects_only_queued_running_and_succeeded_fields() -> None:
     """Hide durable input and metadata while preserving the exact success result."""
     job_id = UUID("00000000-0000-4000-8000-000000000001")
