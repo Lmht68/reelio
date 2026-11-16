@@ -22,6 +22,8 @@ _QUEUED_INDEX = "extraction_job_queued_submitted_at_job_id_idx"
 _OWNER_DIGEST_LENGTH_CONSTRAINT = "extraction_job_owner_digest_length_check"
 _OWNER_IDEMPOTENCY_UNIQUE = "extraction_job_owner_idempotency_key_key"
 _CAPABILITY_PATH_PREFIX = "/api/v1/transcription-jobs/"
+_LEASE_TOKEN_CONSTRAINT = "extraction_job_lease_token_uuid4_check"
+_RUNNING_LEASE_INDEX = "extraction_job_running_lease_expires_at_idx"
 
 
 def _alembic_config() -> Config:
@@ -137,10 +139,22 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             queued_index = await connection.scalar(
                 text(f"SELECT to_regclass('public.{_QUEUED_INDEX}')")
             )
-
+            running_lease_index = await connection.scalar(
+                text(f"SELECT to_regclass('public.{_RUNNING_LEASE_INDEX}')")
+            )
+            running_lease_index_definition = await connection.scalar(
+                text(
+                    "SELECT indexdef FROM pg_indexes "
+                    "WHERE schemaname = 'public' AND indexname = :index_name"
+                ),
+                {"index_name": _RUNNING_LEASE_INDEX},
+            )
         assert revision == _REVISION
         assert expiration_index == _EXPIRATION_INDEX
         assert queued_index == _QUEUED_INDEX
+        assert running_lease_index == _RUNNING_LEASE_INDEX
+        assert running_lease_index_definition is not None
+        assert "WHERE (status = 'running'::text)" in running_lease_index_definition
         assert columns.all() == [
             ("id", "bigint", "NO", "ALWAYS"),
             ("url_identity", "bytea", "NO", None),
@@ -165,6 +179,8 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             ("error_message", "text", "YES", None),
             ("owner_digest", "bytea", "NO", None),
             ("idempotency_key", "uuid", "NO", None),
+            ("lease_token", "uuid", "YES", None),
+            ("lease_expires_at", "timestamp with time zone", "YES", None),
         ]
         assert set(extraction_job_constraint_names.all()) == {
             "extraction_job_pkey",
@@ -178,6 +194,7 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             "extraction_job_lifecycle_state_check",
             _OWNER_DIGEST_LENGTH_CONSTRAINT,
             _OWNER_IDEMPOTENCY_UNIQUE,
+            _LEASE_TOKEN_CONSTRAINT,
         }
         assert set(constraint_names.all()) == {
             "textify_coordination_pkey",
@@ -205,12 +222,16 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             queued_index = await connection.scalar(
                 text(f"SELECT to_regclass('public.{_QUEUED_INDEX}')")
             )
+            running_lease_index = await connection.scalar(
+                text(f"SELECT to_regclass('public.{_RUNNING_LEASE_INDEX}')")
+            )
 
         assert table is None
         assert revision is None
         assert expiration_index is None
         assert extraction_job_table is None
         assert queued_index is None
+        assert running_lease_index is None
 
         await asyncio.to_thread(_upgrade_head)
 
@@ -228,12 +249,16 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             queued_index = await connection.scalar(
                 text(f"SELECT to_regclass('public.{_QUEUED_INDEX}')")
             )
+            running_lease_index = await connection.scalar(
+                text(f"SELECT to_regclass('public.{_RUNNING_LEASE_INDEX}')")
+            )
 
         assert revision == _REVISION
         assert table == _COORDINATION_TABLE_NAME
         assert expiration_index == _EXPIRATION_INDEX
         assert extraction_job_table == _EXTRACTION_JOB_TABLE_NAME
         assert queued_index == _QUEUED_INDEX
+        assert running_lease_index == _RUNNING_LEASE_INDEX
     finally:
         await engine.dispose()
 
@@ -415,5 +440,89 @@ async def test_anonymous_job_ownership_migration_backfills_and_scopes_idempotenc
             await insert_job(owner_a, idempotency_key)
         with pytest.raises(IntegrityError):
             await insert_job(b"short-owner-digest", uuid4())
+    finally:
+        await engine.dispose()
+
+
+async def test_extraction_job_lease_migration_normalizes_active_work_for_rollback(
+    coordination_database: str,
+) -> None:
+    """Recover legacy running work and make downgrade active work reclaimable."""
+    await asyncio.to_thread(command.upgrade, _alembic_config(), "0004_anonymous_job_ownership")
+    engine = create_async_engine(coordination_database)
+    submitted_at = datetime(2026, 10, 15, tzinfo=UTC)
+    started_at = submitted_at + timedelta(seconds=5)
+    legacy_job_id = uuid4()
+    owner_digest = bytes(range(32))
+    idempotency_key = uuid4()
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO extraction_job "
+                    "(job_id, source_url, status, submitted_at, updated_at, started_at, "
+                    "owner_digest, idempotency_key) "
+                    "VALUES (:job_id, :source_url, 'running', :submitted_at, "
+                    ":updated_at, :started_at, :owner_digest, :idempotency_key)"
+                ),
+                {
+                    "job_id": legacy_job_id,
+                    "source_url": "https://www.youtube.com/watch?v=legacy-running",
+                    "submitted_at": submitted_at,
+                    "updated_at": started_at,
+                    "started_at": started_at,
+                    "owner_digest": owner_digest,
+                    "idempotency_key": idempotency_key,
+                },
+            )
+
+        await asyncio.to_thread(_upgrade_head)
+
+        async with engine.connect() as connection:
+            upgraded = (
+                await connection.execute(
+                    text(
+                        "SELECT status, started_at, updated_at, lease_token, lease_expires_at "
+                        "FROM extraction_job WHERE job_id = :job_id"
+                    ),
+                    {"job_id": legacy_job_id},
+                )
+            ).one()
+
+        assert upgraded == ("queued", None, started_at, None, None)
+
+        await asyncio.to_thread(
+            command.downgrade,
+            _alembic_config(),
+            "0004_anonymous_job_ownership",
+        )
+
+        async with engine.connect() as connection:
+            downgraded = (
+                await connection.execute(
+                    text(
+                        "SELECT status, started_at, updated_at FROM extraction_job "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {"job_id": legacy_job_id},
+                )
+            ).one()
+
+        assert downgraded == ("queued", None, submitted_at)
+
+        await asyncio.to_thread(_upgrade_head)
+
+        async with engine.connect() as connection:
+            reupgraded = (
+                await connection.execute(
+                    text(
+                        "SELECT status, started_at, updated_at, lease_token, lease_expires_at "
+                        "FROM extraction_job WHERE job_id = :job_id"
+                    ),
+                    {"job_id": legacy_job_id},
+                )
+            ).one()
+
+        assert reupgraded == ("queued", None, submitted_at, None, None)
     finally:
         await engine.dispose()

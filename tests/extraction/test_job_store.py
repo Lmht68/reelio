@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
@@ -14,6 +14,7 @@ from reelio.extraction.jobs import (
     ExtractionJobStateError,
     ExtractionJobStatus,
     QueuedSourceJob,
+    RunningSourceJob,
 )
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.schemas import ExtractResponse
@@ -78,6 +79,27 @@ def _uuid_factory(*job_ids: UUID) -> Callable[[], UUID]:
     """Return deterministic UUIDs in the supplied order."""
     remaining_job_ids = iter(job_ids)
     return lambda: next(remaining_job_ids)
+
+
+class _MutableClock:
+    """Advance deterministic UTC time between durable store operations."""
+
+    def __init__(self, now: datetime = _SUBMITTED_AT) -> None:
+        """Initialize the clock at one known instant."""
+        self.now = now
+
+    def __call__(self) -> datetime:
+        """Return the current UTC instant."""
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        """Advance the current instant by an exact number of seconds."""
+        self.now += timedelta(seconds=seconds)
+
+
+def _lease_token(number: int) -> UUID:
+    """Return one deterministic UUID4 lease token."""
+    return UUID(f"10000000-0000-4000-8000-{number:012d}")
 
 
 def _store(*job_ids: UUID) -> InMemoryExtractionJobStore:
@@ -146,7 +168,7 @@ async def test_concurrent_admission_caps_active_jobs_and_releases_rejected_keys(
 
     running = await store.claim_next_source()
     assert running is not None
-    await store.complete_success(running.job_id, _response())
+    await store.complete_success(running.job_id, running.lease_token, _response())
 
     admitted_after_completion = await _admit(store, idempotency_key=rejected_keys[0])
     assert admitted_after_completion.job_id == job_ids[10]
@@ -241,9 +263,10 @@ async def test_running_job_transitions_to_versioned_succeeded_response() -> None
     job_id = UUID("00000000-0000-4000-8000-000000000001")
     store = _store(job_id)
     await _admit(store)
-    await store.claim_next_source()
+    running = await store.claim_next_source()
 
-    completed = await store.complete_success(job_id, _response())
+    assert running is not None
+    completed = await store.complete_success(job_id, running.lease_token, _response())
 
     assert completed.job_id == job_id
     assert completed.status is ExtractionJobStatus.SUCCEEDED
@@ -260,7 +283,7 @@ async def test_completion_rejects_every_nonrunning_job_state() -> None:
     await _admit(store)
 
     with pytest.raises(ExtractionJobStateError):
-        await store.complete_success(job_id, _response())
+        await store.complete_success(job_id, _lease_token(1), _response())
 
 
 async def test_admission_replays_the_original_job_for_the_same_owner_and_key() -> None:
@@ -301,3 +324,89 @@ async def test_read_returns_a_job_only_for_its_anonymous_owner() -> None:
 
     assert await store.get_for_owner(job_id, _OWNER_A) == admitted
     assert await store.get_for_owner(job_id, _OWNER_B) is None
+
+
+async def test_claimed_attempt_has_a_sixty_second_lease_and_renews_from_now() -> None:
+    """Extend one valid attempt lease from the authority time of its heartbeat."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=lambda: job_id,
+        lease_token_factory=lambda: _lease_token(1),
+    )
+    await _admit(store)
+
+    claimed = await store.claim_next_source()
+
+    assert claimed is not None
+    assert claimed.lease_token == _lease_token(1)
+    assert claimed.lease_expires_at == _SUBMITTED_AT + timedelta(seconds=60)
+
+    clock.advance(15)
+
+    assert await store.renew_source_attempt(job_id, claimed.lease_token) is True
+    renewed = await store.get_for_owner(job_id, _OWNER_A)
+
+    assert isinstance(renewed, RunningSourceJob)
+    assert renewed.lease_token == claimed.lease_token
+    assert renewed.updated_at == _SUBMITTED_AT + timedelta(seconds=15)
+    assert renewed.lease_expires_at == _SUBMITTED_AT + timedelta(seconds=75)
+
+
+async def test_expired_attempt_is_reclaimed_at_its_exact_expiration_boundary() -> None:
+    """Replace an expired owner at the exact moment its lease is no longer valid."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=lambda: job_id,
+        lease_token_factory=iter((_lease_token(1), _lease_token(2))).__next__,
+    )
+    await _admit(store)
+    original = await store.claim_next_source()
+
+    assert original is not None
+    clock.advance(60)
+
+    assert await store.renew_source_attempt(job_id, original.lease_token) is False
+    reclaimed = await store.claim_next_source()
+
+    assert reclaimed is not None
+    assert reclaimed.job_id == job_id
+    assert reclaimed.lease_token == _lease_token(2)
+    assert reclaimed.lease_token != original.lease_token
+    assert reclaimed.started_at == _SUBMITTED_AT + timedelta(seconds=60)
+    assert reclaimed.lease_expires_at == _SUBMITTED_AT + timedelta(seconds=120)
+
+
+async def test_reclaimed_attempt_rejects_stale_terminal_and_requeue_writes() -> None:
+    """Fence every old terminal or requeue write after another worker reclaims a job."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=lambda: job_id,
+        lease_token_factory=iter((_lease_token(1), _lease_token(2))).__next__,
+    )
+    await _admit(store)
+    original = await store.claim_next_source()
+
+    assert original is not None
+    clock.advance(60)
+    reclaimed = await store.claim_next_source()
+
+    assert reclaimed is not None
+    with pytest.raises(ExtractionJobStateError):
+        await store.complete_success(job_id, original.lease_token, _response())
+    with pytest.raises(ExtractionJobStateError):
+        await store.complete_failure(
+            job_id,
+            original.lease_token,
+            "pipeline_failed",
+            "Source pipeline failed.",
+        )
+    assert await store.requeue_source_attempt(job_id, original.lease_token) is False
+
+    stored = await store.get_for_owner(job_id, _OWNER_A)
+    assert stored == reclaimed

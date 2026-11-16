@@ -168,7 +168,7 @@ async def test_submission_returns_capacity_response_and_retries_rejected_key() -
         )
         running = await store.claim_next_source()
         assert running is not None
-        await store.complete_success(running.job_id, _response())
+        await store.complete_success(running.job_id, running.lease_token, _response())
         retried = await client.post(
             "/api/extraction-jobs",
             json={"url": _SUBMITTED_URL},
@@ -204,9 +204,10 @@ async def test_status_projects_only_queued_running_and_succeeded_fields() -> Non
             headers=_headers(),
         )
         queued_response = await client.get(f"/api/extraction-jobs/{job_id}")
-        await store.claim_next_source()
+        running = await store.claim_next_source()
+        assert running is not None
         running_response = await client.get(f"/api/extraction-jobs/{job_id}")
-        await store.complete_success(job_id, _response())
+        await store.complete_success(job_id, running.lease_token, _response())
         succeeded_response = await client.get(f"/api/extraction-jobs/{job_id}")
 
     assert admitted.status_code == 202

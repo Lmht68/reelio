@@ -59,6 +59,8 @@ class RunningSourceJob(_SourceExtractionJobSnapshot):
     """Represent one Source Extraction job exclusively claimed by a worker."""
 
     started_at: datetime
+    lease_token: UUID
+    lease_expires_at: datetime
     status: ExtractionJobStatus = field(
         init=False,
         default=ExtractionJobStatus.RUNNING,
@@ -143,32 +145,88 @@ class ExtractionJobStore(Protocol):
         ...
 
     async def claim_next_source(self) -> RunningSourceJob | None:
-        """Atomically claim the oldest queued Source Extraction job.
+        """Atomically claim the oldest queued or expired Source Extraction job.
 
         Returns:
-            The committed running snapshot, or None when no job is queued.
+            The committed running snapshot, or None when no job is eligible to run.
 
         Raises:
             ExtractionJobStoreUnavailableError: If storage cannot complete the claim.
         """
         ...
 
+    async def renew_source_attempt(self, job_id: UUID, lease_token: UUID) -> bool:
+        """Renew one currently owned running attempt.
+
+        Args:
+            job_id: Claimed Source Extraction job identity.
+            lease_token: Opaque token issued with the claimed attempt.
+
+        Returns:
+            True after extending the lease, or False when ownership was lost.
+
+        Raises:
+            ExtractionJobStoreUnavailableError: If storage cannot complete the renewal.
+        """
+        ...
+
     async def complete_success(
         self,
         job_id: UUID,
+        lease_token: UUID,
         result: ExtractResponse,
     ) -> SucceededSourceJob:
-        """Commit a mapped response for one running Source Extraction job.
+        """Commit a mapped response only for one currently owned running attempt.
 
         Args:
-            job_id: Claimed job identity.
+            job_id: Claimed Source Extraction job identity.
+            lease_token: Opaque token issued with the claimed attempt.
             result: Existing public Extraction response produced by the worker.
 
         Returns:
             The committed succeeded snapshot.
 
         Raises:
-            ExtractionJobStateError: If the job is absent or not running.
+            ExtractionJobStateError: If the attempt is absent, expired, or replaced.
+            ExtractionJobStoreUnavailableError: If storage cannot complete the update.
+        """
+        ...
+
+    async def complete_failure(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        error_code: str,
+        error_message: str,
+    ) -> FailedSourceJob:
+        """Commit one failure only for a currently owned running attempt.
+
+        Args:
+            job_id: Claimed Source Extraction job identity.
+            lease_token: Opaque token issued with the claimed attempt.
+            error_code: Stable failure classification.
+            error_message: Safe human-readable failure detail.
+
+        Returns:
+            The committed failed snapshot.
+
+        Raises:
+            ExtractionJobStateError: If the attempt is absent, expired, or replaced.
+            ExtractionJobStoreUnavailableError: If storage cannot complete the update.
+        """
+        ...
+
+    async def requeue_source_attempt(self, job_id: UUID, lease_token: UUID) -> bool:
+        """Return one currently owned running attempt to the immediate queue.
+
+        Args:
+            job_id: Claimed Source Extraction job identity.
+            lease_token: Opaque token issued with the claimed attempt.
+
+        Returns:
+            True after requeueing the owned attempt, or False when ownership was lost.
+
+        Raises:
             ExtractionJobStoreUnavailableError: If storage cannot complete the update.
         """
         ...

@@ -1,13 +1,14 @@
 """Behavioral tests for bounded Source Extraction job execution."""
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from reelio.extraction.job_store import InMemoryExtractionJobStore
-from reelio.extraction.jobs import QueuedSourceJob, SucceededSourceJob
+from reelio.extraction.jobs import QueuedSourceJob, RunningSourceJob, SucceededSourceJob
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.service import ExtractionPipeline
 from reelio.extraction.types import (
@@ -466,3 +467,213 @@ async def test_public_job_lifecycle_runs_the_real_pipeline_and_mapper() -> None:
     for response in (queued, running, succeeded):
         assert response.status_code == 200
         assert response.headers["Cache-Control"] == "no-store"
+
+
+class _MutableClock:
+    """Advance the deterministic authority time used by one in-memory job store."""
+
+    def __init__(self, now: datetime = datetime(2026, 10, 15, tzinfo=UTC)) -> None:
+        """Initialize the clock at one known UTC instant."""
+        self.now = now
+
+    def __call__(self) -> datetime:
+        """Return the current authority instant."""
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        """Advance authority time by an exact number of seconds."""
+        self.now += timedelta(seconds=seconds)
+
+
+class _ControlledSleeper:
+    """Release individual worker sleeps only when a test permits the heartbeat."""
+
+    def __init__(self) -> None:
+        """Initialize call and release queues."""
+        self.calls: list[float] = []
+        self._calls: asyncio.Queue[None] = asyncio.Queue()
+        self._releases: asyncio.Queue[None] = asyncio.Queue()
+
+    async def __call__(self, seconds: float) -> None:
+        """Record one requested sleep and wait for an explicit test release."""
+        self.calls.append(seconds)
+        await self._calls.put(None)
+        await self._releases.get()
+
+    async def wait_for_call(self) -> None:
+        """Wait until the worker starts another controlled sleep."""
+        await self._calls.get()
+
+    def release_one(self) -> None:
+        """Release exactly one blocked controlled sleep."""
+        self._releases.put_nowait(None)
+
+
+class _CancellableBlockingPipeline(_RecordingPipeline):
+    """Block one Source execution and observe local worker cancellation."""
+
+    def __init__(self, result: PipelineResult) -> None:
+        """Initialize cancellation and release synchronization."""
+        super().__init__(result)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def run(
+        self,
+        url: str,
+        market: SpotifyMarket | None = None,
+    ) -> PipelineResult:
+        """Block until released or cancelled, then return the prepared result."""
+        self.calls.append((url, market))
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        return self._result
+
+
+def _lease_token(number: int) -> UUID:
+    """Return one deterministic UUID4 lease token."""
+    return UUID(f"10000000-0000-4000-8000-{number:012d}")
+
+
+@pytest.mark.parametrize("heartbeat_interval_seconds", [0, -1, float("inf")])
+def test_worker_rejects_invalid_direct_heartbeat_interval(
+    heartbeat_interval_seconds: float,
+) -> None:
+    """Require a finite positive direct heartbeat interval."""
+    with pytest.raises(ValueError, match="finite and positive"):
+        ExtractionJobWorker(
+            InMemoryExtractionJobStore(),
+            _RecordingPipeline(_pipeline_result(SpotifyMarket("US"))),
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+        )
+
+
+async def test_heartbeat_renews_every_interval_while_the_pipeline_is_active() -> None:
+    """Renew a claimed attempt at the configured cadence until pipeline completion."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    store = InMemoryExtractionJobStore(uuid_factory=lambda: job_id)
+    await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
+    pipeline = _CancellableBlockingPipeline(_pipeline_result(SpotifyMarket("US")))
+    sleeper = _ControlledSleeper()
+    worker = ExtractionJobWorker(
+        store,
+        pipeline,
+        heartbeat_interval_seconds=15.0,
+        sleep=sleeper,
+    )
+
+    worker_run = asyncio.create_task(worker.run_once())
+    await pipeline.started.wait()
+    await sleeper.wait_for_call()
+    assert sleeper.calls == [15.0]
+
+    sleeper.release_one()
+    await sleeper.wait_for_call()
+    assert sleeper.calls == [15.0, 15.0]
+
+    pipeline.release.set()
+
+    assert await worker_run is True
+    assert sleeper.calls == [15.0, 15.0]
+
+
+async def test_lease_loss_cancels_pipeline_and_discards_its_result() -> None:
+    """Stop local work without a terminal write once the attempt is no longer owned."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=lambda: job_id,
+        lease_token_factory=lambda: _lease_token(1),
+    )
+    await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
+    pipeline = _CancellableBlockingPipeline(_pipeline_result(SpotifyMarket("US")))
+    sleeper = _ControlledSleeper()
+    worker = ExtractionJobWorker(store, pipeline, sleep=sleeper)
+
+    worker_run = asyncio.create_task(worker.run_once())
+    await pipeline.started.wait()
+    await sleeper.wait_for_call()
+    clock.advance(60)
+    sleeper.release_one()
+
+    assert await worker_run is False
+    assert pipeline.cancelled.is_set()
+    stored = await store.get_for_owner(job_id, _OWNER_DIGEST)
+    assert isinstance(stored, RunningSourceJob)
+    assert stored.lease_token == _lease_token(1)
+
+
+async def test_shutdown_requeues_only_still_owned_attempts_without_claiming_next_work() -> None:
+    """Requeue owned cancellation work and preserve a reclaimed attempt unchanged."""
+    first_job_id = UUID("00000000-0000-4000-8000-000000000001")
+    second_job_id = UUID("00000000-0000-4000-8000-000000000002")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=iter((first_job_id, second_job_id)).__next__,
+        lease_token_factory=iter((_lease_token(1), _lease_token(2))).__next__,
+    )
+    await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
+    await store.admit_source(
+        "https://www.youtube.com/watch?v=second",
+        None,
+        _OWNER_DIGEST,
+        UUID("00000000-0000-4000-8000-000000000002"),
+    )
+    pipeline = _CancellableBlockingPipeline(_pipeline_result(SpotifyMarket("US")))
+    worker = ExtractionJobWorker(store, pipeline, concurrency=1)
+
+    worker_run = asyncio.create_task(worker.run_until_idle())
+    await pipeline.started.wait()
+    clock.advance(60)
+    reclaimed = await store.claim_next_source()
+
+    assert reclaimed is not None
+    assert reclaimed.job_id == first_job_id
+    await worker.shutdown()
+
+    assert await worker_run == 0
+    assert pipeline.cancelled.is_set()
+    first_job = await store.get_for_owner(first_job_id, _OWNER_DIGEST)
+    second_job = await store.get_for_owner(second_job_id, _OWNER_DIGEST)
+    assert first_job == reclaimed
+    assert isinstance(second_job, QueuedSourceJob)
+
+
+async def test_direct_worker_cancellation_leaves_running_work_for_lease_recovery() -> None:
+    """Leave abrupt worker cancellation unfenced until another worker reclaims it."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=lambda: job_id,
+        lease_token_factory=iter((_lease_token(1), _lease_token(2))).__next__,
+    )
+    await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
+    first_pipeline = _CancellableBlockingPipeline(_pipeline_result(SpotifyMarket("US")))
+    first_worker = ExtractionJobWorker(store, first_pipeline)
+
+    first_run = asyncio.create_task(first_worker.run_until_idle())
+    await first_pipeline.started.wait()
+    first_run.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await first_run
+    assert first_pipeline.cancelled.is_set()
+    running = await store.get_for_owner(job_id, _OWNER_DIGEST)
+    assert isinstance(running, RunningSourceJob)
+    assert running.lease_token == _lease_token(1)
+
+    clock.advance(60)
+    second_pipeline = _RecordingPipeline(_pipeline_result(SpotifyMarket("US")))
+    second_worker = ExtractionJobWorker(store, second_pipeline)
+
+    assert await second_worker.run_once() is True
+    recovered = await store.get_for_owner(job_id, _OWNER_DIGEST)
+    assert isinstance(recovered, SucceededSourceJob)

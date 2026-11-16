@@ -2,15 +2,29 @@
 
 import asyncio
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import Column, DateTime, MetaData, String, Table, Text, func, select, text, update
+from sqlalchemy import (
+    Column,
+    DateTime,
+    MetaData,
+    String,
+    Table,
+    Text,
+    and_,
+    func,
+    or_,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from sqlalchemy.sql.elements import ColumnElement
 
 from reelio.database import CURRENT_SCHEMA_REVISION, DatabaseConfig
 from reelio.extraction.job_config import ExtractionJobConfig
@@ -29,6 +43,8 @@ from reelio.extraction.jobs import (
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.schemas import ExtractResponse
 
+_DEFAULT_LEASE_LIFETIME = timedelta(seconds=60)
+
 
 class InMemoryExtractionJobStore:
     """Store Source Extraction jobs deterministically for tests and local composition."""
@@ -38,24 +54,32 @@ class InMemoryExtractionJobStore:
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         uuid_factory: Callable[[], UUID] = uuid4,
+        lease_token_factory: Callable[[], UUID] = uuid4,
         active_job_cap: int = 10,
+        lease_lifetime: timedelta = _DEFAULT_LEASE_LIFETIME,
     ) -> None:
         """Initialize an empty store with injectable identity and UTC time sources.
 
         Args:
             clock: UTC clock used for every committed lifecycle timestamp.
             uuid_factory: UUID4 factory used when admitting Source jobs.
+            lease_token_factory: UUID4 factory used when claiming Source jobs.
             active_job_cap: Maximum queued and running Source jobs admitted at once.
+            lease_lifetime: Positive duration granted to every claimed Source job.
 
         Raises:
-            ValueError: If active_job_cap is not positive.
+            ValueError: If active_job_cap or lease_lifetime is not positive.
         """
         if active_job_cap <= 0:
             raise ValueError("active_job_cap must be positive")
+        if lease_lifetime <= timedelta():
+            raise ValueError("lease_lifetime must be positive")
 
         self._clock = clock
         self._uuid_factory = uuid_factory
+        self._lease_token_factory = lease_token_factory
         self._active_job_cap = active_job_cap
+        self._lease_lifetime = lease_lifetime
         self._jobs: dict[UUID, SourceExtractionJob] = {}
         self._owners: dict[UUID, bytes] = {}
         self._admissions: dict[tuple[bytes, UUID], QueuedSourceJob] = {}
@@ -130,58 +154,75 @@ class InMemoryExtractionJobStore:
             return _copy_job(job) if job is not None else None
 
     async def claim_next_source(self) -> RunningSourceJob | None:
-        """Atomically claim the oldest queued Source Extraction job.
+        """Atomically claim the oldest queued or expired Source Extraction job.
 
         Returns:
-            The committed running snapshot, or None when no job is queued.
+            The committed running snapshot, or None when no job is eligible to run.
         """
         async with self._lock:
-            queued_jobs = (job for job in self._jobs.values() if isinstance(job, QueuedSourceJob))
-            queued_job = min(
-                queued_jobs,
+            now = self._clock()
+            claimable_jobs = (
+                job
+                for job in self._jobs.values()
+                if isinstance(job, QueuedSourceJob)
+                or (isinstance(job, RunningSourceJob) and job.lease_expires_at <= now)
+            )
+            claimable_job = min(
+                claimable_jobs,
                 default=None,
                 key=lambda job: (job.submitted_at, job.job_id.int),
             )
-            if queued_job is None:
+            if claimable_job is None:
                 return None
 
-            started_at = self._clock()
             running_job = RunningSourceJob(
-                job_id=queued_job.job_id,
-                source_url=queued_job.source_url,
-                market=queued_job.market,
-                submitted_at=queued_job.submitted_at,
-                updated_at=started_at,
-                started_at=started_at,
+                job_id=claimable_job.job_id,
+                source_url=claimable_job.source_url,
+                market=claimable_job.market,
+                submitted_at=claimable_job.submitted_at,
+                updated_at=now,
+                started_at=now,
+                lease_token=self._lease_token_factory(),
+                lease_expires_at=now + self._lease_lifetime,
             )
             self._jobs[running_job.job_id] = running_job
             return running_job
 
+    async def renew_source_attempt(self, job_id: UUID, lease_token: UUID) -> bool:
+        """Renew one currently owned running Source Extraction attempt."""
+        async with self._lock:
+            now = self._clock()
+            running_job = self._owned_running_job(job_id, lease_token, now)
+            if running_job is None:
+                return False
+
+            self._jobs[job_id] = RunningSourceJob(
+                job_id=running_job.job_id,
+                source_url=running_job.source_url,
+                market=running_job.market,
+                submitted_at=running_job.submitted_at,
+                updated_at=now,
+                started_at=running_job.started_at,
+                lease_token=running_job.lease_token,
+                lease_expires_at=now + self._lease_lifetime,
+            )
+            return True
+
     async def complete_success(
         self,
         job_id: UUID,
+        lease_token: UUID,
         result: ExtractResponse,
     ) -> SucceededSourceJob:
-        """Commit a mapped response for one running Source Extraction job.
-
-        Args:
-            job_id: Claimed job identity.
-            result: Existing public Extraction response produced by the worker.
-
-        Returns:
-            The committed succeeded snapshot.
-
-        Raises:
-            ExtractionJobStateError: If the job is absent or not running.
-        """
+        """Commit a mapped response for one currently owned Source job attempt."""
         async with self._lock:
-            job = self._jobs.get(job_id)
-            if not isinstance(job, RunningSourceJob):
+            finished_at = self._clock()
+            job = self._owned_running_job(job_id, lease_token, finished_at)
+            if job is None:
                 raise ExtractionJobStateError(
-                    "Source Extraction job must be running before it can succeed"
+                    "Source Extraction job attempt must be owned before it can succeed"
                 )
 
-            finished_at = self._clock()
             succeeded_job = SucceededSourceJob(
                 job_id=job.job_id,
                 source_url=job.source_url,
@@ -205,6 +246,69 @@ class InMemoryExtractionJobStore:
                 result_version=succeeded_job.result_version,
                 result=succeeded_job.result.model_copy(deep=True),
             )
+
+    async def complete_failure(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        error_code: str,
+        error_message: str,
+    ) -> FailedSourceJob:
+        """Commit one failure for a currently owned Source job attempt."""
+        async with self._lock:
+            finished_at = self._clock()
+            job = self._owned_running_job(job_id, lease_token, finished_at)
+            if job is None:
+                raise ExtractionJobStateError(
+                    "Source Extraction job attempt must be owned before it can fail"
+                )
+
+            failed_job = FailedSourceJob(
+                job_id=job.job_id,
+                source_url=job.source_url,
+                market=job.market,
+                submitted_at=job.submitted_at,
+                updated_at=finished_at,
+                started_at=job.started_at,
+                finished_at=finished_at,
+                error_code=error_code,
+                error_message=error_message,
+            )
+            self._jobs[job_id] = failed_job
+            return failed_job
+
+    async def requeue_source_attempt(self, job_id: UUID, lease_token: UUID) -> bool:
+        """Return one currently owned Source job attempt to the immediate queue."""
+        async with self._lock:
+            now = self._clock()
+            job = self._owned_running_job(job_id, lease_token, now)
+            if job is None:
+                return False
+
+            self._jobs[job_id] = QueuedSourceJob(
+                job_id=job.job_id,
+                source_url=job.source_url,
+                market=job.market,
+                submitted_at=job.submitted_at,
+                updated_at=now,
+            )
+            return True
+
+    def _owned_running_job(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        now: datetime,
+    ) -> RunningSourceJob | None:
+        """Return a running job only while its supplied attempt owns a live lease."""
+        job = self._jobs.get(job_id)
+        if (
+            not isinstance(job, RunningSourceJob)
+            or job.lease_token != lease_token
+            or job.lease_expires_at <= now
+        ):
+            return None
+        return job
 
     async def aclose(self) -> None:
         """Release resources owned by the in-memory store."""
@@ -262,27 +366,39 @@ _EXTRACTION_JOB_TABLE = Table(
     Column("error_message", Text(), nullable=True),
     Column("owner_digest", postgresql.BYTEA(), nullable=False),
     Column("idempotency_key", postgresql.UUID(as_uuid=True), nullable=False),
+    Column("lease_token", postgresql.UUID(as_uuid=True), nullable=True),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=True),
 )
 
 
 class PostgresExtractionJobStore:
     """Persist Source Extraction jobs through an owned async SQLAlchemy engine."""
 
-    def __init__(self, engine: AsyncEngine, *, active_job_cap: int = 10) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        active_job_cap: int = 10,
+        lease_lifetime: timedelta = _DEFAULT_LEASE_LIFETIME,
+    ) -> None:
         """Initialize the store with an exclusively owned database engine.
 
         Args:
             engine: Async engine used only for Source Extraction job storage.
             active_job_cap: Maximum queued and running Source jobs admitted at once.
+            lease_lifetime: Positive duration granted to every claimed Source job.
 
         Raises:
-            ValueError: If active_job_cap is not positive.
+            ValueError: If active_job_cap or lease_lifetime is not positive.
         """
         if active_job_cap <= 0:
             raise ValueError("active_job_cap must be positive")
+        if lease_lifetime <= timedelta():
+            raise ValueError("lease_lifetime must be positive")
 
         self._engine = engine
         self._active_job_cap = active_job_cap
+        self._lease_lifetime = lease_lifetime
 
     async def admit_source(
         self,
@@ -412,19 +528,28 @@ class PostgresExtractionJobStore:
         return _to_source_extraction_job(row) if row is not None else None
 
     async def claim_next_source(self) -> RunningSourceJob | None:
-        """Atomically commit one oldest queued Source job as running.
+        """Atomically claim the oldest queued or expired Source Extraction job.
 
         Returns:
-            The committed running snapshot, or None when no job is queued.
+            The committed running snapshot, or None when no job is eligible to run.
 
         Raises:
             ExtractionJobStoreUnavailableError: If PostgreSQL cannot complete the claim.
         """
         try:
             async with self._engine.begin() as connection:
+                now = await self._current_time(connection)
                 selection = await connection.execute(
                     select(_EXTRACTION_JOB_TABLE)
-                    .where(_EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.QUEUED.value)
+                    .where(
+                        or_(
+                            _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.QUEUED.value,
+                            and_(
+                                _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.RUNNING.value,
+                                _EXTRACTION_JOB_TABLE.c.lease_expires_at <= now,
+                            ),
+                        )
+                    )
                     .order_by(
                         _EXTRACTION_JOB_TABLE.c.submitted_at,
                         _EXTRACTION_JOB_TABLE.c.job_id,
@@ -432,21 +557,28 @@ class PostgresExtractionJobStore:
                     .with_for_update(skip_locked=True)
                     .limit(1)
                 )
-                queued_row = selection.mappings().one_or_none()
-                if queued_row is None:
+                claimed_row = selection.mappings().one_or_none()
+                if claimed_row is None:
                     return None
 
-                started_at = datetime.now(UTC)
                 result = await connection.execute(
                     update(_EXTRACTION_JOB_TABLE)
                     .where(
-                        _EXTRACTION_JOB_TABLE.c.job_id == queued_row["job_id"],
-                        _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.QUEUED.value,
+                        _EXTRACTION_JOB_TABLE.c.job_id == claimed_row["job_id"],
+                        or_(
+                            _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.QUEUED.value,
+                            and_(
+                                _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.RUNNING.value,
+                                _EXTRACTION_JOB_TABLE.c.lease_expires_at <= now,
+                            ),
+                        ),
                     )
                     .values(
                         status=ExtractionJobStatus.RUNNING.value,
-                        updated_at=started_at,
-                        started_at=started_at,
+                        updated_at=now,
+                        started_at=now,
+                        lease_token=uuid4(),
+                        lease_expires_at=now + self._lease_lifetime,
                     )
                     .returning(*_EXTRACTION_JOB_TABLE.c)
                 )
@@ -464,39 +596,47 @@ class PostgresExtractionJobStore:
             )
         return job
 
+    async def renew_source_attempt(self, job_id: UUID, lease_token: UUID) -> bool:
+        """Renew one currently owned running Source Extraction attempt."""
+        try:
+            async with self._engine.begin() as connection:
+                now = await self._current_time(connection)
+                renewed = await connection.execute(
+                    update(_EXTRACTION_JOB_TABLE)
+                    .where(self._owned_attempt_predicate(job_id, lease_token, now))
+                    .values(
+                        updated_at=now,
+                        lease_expires_at=now + self._lease_lifetime,
+                    )
+                    .returning(_EXTRACTION_JOB_TABLE.c.job_id)
+                )
+                return renewed.scalar_one_or_none() is not None
+        except SQLAlchemyError as exc:
+            raise ExtractionJobStoreUnavailableError(
+                "Source Extraction job storage is temporarily unavailable"
+            ) from exc
+
     async def complete_success(
         self,
         job_id: UUID,
+        lease_token: UUID,
         result: ExtractResponse,
     ) -> SucceededSourceJob:
-        """Commit one mapped response only for a currently running Source job.
-
-        Args:
-            job_id: Claimed job identity.
-            result: Existing public Extraction response produced by the worker.
-
-        Returns:
-            The committed succeeded job snapshot.
-
-        Raises:
-            ExtractionJobStateError: If the job is absent or not running.
-            ExtractionJobStoreUnavailableError: If PostgreSQL cannot commit completion.
-        """
-        finished_at = datetime.now(UTC)
+        """Commit one mapped response only for a currently owned Source attempt."""
         try:
             async with self._engine.begin() as connection:
+                finished_at = await self._current_time(connection)
                 update_result = await connection.execute(
                     update(_EXTRACTION_JOB_TABLE)
-                    .where(
-                        _EXTRACTION_JOB_TABLE.c.job_id == job_id,
-                        _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.RUNNING.value,
-                    )
+                    .where(self._owned_attempt_predicate(job_id, lease_token, finished_at))
                     .values(
                         status=ExtractionJobStatus.SUCCEEDED.value,
                         updated_at=finished_at,
                         finished_at=finished_at,
                         result_version=EXTRACTION_RESPONSE_VERSION,
                         result=result.model_dump(mode="json"),
+                        lease_token=None,
+                        lease_expires_at=None,
                     )
                     .returning(*_EXTRACTION_JOB_TABLE.c)
                 )
@@ -507,7 +647,7 @@ class PostgresExtractionJobStore:
             ) from exc
         if row is None:
             raise ExtractionJobStateError(
-                "Source Extraction job must be running before it can succeed"
+                "Source Extraction job attempt must be owned before it can succeed"
             )
         job = _to_source_extraction_job(row)
         if not isinstance(job, SucceededSourceJob):
@@ -515,6 +655,88 @@ class PostgresExtractionJobStore:
                 "Source Extraction job completion did not return a succeeded job"
             )
         return job
+
+    async def complete_failure(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        error_code: str,
+        error_message: str,
+    ) -> FailedSourceJob:
+        """Commit one failure only for a currently owned Source attempt."""
+        try:
+            async with self._engine.begin() as connection:
+                finished_at = await self._current_time(connection)
+                update_result = await connection.execute(
+                    update(_EXTRACTION_JOB_TABLE)
+                    .where(self._owned_attempt_predicate(job_id, lease_token, finished_at))
+                    .values(
+                        status=ExtractionJobStatus.FAILED.value,
+                        updated_at=finished_at,
+                        finished_at=finished_at,
+                        error_code=error_code,
+                        error_message=error_message,
+                        lease_token=None,
+                        lease_expires_at=None,
+                    )
+                    .returning(*_EXTRACTION_JOB_TABLE.c)
+                )
+                row = update_result.mappings().one_or_none()
+        except SQLAlchemyError as exc:
+            raise ExtractionJobStoreUnavailableError(
+                "Source Extraction job storage is temporarily unavailable"
+            ) from exc
+        if row is None:
+            raise ExtractionJobStateError(
+                "Source Extraction job attempt must be owned before it can fail"
+            )
+        job = _to_source_extraction_job(row)
+        if not isinstance(job, FailedSourceJob):
+            raise ExtractionJobStateError(
+                "Source Extraction job completion did not return a failed job"
+            )
+        return job
+
+    async def requeue_source_attempt(self, job_id: UUID, lease_token: UUID) -> bool:
+        """Return one currently owned Source attempt to the immediate queue."""
+        try:
+            async with self._engine.begin() as connection:
+                now = await self._current_time(connection)
+                requeued = await connection.execute(
+                    update(_EXTRACTION_JOB_TABLE)
+                    .where(self._owned_attempt_predicate(job_id, lease_token, now))
+                    .values(
+                        status=ExtractionJobStatus.QUEUED.value,
+                        updated_at=now,
+                        started_at=None,
+                        lease_token=None,
+                        lease_expires_at=None,
+                    )
+                    .returning(_EXTRACTION_JOB_TABLE.c.job_id)
+                )
+                return requeued.scalar_one_or_none() is not None
+        except SQLAlchemyError as exc:
+            raise ExtractionJobStoreUnavailableError(
+                "Source Extraction job storage is temporarily unavailable"
+            ) from exc
+
+    async def _current_time(self, connection: AsyncConnection) -> datetime:
+        """Read PostgreSQL's transaction authority time."""
+        return cast(datetime, await connection.scalar(select(func.now())))
+
+    def _owned_attempt_predicate(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        now: datetime,
+    ) -> ColumnElement[bool]:
+        """Build the durable predicate that fences all owned attempt writes."""
+        return and_(
+            _EXTRACTION_JOB_TABLE.c.job_id == job_id,
+            _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.RUNNING.value,
+            _EXTRACTION_JOB_TABLE.c.lease_token == lease_token,
+            _EXTRACTION_JOB_TABLE.c.lease_expires_at > now,
+        )
 
     async def aclose(self) -> None:
         """Dispose the database engine owned by this job store."""
@@ -568,7 +790,11 @@ async def create_production_extraction_job_store() -> PostgresExtractionJobStore
         hide_parameters=True,
         pool_pre_ping=True,
     )
-    store = PostgresExtractionJobStore(engine, active_job_cap=job_settings.active_job_cap)
+    store = PostgresExtractionJobStore(
+        engine,
+        active_job_cap=job_settings.active_job_cap,
+        lease_lifetime=timedelta(seconds=job_settings.lease_lifetime_seconds),
+    )
     try:
         await store._verify_ready()
     except BaseException:
@@ -624,6 +850,8 @@ def _to_source_extraction_job(row: RowMapping) -> SourceExtractionJob:
             submitted_at=submitted_at,
             updated_at=updated_at,
             started_at=cast(datetime, row["started_at"]),
+            lease_token=cast(UUID, row["lease_token"]),
+            lease_expires_at=cast(datetime, row["lease_expires_at"]),
         )
     if status is ExtractionJobStatus.SUCCEEDED:
         return SucceededSourceJob(

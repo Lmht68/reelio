@@ -35,24 +35,30 @@ def _without_dotenv[SettingsType: BaseSettings](
 
 
 def test_extraction_job_configuration_defaults() -> None:
-    """Use the documented worker concurrency and active admission defaults."""
+    """Use the documented worker, admission, and lease defaults."""
     settings = _without_dotenv(ExtractionJobConfig)
 
     assert settings.worker_concurrency == 2
     assert settings.active_job_cap == 10
+    assert settings.lease_lifetime_seconds == 60.0
+    assert settings.heartbeat_interval_seconds == 15.0
 
 
 def test_extraction_job_configuration_reads_exact_environment_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Read only the extraction job worker and active-cap environment settings."""
+    """Read only the extraction worker, admission, and lease environment settings."""
     monkeypatch.setenv("REELIO_EXTRACTION_WORKER_CONCURRENCY", "3")
     monkeypatch.setenv("REELIO_EXTRACTION_ACTIVE_JOB_CAP", "11")
+    monkeypatch.setenv("REELIO_EXTRACTION_LEASE_LIFETIME_SECONDS", "75.5")
+    monkeypatch.setenv("REELIO_EXTRACTION_HEARTBEAT_INTERVAL_SECONDS", "25.25")
 
     settings = _without_dotenv(ExtractionJobConfig)
 
     assert settings.worker_concurrency == 3
     assert settings.active_job_cap == 11
+    assert settings.lease_lifetime_seconds == 75.5
+    assert settings.heartbeat_interval_seconds == 25.25
 
 
 @pytest.mark.parametrize(
@@ -62,15 +68,40 @@ def test_extraction_job_configuration_reads_exact_environment_overrides(
         ("worker_concurrency", -1),
         ("active_job_cap", 0),
         ("active_job_cap", -1),
+        ("lease_lifetime_seconds", 0),
+        ("lease_lifetime_seconds", -1),
+        ("lease_lifetime_seconds", float("inf")),
+        ("lease_lifetime_seconds", "not-a-number"),
+        ("heartbeat_interval_seconds", 0),
+        ("heartbeat_interval_seconds", -1),
+        ("heartbeat_interval_seconds", float("inf")),
+        ("heartbeat_interval_seconds", "not-a-number"),
     ],
 )
-def test_extraction_job_configuration_rejects_nonpositive_capacity(
+def test_extraction_job_configuration_rejects_invalid_capacity_or_lease_value(
     field_name: str,
-    value: int,
+    value: int | float | str,
 ) -> None:
-    """Require positive worker and admission capacity settings."""
+    """Require positive finite lease settings and positive capacity settings."""
     with pytest.raises(ValidationError):
         _without_dotenv(ExtractionJobConfig, **{field_name: value})
+
+
+@pytest.mark.parametrize(
+    ("lease_lifetime_seconds", "heartbeat_interval_seconds"),
+    [(60.0, 60.0), (60.0, 75.0)],
+)
+def test_extraction_job_configuration_requires_heartbeat_before_lease_expiration(
+    lease_lifetime_seconds: float,
+    heartbeat_interval_seconds: float,
+) -> None:
+    """Reject heartbeats that cannot renew before the current lease expires."""
+    with pytest.raises(ValidationError, match="strictly shorter than lease lifetime"):
+        _without_dotenv(
+            ExtractionJobConfig,
+            lease_lifetime_seconds=lease_lifetime_seconds,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+        )
 
 
 def test_tmdb_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

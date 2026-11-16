@@ -45,12 +45,14 @@ from reelio.extraction.coordination import (
     create_postgres_textify_coordination,
 )
 from reelio.extraction.job_store import InMemoryExtractionJobStore
+from reelio.extraction.jobs import RunningSourceJob, SucceededSourceJob
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.service import ExtractionPipeline
 from reelio.extraction.services.textify import (
     TextifyConfig,
     TextifySourceTranscriptProvider,
 )
+from reelio.extraction.worker import ExtractionJobWorker
 from reelio.main import create_app
 from tests.extraction.fakes import FakeInterpretationService, FakeResultAggregator
 
@@ -1258,6 +1260,98 @@ async def test_restart_after_request_cancellation_resumes_the_active_textify_job
     assert server.job_count == 1
     assert len(server.idempotency_keys) == 1
     assert server.cancellation_paths == []
+
+
+async def test_reclaimed_source_job_resumes_textify_without_remote_cancellation(
+    migrated_coordination_database: str,
+) -> None:
+    """Resume stored Textify work after abrupt worker loss and lease reclamation."""
+    server = _TextifyContractServer("faster_whisper", active_polls=1)
+    first_poll_sleep_started = asyncio.Event()
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    owner_digest = bytes(range(32))
+    job_clock = [datetime(2026, 10, 15, tzinfo=UTC)]
+
+    def extraction_job_clock() -> datetime:
+        """Return the test-controlled Extraction Job authority time."""
+        return job_clock[0]
+
+    async def blocking_sleeper(seconds: float) -> None:
+        """Block the first worker after durable Textify admission."""
+        assert seconds == 0
+        first_poll_sleep_started.set()
+        await asyncio.Event().wait()
+
+    store = InMemoryExtractionJobStore(
+        clock=extraction_job_clock,
+        uuid_factory=lambda: job_id,
+        lease_token_factory=iter(
+            (
+                UUID("10000000-0000-4000-8000-000000000001"),
+                UUID("10000000-0000-4000-8000-000000000002"),
+            )
+        ).__next__,
+    )
+    await store.admit_source(
+        _SUBMITTED_URL,
+        None,
+        owner_digest,
+        UUID("00000000-0000-4000-8000-000000000001"),
+    )
+    first_pipeline = await _create_pipeline(
+        migrated_coordination_database,
+        server,
+        blocking_sleeper,
+    )
+    resumed_pipeline: ExtractionPipeline | None = None
+    try:
+        first_worker = ExtractionJobWorker(store, first_pipeline)
+        first_run = asyncio.create_task(first_worker.run_once())
+        await first_poll_sleep_started.wait()
+
+        stored_coordinations = await _stored_coordinations(migrated_coordination_database)
+        assert len(stored_coordinations) == 1
+        assert stored_coordinations[0][2] == server.capability_links[0]
+
+        first_run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_run
+
+        running = await store.get_for_owner(job_id, owner_digest)
+        assert isinstance(running, RunningSourceJob)
+        job_clock[0] += timedelta(seconds=60)
+
+        resumed_waits: list[float] = []
+
+        async def resumed_sleeper(seconds: float) -> None:
+            """Record polling waits used by the reclaimed worker."""
+            resumed_waits.append(seconds)
+
+        resumed_pipeline = await _create_pipeline(
+            migrated_coordination_database,
+            server,
+            resumed_sleeper,
+        )
+        resumed_worker = ExtractionJobWorker(store, resumed_pipeline)
+
+        assert await resumed_worker.run_once() is True
+        completed = await store.get_for_owner(job_id, owner_digest)
+
+        assert isinstance(completed, SucceededSourceJob)
+        assert resumed_waits == [0, 0]
+        assert server.inspection_statuses == ["processing", "finished"]
+        assert server.request_paths == [
+            "/api/v1/transcription-jobs",
+            server.capability_links[0],
+            server.capability_links[0],
+        ]
+        assert server.job_count == 1
+        assert len(server.idempotency_keys) == 1
+        assert server.cancellation_paths == []
+    finally:
+        await first_pipeline.aclose()
+        if resumed_pipeline is not None:
+            await resumed_pipeline.aclose()
 
 
 async def test_distinct_exact_urls_receive_distinct_textify_coordination_identities(
