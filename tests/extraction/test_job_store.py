@@ -13,6 +13,7 @@ from reelio.extraction.jobs import (
     ExtractionJobCapacityExceededError,
     ExtractionJobStateError,
     ExtractionJobStatus,
+    FailedSourceJob,
     QueuedSourceJob,
     RunningSourceJob,
 )
@@ -214,6 +215,8 @@ async def test_admission_returns_one_deterministic_queued_snapshot() -> None:
     assert admitted.source_url == _SUBMITTED_URL
     assert admitted.market is None
     assert admitted.status is ExtractionJobStatus.QUEUED
+    assert admitted.attempt_count == 0
+    assert admitted.eligible_at == _SUBMITTED_AT
     assert admitted.submitted_at == _SUBMITTED_AT
     assert admitted.updated_at == _SUBMITTED_AT
     assert await store.get_for_owner(job_id, _OWNER_A) == admitted
@@ -256,6 +259,118 @@ async def test_claim_never_returns_one_job_twice() -> None:
     assert first_claim is not None
     assert first_claim.job_id == job_id
     assert second_claim is None
+
+
+async def test_retry_delays_the_next_claim_and_issues_a_fresh_lease() -> None:
+    """Keep a retry queued until its eligibility time and increment its attempt."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=lambda: job_id,
+        lease_token_factory=iter((_lease_token(1), _lease_token(2))).__next__,
+    )
+    await _admit(store)
+    first_attempt = await store.claim_next_source()
+
+    assert first_attempt is not None
+    assert first_attempt.attempt_count == 1
+    assert await store.retry_source_attempt(
+        job_id,
+        first_attempt.lease_token,
+        timedelta(seconds=10),
+    )
+    assert await store.claim_next_source() is None
+
+    clock.advance(10)
+    second_attempt = await store.claim_next_source()
+
+    assert second_attempt is not None
+    assert second_attempt.attempt_count == 2
+    assert second_attempt.lease_token != first_attempt.lease_token
+
+
+async def test_final_requeued_attempt_becomes_a_terminal_internal_failure() -> None:
+    """Prevent graceful requeue from leaving a third attempt active forever."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=lambda: job_id,
+        lease_token_factory=iter((_lease_token(1), _lease_token(2), _lease_token(3))).__next__,
+    )
+    await _admit(store)
+
+    first_attempt = await store.claim_next_source()
+    assert first_attempt is not None
+    assert await store.retry_source_attempt(
+        job_id,
+        first_attempt.lease_token,
+        timedelta(seconds=1),
+    )
+    clock.advance(1)
+
+    second_attempt = await store.claim_next_source()
+    assert second_attempt is not None
+    assert await store.retry_source_attempt(
+        job_id,
+        second_attempt.lease_token,
+        timedelta(seconds=1),
+    )
+    clock.advance(1)
+
+    third_attempt = await store.claim_next_source()
+    assert third_attempt is not None
+    assert third_attempt.attempt_count == 3
+    assert await store.requeue_source_attempt(job_id, third_attempt.lease_token)
+
+    assert await store.claim_next_source() is None
+    stored = await store.get_for_owner(job_id, _OWNER_A)
+
+    assert isinstance(stored, FailedSourceJob)
+    assert stored.error_code == "internal_error"
+    assert stored.error_message == "An unexpected error occurred."
+
+
+async def test_expired_final_attempt_becomes_a_terminal_internal_failure() -> None:
+    """Prevent an expired third lease from remaining active without another claim."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=lambda: job_id,
+        lease_token_factory=iter((_lease_token(1), _lease_token(2), _lease_token(3))).__next__,
+    )
+    await _admit(store)
+
+    first_attempt = await store.claim_next_source()
+    assert first_attempt is not None
+    assert await store.retry_source_attempt(
+        job_id,
+        first_attempt.lease_token,
+        timedelta(seconds=1),
+    )
+    clock.advance(1)
+
+    second_attempt = await store.claim_next_source()
+    assert second_attempt is not None
+    assert await store.retry_source_attempt(
+        job_id,
+        second_attempt.lease_token,
+        timedelta(seconds=1),
+    )
+    clock.advance(1)
+
+    third_attempt = await store.claim_next_source()
+    assert third_attempt is not None
+    clock.advance(60)
+
+    assert await store.claim_next_source() is None
+    stored = await store.get_for_owner(job_id, _OWNER_A)
+
+    assert isinstance(stored, FailedSourceJob)
+    assert stored.error_code == "internal_error"
+    assert stored.error_message == "An unexpected error occurred."
 
 
 async def test_running_job_transitions_to_versioned_succeeded_response() -> None:
@@ -407,6 +522,14 @@ async def test_reclaimed_attempt_rejects_stale_terminal_and_requeue_writes() -> 
             "Source pipeline failed.",
         )
     assert await store.requeue_source_attempt(job_id, original.lease_token) is False
+    assert (
+        await store.retry_source_attempt(
+            job_id,
+            original.lease_token,
+            timedelta(seconds=1),
+        )
+        is False
+    )
 
     stored = await store.get_for_owner(job_id, _OWNER_A)
     assert stored == reclaimed

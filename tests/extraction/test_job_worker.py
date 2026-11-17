@@ -7,8 +7,19 @@ from uuid import UUID
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from reelio.extraction.exceptions import (
+    INTERNAL_ERROR_CODE,
+    INTERNAL_ERROR_MESSAGE,
+    InvalidSourceError,
+    PipelineTimeoutError,
+)
 from reelio.extraction.job_store import InMemoryExtractionJobStore
-from reelio.extraction.jobs import QueuedSourceJob, RunningSourceJob, SucceededSourceJob
+from reelio.extraction.jobs import (
+    FailedSourceJob,
+    QueuedSourceJob,
+    RunningSourceJob,
+    SucceededSourceJob,
+)
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.service import ExtractionPipeline
 from reelio.extraction.types import (
@@ -91,6 +102,27 @@ class _RecordingPipeline:
 
     async def aclose(self) -> None:
         """Release no resources for this deterministic pipeline fake."""
+
+
+class _OutcomePipeline(_RecordingPipeline):
+    """Return or raise each prepared pipeline outcome in order."""
+
+    def __init__(self, outcomes: list[PipelineResult | Exception]) -> None:
+        """Initialize deterministic Source pipeline outcomes."""
+        super().__init__(_pipeline_result(SpotifyMarket("US")))
+        self._outcomes = outcomes
+
+    async def run(
+        self,
+        url: str,
+        market: SpotifyMarket | None = None,
+    ) -> PipelineResult:
+        """Return or raise the next prepared outcome after recording its input."""
+        self.calls.append((url, market))
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
 
 async def test_run_once_returns_false_without_a_queued_job() -> None:
@@ -538,6 +570,133 @@ class _CancellableBlockingPipeline(_RecordingPipeline):
 def _lease_token(number: int) -> UUID:
     """Return one deterministic UUID4 lease token."""
     return UUID(f"10000000-0000-4000-8000-{number:012d}")
+
+
+async def test_terminal_pipeline_failure_commits_without_retrying() -> None:
+    """Persist a terminal safe error immediately after the first failed attempt."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    store = InMemoryExtractionJobStore(uuid_factory=lambda: job_id)
+    await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
+    pipeline = _OutcomePipeline([InvalidSourceError("Invalid source URL.")])
+    worker = ExtractionJobWorker(store, pipeline)
+
+    assert await worker.run_once() is False
+    stored = await store.get_for_owner(job_id, _OWNER_DIGEST)
+
+    assert isinstance(stored, FailedSourceJob)
+    assert stored.attempt_count == 1
+    assert stored.error_code == "invalid_source"
+    assert stored.error_message == "Invalid source URL."
+    assert await store.claim_next_source() is None
+
+
+async def test_transient_pipeline_failure_retries_then_commits_success() -> None:
+    """Reschedule a transient failure using jitter before its next successful attempt."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(clock=clock, uuid_factory=lambda: job_id)
+    await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
+    pipeline = _OutcomePipeline(
+        [
+            PipelineTimeoutError("Pipeline request timed out."),
+            _pipeline_result(SpotifyMarket("US")),
+        ]
+    )
+    worker = ExtractionJobWorker(store, pipeline, jitter=lambda: 0.5)
+
+    assert await worker.run_once() is False
+    queued = await store.get_for_owner(job_id, _OWNER_DIGEST)
+    assert isinstance(queued, QueuedSourceJob)
+    assert queued.attempt_count == 1
+    assert queued.eligible_at == clock.now + timedelta(seconds=1.5)
+
+    clock.advance(1.5)
+
+    assert await worker.run_once() is True
+    stored = await store.get_for_owner(job_id, _OWNER_DIGEST)
+    assert isinstance(stored, SucceededSourceJob)
+    assert stored.attempt_count == 2
+
+
+async def test_third_transient_pipeline_failure_commits_its_safe_error() -> None:
+    """Stop retrying after the third retryable pipeline failure."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(clock=clock, uuid_factory=lambda: job_id)
+    await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
+    pipeline = _OutcomePipeline(
+        [PipelineTimeoutError("Pipeline request timed out.") for _ in range(3)]
+    )
+    worker = ExtractionJobWorker(store, pipeline, jitter=lambda: 0.0)
+
+    assert await worker.run_once() is False
+    first_retry = await store.get_for_owner(job_id, _OWNER_DIGEST)
+    assert isinstance(first_retry, QueuedSourceJob)
+    assert first_retry.eligible_at == clock.now + timedelta(seconds=1)
+
+    clock.advance(1)
+    assert await worker.run_once() is False
+    second_retry = await store.get_for_owner(job_id, _OWNER_DIGEST)
+    assert isinstance(second_retry, QueuedSourceJob)
+    assert second_retry.eligible_at == clock.now + timedelta(seconds=2)
+
+    clock.advance(2)
+    assert await worker.run_once() is False
+    stored = await store.get_for_owner(job_id, _OWNER_DIGEST)
+    assert isinstance(stored, FailedSourceJob)
+    assert stored.attempt_count == 3
+    assert stored.error_code == "pipeline_timeout"
+    assert stored.error_message == "Pipeline request timed out."
+
+
+async def test_unexpected_pipeline_failure_commits_generic_safe_error() -> None:
+    """Hide unexpected pipeline exceptions in the terminal generic safe contract."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    store = InMemoryExtractionJobStore(uuid_factory=lambda: job_id)
+    await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
+    worker = ExtractionJobWorker(
+        store,
+        _OutcomePipeline([RuntimeError("provider secret detail")]),
+    )
+
+    assert await worker.run_once() is False
+    stored = await store.get_for_owner(job_id, _OWNER_DIGEST)
+
+    assert isinstance(stored, FailedSourceJob)
+    assert stored.error_code == INTERNAL_ERROR_CODE
+    assert stored.error_message == INTERNAL_ERROR_MESSAGE
+
+
+async def test_stale_failed_attempt_cannot_terminalize_a_reclaimed_job() -> None:
+    """Discard a terminal write after another worker reclaims the expired lease."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=lambda: job_id,
+        lease_token_factory=iter((_lease_token(1), _lease_token(2))).__next__,
+    )
+    await store.admit_source(_SUBMITTED_URL, None, _OWNER_DIGEST, _IDEMPOTENCY_KEY)
+
+    class _ReclaimingFailurePipeline:
+        async def run(
+            self,
+            url: str,
+            market: SpotifyMarket | None = None,
+        ) -> PipelineResult:
+            del url, market
+            clock.advance(60)
+            replacement = await store.claim_next_source()
+            assert replacement is not None
+            raise InvalidSourceError("Invalid source URL.")
+
+    worker = ExtractionJobWorker(store, _ReclaimingFailurePipeline())
+
+    assert await worker.run_once() is False
+    stored = await store.get_for_owner(job_id, _OWNER_DIGEST)
+
+    assert isinstance(stored, RunningSourceJob)
+    assert stored.lease_token == _lease_token(2)
 
 
 @pytest.mark.parametrize("heartbeat_interval_seconds", [0, -1, float("inf")])

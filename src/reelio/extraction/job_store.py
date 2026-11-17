@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import (
     Column,
     DateTime,
+    Integer,
     MetaData,
     String,
     Table,
@@ -27,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 from sqlalchemy.sql.elements import ColumnElement
 
 from reelio.database import CURRENT_SCHEMA_REVISION, DatabaseConfig
+from reelio.extraction.exceptions import INTERNAL_ERROR_CODE, INTERNAL_ERROR_MESSAGE
 from reelio.extraction.job_config import ExtractionJobConfig
 from reelio.extraction.jobs import (
     EXTRACTION_RESPONSE_VERSION,
@@ -127,6 +129,8 @@ class InMemoryExtractionJobStore:
                 market=market,
                 submitted_at=submitted_at,
                 updated_at=submitted_at,
+                attempt_count=0,
+                eligible_at=submitted_at,
             )
             self._jobs[job.job_id] = job
             self._owners[job.job_id] = owner_digest
@@ -161,11 +165,27 @@ class InMemoryExtractionJobStore:
         """
         async with self._lock:
             now = self._clock()
+            for job_id, job in self._jobs.items():
+                if (isinstance(job, QueuedSourceJob) and job.attempt_count == 3) or (
+                    isinstance(job, RunningSourceJob)
+                    and job.attempt_count == 3
+                    and job.lease_expires_at <= now
+                ):
+                    self._jobs[job_id] = _terminalize_exhausted_attempt(job, now)
+
             claimable_jobs = (
                 job
                 for job in self._jobs.values()
-                if isinstance(job, QueuedSourceJob)
-                or (isinstance(job, RunningSourceJob) and job.lease_expires_at <= now)
+                if (
+                    isinstance(job, QueuedSourceJob)
+                    and job.eligible_at <= now
+                    and job.attempt_count < 3
+                )
+                or (
+                    isinstance(job, RunningSourceJob)
+                    and job.lease_expires_at <= now
+                    and job.attempt_count < 3
+                )
             )
             claimable_job = min(
                 claimable_jobs,
@@ -181,6 +201,7 @@ class InMemoryExtractionJobStore:
                 market=claimable_job.market,
                 submitted_at=claimable_job.submitted_at,
                 updated_at=now,
+                attempt_count=claimable_job.attempt_count + 1,
                 started_at=now,
                 lease_token=self._lease_token_factory(),
                 lease_expires_at=now + self._lease_lifetime,
@@ -202,6 +223,7 @@ class InMemoryExtractionJobStore:
                 market=running_job.market,
                 submitted_at=running_job.submitted_at,
                 updated_at=now,
+                attempt_count=running_job.attempt_count,
                 started_at=running_job.started_at,
                 lease_token=running_job.lease_token,
                 lease_expires_at=now + self._lease_lifetime,
@@ -229,6 +251,7 @@ class InMemoryExtractionJobStore:
                 market=job.market,
                 submitted_at=job.submitted_at,
                 updated_at=finished_at,
+                attempt_count=job.attempt_count,
                 started_at=job.started_at,
                 finished_at=finished_at,
                 result_version=EXTRACTION_RESPONSE_VERSION,
@@ -241,6 +264,7 @@ class InMemoryExtractionJobStore:
                 market=succeeded_job.market,
                 submitted_at=succeeded_job.submitted_at,
                 updated_at=succeeded_job.updated_at,
+                attempt_count=succeeded_job.attempt_count,
                 started_at=succeeded_job.started_at,
                 finished_at=succeeded_job.finished_at,
                 result_version=succeeded_job.result_version,
@@ -269,6 +293,7 @@ class InMemoryExtractionJobStore:
                 market=job.market,
                 submitted_at=job.submitted_at,
                 updated_at=finished_at,
+                attempt_count=job.attempt_count,
                 started_at=job.started_at,
                 finished_at=finished_at,
                 error_code=error_code,
@@ -276,6 +301,37 @@ class InMemoryExtractionJobStore:
             )
             self._jobs[job_id] = failed_job
             return failed_job
+
+    async def retry_source_attempt(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        retry_delay: timedelta,
+    ) -> bool:
+        """Reschedule one currently owned Source attempt after a positive delay.
+
+        Raises:
+            ValueError: If retry_delay is not positive.
+        """
+        if retry_delay <= timedelta():
+            raise ValueError("retry_delay must be positive")
+
+        async with self._lock:
+            now = self._clock()
+            job = self._owned_running_job(job_id, lease_token, now)
+            if job is None:
+                return False
+
+            self._jobs[job_id] = QueuedSourceJob(
+                job_id=job.job_id,
+                source_url=job.source_url,
+                market=job.market,
+                submitted_at=job.submitted_at,
+                updated_at=now,
+                attempt_count=job.attempt_count,
+                eligible_at=now + retry_delay,
+            )
+            return True
 
     async def requeue_source_attempt(self, job_id: UUID, lease_token: UUID) -> bool:
         """Return one currently owned Source job attempt to the immediate queue."""
@@ -291,6 +347,8 @@ class InMemoryExtractionJobStore:
                 market=job.market,
                 submitted_at=job.submitted_at,
                 updated_at=now,
+                attempt_count=job.attempt_count,
+                eligible_at=now,
             )
             return True
 
@@ -314,6 +372,25 @@ class InMemoryExtractionJobStore:
         """Release resources owned by the in-memory store."""
 
 
+def _terminalize_exhausted_attempt(
+    job: QueuedSourceJob | RunningSourceJob,
+    finished_at: datetime,
+) -> FailedSourceJob:
+    """Return the generic terminal failure for a job that exhausted its attempts."""
+    return FailedSourceJob(
+        job_id=job.job_id,
+        source_url=job.source_url,
+        market=job.market,
+        submitted_at=job.submitted_at,
+        updated_at=finished_at,
+        attempt_count=job.attempt_count,
+        started_at=job.started_at if isinstance(job, RunningSourceJob) else None,
+        finished_at=finished_at,
+        error_code=INTERNAL_ERROR_CODE,
+        error_message=INTERNAL_ERROR_MESSAGE,
+    )
+
+
 def _copy_job(job: SourceExtractionJob) -> SourceExtractionJob:
     """Return a caller-isolated immutable snapshot.
 
@@ -330,6 +407,7 @@ def _copy_job(job: SourceExtractionJob) -> SourceExtractionJob:
             market=job.market,
             submitted_at=job.submitted_at,
             updated_at=job.updated_at,
+            attempt_count=job.attempt_count,
             started_at=job.started_at,
             finished_at=job.finished_at,
             result_version=job.result_version,
@@ -346,6 +424,8 @@ def _copy_queued_job(job: QueuedSourceJob) -> QueuedSourceJob:
         market=job.market,
         submitted_at=job.submitted_at,
         updated_at=job.updated_at,
+        attempt_count=job.attempt_count,
+        eligible_at=job.eligible_at,
     )
 
 
@@ -358,6 +438,8 @@ _EXTRACTION_JOB_TABLE = Table(
     Column("status", Text(), nullable=False),
     Column("submitted_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("attempt_count", Integer(), nullable=False),
+    Column("eligible_at", DateTime(timezone=True), nullable=True),
     Column("started_at", DateTime(timezone=True), nullable=True),
     Column("finished_at", DateTime(timezone=True), nullable=True),
     Column("result_version", Text(), nullable=True),
@@ -471,6 +553,8 @@ class PostgresExtractionJobStore:
                         status=ExtractionJobStatus.QUEUED.value,
                         submitted_at=submitted_at,
                         updated_at=submitted_at,
+                        attempt_count=0,
+                        eligible_at=submitted_at,
                     )
                     .on_conflict_do_nothing(
                         index_elements=(
@@ -539,16 +623,44 @@ class PostgresExtractionJobStore:
         try:
             async with self._engine.begin() as connection:
                 now = await self._current_time(connection)
-                selection = await connection.execute(
-                    select(_EXTRACTION_JOB_TABLE)
+                await connection.execute(
+                    update(_EXTRACTION_JOB_TABLE)
                     .where(
+                        _EXTRACTION_JOB_TABLE.c.attempt_count == 3,
                         or_(
                             _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.QUEUED.value,
                             and_(
                                 _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.RUNNING.value,
                                 _EXTRACTION_JOB_TABLE.c.lease_expires_at <= now,
                             ),
-                        )
+                        ),
+                    )
+                    .values(
+                        status=ExtractionJobStatus.FAILED.value,
+                        updated_at=now,
+                        finished_at=now,
+                        error_code=INTERNAL_ERROR_CODE,
+                        error_message=INTERNAL_ERROR_MESSAGE,
+                        eligible_at=None,
+                        lease_token=None,
+                        lease_expires_at=None,
+                    )
+                )
+
+                selection = await connection.execute(
+                    select(_EXTRACTION_JOB_TABLE)
+                    .where(
+                        or_(
+                            and_(
+                                _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.QUEUED.value,
+                                _EXTRACTION_JOB_TABLE.c.eligible_at <= now,
+                            ),
+                            and_(
+                                _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.RUNNING.value,
+                                _EXTRACTION_JOB_TABLE.c.lease_expires_at <= now,
+                            ),
+                        ),
+                        _EXTRACTION_JOB_TABLE.c.attempt_count < 3,
                     )
                     .order_by(
                         _EXTRACTION_JOB_TABLE.c.submitted_at,
@@ -566,16 +678,22 @@ class PostgresExtractionJobStore:
                     .where(
                         _EXTRACTION_JOB_TABLE.c.job_id == claimed_row["job_id"],
                         or_(
-                            _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.QUEUED.value,
+                            and_(
+                                _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.QUEUED.value,
+                                _EXTRACTION_JOB_TABLE.c.eligible_at <= now,
+                            ),
                             and_(
                                 _EXTRACTION_JOB_TABLE.c.status == ExtractionJobStatus.RUNNING.value,
                                 _EXTRACTION_JOB_TABLE.c.lease_expires_at <= now,
                             ),
                         ),
+                        _EXTRACTION_JOB_TABLE.c.attempt_count < 3,
                     )
                     .values(
                         status=ExtractionJobStatus.RUNNING.value,
                         updated_at=now,
+                        attempt_count=_EXTRACTION_JOB_TABLE.c.attempt_count + 1,
+                        eligible_at=None,
                         started_at=now,
                         lease_token=uuid4(),
                         lease_expires_at=now + self._lease_lifetime,
@@ -635,6 +753,7 @@ class PostgresExtractionJobStore:
                         finished_at=finished_at,
                         result_version=EXTRACTION_RESPONSE_VERSION,
                         result=result.model_dump(mode="json"),
+                        eligible_at=None,
                         lease_token=None,
                         lease_expires_at=None,
                     )
@@ -676,6 +795,7 @@ class PostgresExtractionJobStore:
                         finished_at=finished_at,
                         error_code=error_code,
                         error_message=error_message,
+                        eligible_at=None,
                         lease_token=None,
                         lease_expires_at=None,
                     )
@@ -697,6 +817,42 @@ class PostgresExtractionJobStore:
             )
         return job
 
+    async def retry_source_attempt(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        retry_delay: timedelta,
+    ) -> bool:
+        """Reschedule one currently owned Source attempt after a positive delay.
+
+        Raises:
+            ValueError: If retry_delay is not positive.
+        """
+        if retry_delay <= timedelta():
+            raise ValueError("retry_delay must be positive")
+
+        try:
+            async with self._engine.begin() as connection:
+                now = await self._current_time(connection)
+                rescheduled = await connection.execute(
+                    update(_EXTRACTION_JOB_TABLE)
+                    .where(self._owned_attempt_predicate(job_id, lease_token, now))
+                    .values(
+                        status=ExtractionJobStatus.QUEUED.value,
+                        updated_at=now,
+                        started_at=None,
+                        eligible_at=now + retry_delay,
+                        lease_token=None,
+                        lease_expires_at=None,
+                    )
+                    .returning(_EXTRACTION_JOB_TABLE.c.job_id)
+                )
+                return rescheduled.scalar_one_or_none() is not None
+        except SQLAlchemyError as exc:
+            raise ExtractionJobStoreUnavailableError(
+                "Source Extraction job storage is temporarily unavailable"
+            ) from exc
+
     async def requeue_source_attempt(self, job_id: UUID, lease_token: UUID) -> bool:
         """Return one currently owned Source attempt to the immediate queue."""
         try:
@@ -709,6 +865,7 @@ class PostgresExtractionJobStore:
                         status=ExtractionJobStatus.QUEUED.value,
                         updated_at=now,
                         started_at=None,
+                        eligible_at=now,
                         lease_token=None,
                         lease_expires_at=None,
                     )
@@ -812,6 +969,8 @@ def _to_queued_admission(row: RowMapping) -> QueuedSourceJob:
         market=SpotifyMarket(market_value) if market_value is not None else None,
         submitted_at=cast(datetime, row["submitted_at"]),
         updated_at=cast(datetime, row["submitted_at"]),
+        attempt_count=cast(int, row["attempt_count"]),
+        eligible_at=cast(datetime, row["eligible_at"]),
     )
 
 
@@ -834,6 +993,7 @@ def _to_source_extraction_job(row: RowMapping) -> SourceExtractionJob:
     market = SpotifyMarket(market_value) if market_value is not None else None
     submitted_at = cast(datetime, row["submitted_at"])
     updated_at = cast(datetime, row["updated_at"])
+    attempt_count = cast(int, row["attempt_count"])
     if status is ExtractionJobStatus.QUEUED:
         return QueuedSourceJob(
             job_id=job_id,
@@ -841,6 +1001,8 @@ def _to_source_extraction_job(row: RowMapping) -> SourceExtractionJob:
             market=market,
             submitted_at=submitted_at,
             updated_at=updated_at,
+            attempt_count=attempt_count,
+            eligible_at=cast(datetime, row["eligible_at"]),
         )
     if status is ExtractionJobStatus.RUNNING:
         return RunningSourceJob(
@@ -849,6 +1011,7 @@ def _to_source_extraction_job(row: RowMapping) -> SourceExtractionJob:
             market=market,
             submitted_at=submitted_at,
             updated_at=updated_at,
+            attempt_count=attempt_count,
             started_at=cast(datetime, row["started_at"]),
             lease_token=cast(UUID, row["lease_token"]),
             lease_expires_at=cast(datetime, row["lease_expires_at"]),
@@ -860,6 +1023,7 @@ def _to_source_extraction_job(row: RowMapping) -> SourceExtractionJob:
             market=market,
             submitted_at=submitted_at,
             updated_at=updated_at,
+            attempt_count=attempt_count,
             started_at=cast(datetime, row["started_at"]),
             finished_at=cast(datetime, row["finished_at"]),
             result_version=cast(str, row["result_version"]),
@@ -872,6 +1036,7 @@ def _to_source_extraction_job(row: RowMapping) -> SourceExtractionJob:
             market=market,
             submitted_at=submitted_at,
             updated_at=updated_at,
+            attempt_count=attempt_count,
             started_at=cast(datetime | None, row["started_at"]),
             finished_at=cast(datetime, row["finished_at"]),
             error_code=cast(str, row["error_code"]),

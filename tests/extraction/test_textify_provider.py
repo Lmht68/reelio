@@ -11,7 +11,10 @@ import pytest
 
 from reelio.cache import DisabledCache
 from reelio.extraction.coordination import TextifyCoordination
-from reelio.extraction.exceptions import TranscriptionError
+from reelio.extraction.exceptions import (
+    RetryableTranscriptionError,
+    TranscriptionError,
+)
 from reelio.extraction.services.textify import (
     TextifyConfig,
     TextifySourceTranscriptProvider,
@@ -237,3 +240,106 @@ async def test_provider_rejects_admission_that_does_not_repeat_its_capability() 
     assert repository.calls == [("get_or_create", _SUBMITTED_URL)]
 
     await provider.aclose()
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_error"),
+    [
+        ("internal_error", RetryableTranscriptionError),
+        ("worker_interrupted", RetryableTranscriptionError),
+        ("transcription_failed", TranscriptionError),
+    ],
+)
+async def test_provider_classifies_terminal_job_failures(
+    error_code: str,
+    expected_error: type[Exception],
+) -> None:
+    """Surface only transient Textify terminal failures as retryable."""
+    repository = _CoordinationRepository()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(
+                202,
+                headers={"Location": _CAPABILITY_LINK, "Retry-After": "0"},
+                json={
+                    "id": "00000000-0000-4000-8000-000000000000",
+                    "status": "queued",
+                    "submitted_at": _SUBMITTED_AT,
+                    "links": {
+                        "self": _CAPABILITY_LINK,
+                        "cancel": f"{_CAPABILITY_LINK}/cancellation",
+                    },
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "00000000-0000-4000-8000-000000000000",
+                "status": "finished",
+                "outcome": "failed",
+                "submitted_at": _SUBMITTED_AT,
+                "started_at": _STARTED_AT,
+                "finished_at": _FINISHED_AT,
+                "error": {"code": error_code, "message": "provider detail"},
+                "links": {"self": _CAPABILITY_LINK},
+            },
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://textify.test/",
+        follow_redirects=False,
+    )
+    provider = TextifySourceTranscriptProvider(
+        client=client,
+        coordination_repository=repository,
+        settings=_textify_settings(),
+        cache=DisabledCache(),
+        sleeper=lambda seconds: _no_wait(seconds),
+    )
+
+    with pytest.raises(expected_error, match="^Transcript is unavailable for this video\\.$"):
+        await provider.acquire(_SUBMITTED_URL)
+
+    assert repository.calls[-1][0] == "delete"
+    await provider.aclose()
+
+
+async def test_provider_marks_exhausted_transport_failures_retryable() -> None:
+    """Classify Textify transport exhaustion as a retryable extraction failure."""
+    repository = _CoordinationRepository()
+    clock = {"now": 0.0}
+
+    async def sleeper(seconds: float) -> None:
+        clock["now"] += seconds
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection failed", request=request)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://textify.test/",
+        follow_redirects=False,
+    )
+    provider = TextifySourceTranscriptProvider(
+        client=client,
+        coordination_repository=repository,
+        settings=_textify_settings(transport_retry_budget_seconds=1),
+        cache=DisabledCache(),
+        clock=lambda: clock["now"],
+        sleeper=sleeper,
+    )
+
+    with pytest.raises(
+        RetryableTranscriptionError,
+        match="^Transcript is unavailable for this video\\.$",
+    ):
+        await provider.acquire(_SUBMITTED_URL)
+
+    await provider.aclose()
+
+
+async def _no_wait(seconds: float) -> None:
+    """Accept expected zero-length Textify polling delays in provider tests."""
+    assert seconds == 0

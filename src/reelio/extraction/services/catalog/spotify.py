@@ -34,7 +34,12 @@ from reelio.cache import (
     RevalidatingCacheEntry,
 )
 from reelio.cache.interface import JsonObject
-from reelio.extraction.exceptions import CatalogProviderError, PipelineTimeoutError
+from reelio.extraction.exceptions import (
+    CatalogProviderError,
+    PipelineTimeoutError,
+    RetryableCatalogProviderError,
+    is_retryable_provider_status,
+)
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.services.catalog.config import SpotifyConfig
 from reelio.extraction.services.catalog.types import (
@@ -669,8 +674,14 @@ class SpotifyCatalog:
             self._raise_timeout(exc)
         except httpx.TimeoutException as exc:
             self._raise_timeout(exc)
-        except httpx.HTTPError as exc:
-            self._raise_provider_error("http_failure", exc)
+        except httpx.HTTPStatusError as exc:
+            self._raise_provider_error(
+                "http_failure",
+                exc,
+                retryable=is_retryable_provider_status(exc.response.status_code),
+            )
+        except httpx.TransportError as exc:
+            self._raise_provider_error("transport_failure", exc, retryable=True)
         except (ValidationError, ValueError) as exc:
             self._raise_provider_error("invalid_provider_response", exc)
 
@@ -756,9 +767,12 @@ class SpotifyCatalog:
             return response
 
         # Preserve conditional headers for the one permitted rate-limit retry.
-        retry_after = _retry_after_seconds(response)
+        try:
+            retry_after = _retry_after_seconds(response)
+        except ValueError as exc:
+            self._raise_provider_error("invalid_retry_after", exc, retryable=True)
         if retry_after > deadline - self._clock():
-            self._raise_provider_error("rate_limit_exceeds_timeout")
+            self._raise_provider_error("rate_limit_exceeds_timeout", retryable=True)
 
         await self._sleep(retry_after)
         response = await self._client.get(
@@ -767,7 +781,7 @@ class SpotifyCatalog:
             headers=headers,
         )
         if response.status_code == httpx.codes.TOO_MANY_REQUESTS:
-            self._raise_provider_error("rate_limit_retry_exhausted")
+            self._raise_provider_error("rate_limit_retry_exhausted", retryable=True)
         return response
 
     def _validate_response[ModelType: BaseModel](
@@ -787,14 +801,21 @@ class SpotifyCatalog:
         )
         raise PipelineTimeoutError(_CATALOG_TIMEOUT_MESSAGE) from exc
 
-    def _raise_provider_error(self, reason: str, exc: Exception | None = None) -> NoReturn:
+    def _raise_provider_error(
+        self,
+        reason: str,
+        exc: Exception | None = None,
+        *,
+        retryable: bool = False,
+    ) -> NoReturn:
         logger.error(
             "Spotify catalog request failed",
             extra={"stage": _STAGE, "reason": reason},
         )
+        error_type = RetryableCatalogProviderError if retryable else CatalogProviderError
         if exc is None:
-            raise CatalogProviderError(_CATALOG_ERROR_MESSAGE)
-        raise CatalogProviderError(_CATALOG_ERROR_MESSAGE) from exc
+            raise error_type(_CATALOG_ERROR_MESSAGE)
+        raise error_type(_CATALOG_ERROR_MESSAGE) from exc
 
 
 def create_spotify_catalog(settings: SpotifyConfig, cache: AsyncCache) -> SpotifyCatalog:

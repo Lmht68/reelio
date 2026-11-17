@@ -22,7 +22,12 @@ from rapidfuzz import fuzz
 
 from reelio.cache import AsyncCache, CacheCodec, CacheCodecError, CacheEntry
 from reelio.cache.interface import JsonObject
-from reelio.extraction.exceptions import EnrichmentError, PipelineTimeoutError
+from reelio.extraction.exceptions import (
+    EnrichmentError,
+    PipelineTimeoutError,
+    RetryableEnrichmentError,
+    is_retryable_provider_status,
+)
 from reelio.extraction.services.enrichment.config import TMDBConfig
 from reelio.extraction.types import (
     EnrichedMovie,
@@ -965,12 +970,23 @@ class TMDBScreenWorkResolver:
                 extra={"stage": _STAGE, "reason": "provider_timeout"},
             )
             raise PipelineTimeoutError(_ENRICHMENT_TIMEOUT_MESSAGE) from exc
-        except httpx.HTTPError as exc:
+        except httpx.HTTPStatusError as exc:
             logger.error(
                 "TMDB request failed",
-                extra={"stage": _STAGE, "reason": "provider_failure"},
+                extra={"stage": _STAGE, "reason": "provider_http_failure"},
             )
-            raise EnrichmentError(_ENRICHMENT_ERROR_MESSAGE) from exc
+            error_type = (
+                RetryableEnrichmentError
+                if is_retryable_provider_status(exc.response.status_code)
+                else EnrichmentError
+            )
+            raise error_type(_ENRICHMENT_ERROR_MESSAGE) from exc
+        except httpx.TransportError as exc:
+            logger.error(
+                "TMDB request failed",
+                extra={"stage": _STAGE, "reason": "provider_transport_failure"},
+            )
+            raise RetryableEnrichmentError(_ENRICHMENT_ERROR_MESSAGE) from exc
 
         try:
             return parser(cast(object, response.json()))

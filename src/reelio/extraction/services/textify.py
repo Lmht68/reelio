@@ -39,6 +39,7 @@ from reelio.extraction.exceptions import (
     InvalidSourceError,
     MetadataProviderError,
     PipelineTimeoutError,
+    RetryableTranscriptionError,
     SourceUnavailableError,
     TranscriptionError,
     TranscriptionUnavailableError,
@@ -582,6 +583,8 @@ class TextifySourceTranscriptProvider:
                     and inspection.code == "job_store_unavailable"
                 ):
                     raise _transcription_unavailable() from None
+                if inspection.code == "internal_error":
+                    raise _retryable_transcription_failure() from None
                 _invalid_textify_response("incompatible_polling_error")
 
             if inspection.links.self != capability_link:
@@ -935,6 +938,8 @@ def _admission_exception(code: _TextifyErrorCode) -> Exception:
         return UnsupportedPlatformError(_UNSUPPORTED_PLATFORM_MESSAGE)
     if code == "job_store_unavailable":
         return _transcription_unavailable()
+    if code == "internal_error":
+        return _retryable_transcription_failure()
     return _transcription_failure()
 
 
@@ -970,6 +975,8 @@ def _terminal_exception(code: _TextifyErrorCode) -> Exception:
         return PipelineTimeoutError(_TRANSCRIPT_TIMEOUT_MESSAGE)
     if code in {"transcription_capacity_exceeded", "job_store_unavailable"}:
         return _transcription_unavailable()
+    if code in {"worker_interrupted", "internal_error"}:
+        return _retryable_transcription_failure()
     return _transcription_failure()
 
 
@@ -1122,12 +1129,17 @@ def _raise_transport_exhausted(error: httpx.TransportError | None) -> NoReturn:
         _log_adapter_event("transport_timeout_retry_exhausted")
         raise PipelineTimeoutError(_TRANSCRIPT_TIMEOUT_MESSAGE) from None
     _log_adapter_event("transport_retry_exhausted")
-    raise _transcription_failure() from None
+    raise _retryable_transcription_failure() from None
 
 
 def _transcription_failure() -> TranscriptionError:
     """Create the existing safe public Transcript failure without provider details."""
     return TranscriptionError(_TRANSCRIPTION_FAILURE_MESSAGE)
+
+
+def _retryable_transcription_failure() -> RetryableTranscriptionError:
+    """Create the stable temporary retryable transcription failure."""
+    return RetryableTranscriptionError(_TRANSCRIPTION_FAILURE_MESSAGE)
 
 
 def _transcription_unavailable() -> TranscriptionUnavailableError:

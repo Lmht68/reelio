@@ -160,10 +160,8 @@ async def get_source_extraction_job(
         owner_cookie: Optional existing HttpOnly anonymous owner cookie.
 
     Returns:
-        A no-store queued, running, or succeeded public job projection.
-
-    Raises:
-        RuntimeError: If a failed state is found before its public projection exists.
+        A no-store public job projection containing queued, running, succeeded, or
+        terminal failed state.
     """
     owner = owner_manager.resolve_existing(owner_cookie)
     if owner is None:
@@ -201,7 +199,17 @@ async def get_source_extraction_job(
             _NO_STORE_HEADERS,
         )
     if isinstance(job, FailedSourceJob):
-        raise RuntimeError("Source Extraction job failed before failure projection exists")
+        return _response(
+            job_schemas.FailedSourceExtractionJob(
+                job_id=job.job_id,
+                status="failed",
+                error=extraction_schemas.ErrorDetail(
+                    code=job.error_code,
+                    message=job.error_message,
+                ),
+            ),
+            _NO_STORE_HEADERS,
+        )
     raise RuntimeError("Source Extraction job has an unsupported public state")
 
 
@@ -212,8 +220,7 @@ def _response(
     """Serialize one validated public job projection with explicit cache headers.
 
     Args:
-        body: Validated nonterminal or succeeded public projection.
-        headers: Cache and polling headers for the projection state.
+        body: Validated public job projection.
 
     Returns:
         JSON response containing only the public job projection.

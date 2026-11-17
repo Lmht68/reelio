@@ -1,10 +1,19 @@
 """Bounded execution for claimed Source Extraction jobs."""
 
 import asyncio
+import logging
+import random
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from datetime import timedelta
+from enum import Enum, auto
 from math import isfinite
 
+from reelio.extraction.exceptions import (
+    INTERNAL_ERROR_CODE,
+    INTERNAL_ERROR_MESSAGE,
+    ExtractionError,
+)
 from reelio.extraction.jobs import (
     ExtractionJobStateError,
     ExtractionJobStore,
@@ -12,6 +21,21 @@ from reelio.extraction.jobs import (
 )
 from reelio.extraction.response_mapper import map_extraction_response
 from reelio.extraction.service import ExtractionPipelineProtocol
+
+logger = logging.getLogger(__name__)
+
+_RETRY_BASE_DELAY_SECONDS = 1.0
+_RETRY_MAX_DELAY_SECONDS = 30.0
+_MAX_SOURCE_ATTEMPTS = 3
+
+
+class _AttemptOutcome(Enum):
+    """Represent the durable result of one claimed Source attempt."""
+
+    SUCCEEDED = auto()
+    RETRIED = auto()
+    FAILED = auto()
+    LEASE_LOST = auto()
 
 
 class ExtractionJobWorker:
@@ -25,6 +49,7 @@ class ExtractionJobWorker:
         concurrency: int = 2,
         heartbeat_interval_seconds: float = 15.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        jitter: Callable[[], float] = random.random,
     ) -> None:
         """Initialize one worker with bounded pipeline and lease-heartbeat execution.
 
@@ -34,6 +59,7 @@ class ExtractionJobWorker:
             concurrency: Maximum number of Source jobs executed at one time.
             heartbeat_interval_seconds: Delay between live-attempt lease renewals.
             sleep: Awaitable delay seam used by heartbeat execution.
+            jitter: Unit-interval random seam used to spread retry delays.
 
         Raises:
             ValueError: If concurrency or heartbeat_interval_seconds is invalid.
@@ -48,6 +74,7 @@ class ExtractionJobWorker:
         self._concurrency = concurrency
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._sleep = sleep
+        self._jitter = jitter
         self._run_lock = asyncio.Lock()
         self._claim_gate = asyncio.Lock()
         self._shutdown_lock = asyncio.Lock()
@@ -110,7 +137,8 @@ class ExtractionJobWorker:
             self._active_attempt_tasks.add(attempt_task)
 
         try:
-            return await self._run_claimed_attempt(job)
+            outcome = await self._run_claimed_attempt(job)
+            return outcome is _AttemptOutcome.SUCCEEDED
         except asyncio.CancelledError:
             if self._shutdown_requested:
                 await self._store.requeue_source_attempt(job.job_id, job.lease_token)
@@ -119,7 +147,7 @@ class ExtractionJobWorker:
         finally:
             self._active_attempt_tasks.discard(attempt_task)
 
-    async def _run_claimed_attempt(self, job: RunningSourceJob) -> bool:
+    async def _run_claimed_attempt(self, job: RunningSourceJob) -> _AttemptOutcome:
         """Execute one owned attempt beside its lease heartbeat."""
         pipeline_task = asyncio.create_task(self._pipeline.run(job.source_url, job.market))
         heartbeat_task = asyncio.create_task(self._heartbeat(job, pipeline_task))
@@ -132,9 +160,25 @@ class ExtractionJobWorker:
                 pipeline_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await pipeline_task
-                return False
+                return _AttemptOutcome.LEASE_LOST
 
-            pipeline_result = await pipeline_task
+            try:
+                pipeline_result = await pipeline_task
+                response = map_extraction_response(pipeline_result)
+            except ExtractionError as exc:
+                return await self._handle_extraction_failure(job, exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error(
+                    "Source Extraction attempt failed unexpectedly",
+                    extra={"stage": "job_worker", "reason": "unexpected_failure"},
+                )
+                return await self._complete_failure(
+                    job,
+                    INTERNAL_ERROR_CODE,
+                    INTERNAL_ERROR_MESSAGE,
+                )
         finally:
             heartbeat_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -144,12 +188,58 @@ class ExtractionJobWorker:
                 with suppress(asyncio.CancelledError):
                     await pipeline_task
 
-        response = map_extraction_response(pipeline_result)
         try:
             await self._store.complete_success(job.job_id, job.lease_token, response)
         except ExtractionJobStateError:
-            return False
-        return True
+            return _AttemptOutcome.LEASE_LOST
+        return _AttemptOutcome.SUCCEEDED
+
+    async def _handle_extraction_failure(
+        self,
+        job: RunningSourceJob,
+        error: ExtractionError,
+    ) -> _AttemptOutcome:
+        """Commit, or durably reschedule, one safe classified pipeline failure."""
+        if error.retryable and job.attempt_count < _MAX_SOURCE_ATTEMPTS:
+            retry_delay = timedelta(seconds=self._retry_delay_seconds(job.attempt_count))
+            if await self._store.retry_source_attempt(
+                job.job_id,
+                job.lease_token,
+                retry_delay,
+            ):
+                return _AttemptOutcome.RETRIED
+            return _AttemptOutcome.LEASE_LOST
+        return await self._complete_failure(job, error.code, str(error))
+
+    async def _complete_failure(
+        self,
+        job: RunningSourceJob,
+        error_code: str,
+        error_message: str,
+    ) -> _AttemptOutcome:
+        """Fence and persist one safe terminal failure."""
+        try:
+            await self._store.complete_failure(
+                job.job_id,
+                job.lease_token,
+                error_code,
+                error_message,
+            )
+        except ExtractionJobStateError:
+            return _AttemptOutcome.LEASE_LOST
+        return _AttemptOutcome.FAILED
+
+    def _retry_delay_seconds(self, attempt_count: int) -> float:
+        """Calculate one bounded exponentially increasing retry delay with jitter."""
+        base_delay: float = min(
+            _RETRY_BASE_DELAY_SECONDS * 2 ** (attempt_count - 1),
+            _RETRY_MAX_DELAY_SECONDS,
+        )
+        jitter: float = self._jitter()
+        if not isfinite(jitter) or not 0.0 <= jitter <= 1.0:
+            raise ValueError("jitter must return a finite value in [0, 1]")
+        delay = base_delay * (1.0 + jitter)
+        return delay if delay < _RETRY_MAX_DELAY_SECONDS else _RETRY_MAX_DELAY_SECONDS
 
     async def _heartbeat(
         self,

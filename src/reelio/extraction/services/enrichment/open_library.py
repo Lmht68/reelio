@@ -25,7 +25,12 @@ from rapidfuzz import fuzz
 
 from reelio.cache import AsyncCache, CacheCodec, CacheCodecError, CacheEntry
 from reelio.cache.interface import JsonObject
-from reelio.extraction.exceptions import CatalogProviderError, PipelineTimeoutError
+from reelio.extraction.exceptions import (
+    CatalogProviderError,
+    PipelineTimeoutError,
+    RetryableCatalogProviderError,
+    is_retryable_provider_status,
+)
 from reelio.extraction.services.enrichment.config import OpenLibraryConfig
 from reelio.extraction.types import (
     BookEdition,
@@ -849,24 +854,27 @@ class OpenLibraryBookResolver:
                 raise
             except httpx.TransportError as exc:
                 if attempt == 1:
-                    self._raise_catalog_failure("retry_exhausted", exc)
+                    self._raise_catalog_failure("retry_exhausted", exc, retryable=True)
                 continue
 
             if response.is_success:
                 return response
-            if response.status_code == 429 or response.status_code >= 500:
+            if is_retryable_provider_status(response.status_code):
                 if attempt == 1:
-                    self._raise_catalog_failure("retry_exhausted")
+                    self._raise_catalog_failure("retry_exhausted", retryable=True)
                 retry_after_header = response.headers.get("Retry-After")
                 if response.status_code == 429 and retry_after_header is None:
-                    self._raise_catalog_failure("http_failure")
+                    self._raise_catalog_failure("http_failure", retryable=True)
                 if retry_after_header is not None:
                     try:
                         retry_after = _retry_after_seconds(response)
                     except ValueError as exc:
-                        self._raise_catalog_failure("http_failure", exc)
+                        self._raise_catalog_failure("http_failure", exc, retryable=True)
                     if retry_after > deadline - self._clock():
-                        self._raise_catalog_failure("retry_after_exceeds_timeout")
+                        self._raise_catalog_failure(
+                            "retry_after_exceeds_timeout",
+                            retryable=True,
+                        )
                     await self._sleep(retry_after)
                 continue
             self._raise_catalog_failure("http_failure")
@@ -938,14 +946,17 @@ class OpenLibraryBookResolver:
         self,
         reason: str,
         exception: Exception | None = None,
+        *,
+        retryable: bool = False,
     ) -> NoReturn:
         logger.error(
             "Open Library catalog request failed",
             extra={"stage": _STAGE, "reason": reason},
         )
+        error_type = RetryableCatalogProviderError if retryable else CatalogProviderError
         if exception is None:
-            raise CatalogProviderError(_CATALOG_ERROR_MESSAGE)
-        raise CatalogProviderError(_CATALOG_ERROR_MESSAGE) from exception
+            raise error_type(_CATALOG_ERROR_MESSAGE)
+        raise error_type(_CATALOG_ERROR_MESSAGE) from exception
 
 
 def create_open_library_book_resolver(

@@ -236,6 +236,42 @@ async def test_status_projects_only_queued_running_and_succeeded_fields() -> Non
         assert response.headers["Cache-Control"] == "no-store"
 
 
+async def test_status_projects_terminal_safe_failure_without_retry_metadata() -> None:
+    """Expose only a failed status and its existing safe public error object."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    store = InMemoryExtractionJobStore(uuid_factory=lambda: job_id)
+    application = _application(store)
+    transport = ASGITransport(app=application)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post(
+            "/api/extraction-jobs",
+            json={"url": _SUBMITTED_URL},
+            headers=_headers(),
+        )
+        running = await store.claim_next_source()
+        assert running is not None
+        await store.complete_failure(
+            job_id,
+            running.lease_token,
+            "catalog_provider_failed",
+            "Catalog provider request failed.",
+        )
+        response = await client.get(f"/api/extraction-jobs/{job_id}")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "job_id": str(job_id),
+        "status": "failed",
+        "error": {
+            "code": "catalog_provider_failed",
+            "message": "Catalog provider request failed.",
+        },
+    }
+    assert response.headers["Cache-Control"] == "no-store"
+    assert "Retry-After" not in response.headers
+
+
 async def test_missing_job_returns_the_no_store_error_envelope() -> None:
     """Distinguish an absent opaque job identity without cacheable error state."""
     application = _application(InMemoryExtractionJobStore())
@@ -328,6 +364,8 @@ class _RecordingStore:
             market=market,
             submitted_at=submitted_at,
             updated_at=submitted_at,
+            attempt_count=0,
+            eligible_at=submitted_at,
         )
 
 

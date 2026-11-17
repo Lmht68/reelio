@@ -3,13 +3,15 @@
 from collections.abc import Sequence
 from typing import cast
 
-from openai import APIError, APITimeoutError, AsyncOpenAI
+from openai import APIError, APIStatusError, APITimeoutError, AsyncOpenAI
 from openai.types.responses import ResponseInputParam, ResponseTextConfigParam
 from openai.types.shared_params import Reasoning
 
 from reelio.extraction.exceptions import (
     MentionInterpretationError,
     PipelineTimeoutError,
+    RetryableMentionInterpretationError,
+    is_retryable_provider_status,
 )
 from reelio.extraction.services.interpretation.config import LLMProvider, OpenAIConfig
 from reelio.extraction.services.interpretation.messages import (
@@ -88,6 +90,8 @@ class OpenAIProvider:
         except APITimeoutError as exc:
             raise PipelineTimeoutError(PROVIDER_TIMEOUT_MESSAGE) from exc
         except APIError as exc:
+            if not isinstance(exc, APIStatusError) or is_retryable_provider_status(exc.status_code):
+                raise RetryableMentionInterpretationError(PROVIDER_ERROR_MESSAGE) from exc
             raise MentionInterpretationError(PROVIDER_ERROR_MESSAGE) from exc
 
         if response.status != "completed" or not response.output_text:

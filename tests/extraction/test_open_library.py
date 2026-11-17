@@ -9,7 +9,11 @@ import httpx
 import pytest
 
 from reelio.cache import AsyncCache, DisabledCache, RedisCache
-from reelio.extraction.exceptions import CatalogProviderError, PipelineTimeoutError
+from reelio.extraction.exceptions import (
+    CatalogProviderError,
+    PipelineTimeoutError,
+    RetryableCatalogProviderError,
+)
 from reelio.extraction.services.enrichment.config import OpenLibraryConfig
 from reelio.extraction.services.enrichment.open_library import (
     OpenLibraryBookResolver,
@@ -2476,7 +2480,7 @@ async def test_resolver_maps_http_failures_and_timeouts_to_typed_errors() -> Non
     resolver = _resolver(httpx.MockTransport(handle))
     mentions = _mentions(BookMention(title="Target", authors=[]))
 
-    with pytest.raises(CatalogProviderError, match="Open Library catalog request failed"):
+    with pytest.raises(RetryableCatalogProviderError, match="Open Library catalog request failed"):
         await resolver.resolve(mentions)
     with pytest.raises(PipelineTimeoutError, match="Open Library catalog request timed out"):
         await resolver.resolve(mentions)
@@ -2485,8 +2489,8 @@ async def test_resolver_maps_http_failures_and_timeouts_to_typed_errors() -> Non
     await resolver.aclose()
 
 
-async def test_resolver_maps_malformed_json_and_transport_errors_to_catalog_failure() -> None:
-    """Translate unsafe provider response encodings and transport errors consistently."""
+async def test_resolver_maps_malformed_json_and_transport_errors_to_typed_failures() -> None:
+    """Keep malformed output terminal and mark exhausted transport failures retryable."""
     request_count = 0
 
     async def handle(request: httpx.Request) -> httpx.Response:
@@ -2501,10 +2505,40 @@ async def test_resolver_maps_malformed_json_and_transport_errors_to_catalog_fail
 
     with pytest.raises(CatalogProviderError, match="Open Library catalog request failed"):
         await resolver.resolve(mentions)
-    with pytest.raises(CatalogProviderError, match="Open Library catalog request failed"):
+    with pytest.raises(RetryableCatalogProviderError, match="Open Library catalog request failed"):
         await resolver.resolve(mentions)
     assert request_count == 3
 
+    await resolver.aclose()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_error", "expected_request_count"),
+    [
+        (400, CatalogProviderError, 1),
+        (429, RetryableCatalogProviderError, 2),
+    ],
+)
+async def test_resolver_classifies_http_failure_retryability(
+    status_code: int,
+    expected_error: type[Exception],
+    expected_request_count: int,
+) -> None:
+    """Retry only Open Library's documented transient HTTP responses."""
+    request_count = 0
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        headers = {"Retry-After": "0"} if status_code == 429 else {}
+        return httpx.Response(status_code, headers=headers)
+
+    resolver = _resolver(httpx.MockTransport(handle))
+
+    with pytest.raises(expected_error, match="Open Library catalog request failed"):
+        await resolver.resolve(_mentions(BookMention(title="Target", authors=[])))
+
+    assert request_count == expected_request_count
     await resolver.aclose()
 
 

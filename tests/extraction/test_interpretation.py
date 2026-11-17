@@ -12,7 +12,7 @@ from typing import cast
 
 import httpx
 import pytest
-from openai import APIError, APITimeoutError, AsyncOpenAI
+from openai import APIError, APIStatusError, APITimeoutError, AsyncOpenAI
 
 import reelio.extraction.services.interpretation.deepseek as deepseek_adapter
 import reelio.extraction.services.interpretation.service as interpretation_service_module
@@ -23,6 +23,7 @@ from reelio.extraction.exceptions import (
     InvalidLLMResponseError,
     MentionInterpretationError,
     PipelineTimeoutError,
+    RetryableMentionInterpretationError,
 )
 from reelio.extraction.services.interpretation.config import (
     DeepSeekConfig,
@@ -134,6 +135,18 @@ def _service(
 def _deepseek_settings(**values: object) -> DeepSeekConfig:
     settings_type = cast(Callable[..., DeepSeekConfig], DeepSeekConfig)
     return settings_type(_env_file=None, api_key="test-key", **values)
+
+
+def _deepseek_status_error(status_code: int) -> APIStatusError:
+    """Build one DeepSeek SDK response failure with a known provider status."""
+    return APIStatusError(
+        "provider error",
+        response=httpx.Response(
+            status_code,
+            request=httpx.Request("POST", "https://api.deepseek.com/chat/completions"),
+        ),
+        body=None,
+    )
 
 
 def _source(
@@ -1774,8 +1787,11 @@ async def test_deepseek_adapter_sends_json_options_and_closes_client() -> None:
                 httpx.Request("POST", "https://api.deepseek.com/chat/completions"),
                 body=None,
             ),
-            MentionInterpretationError,
+            RetryableMentionInterpretationError,
         ),
+        (_deepseek_status_error(400), MentionInterpretationError),
+        (_deepseek_status_error(429), RetryableMentionInterpretationError),
+        (_deepseek_status_error(503), RetryableMentionInterpretationError),
     ],
 )
 async def test_deepseek_adapter_maps_sdk_failures(

@@ -20,6 +20,10 @@ from reelio.extraction.exceptions import (
     MentionInterpretationError,
     MetadataProviderError,
     PipelineTimeoutError,
+    RetryableCatalogProviderError,
+    RetryableEnrichmentError,
+    RetryableMentionInterpretationError,
+    RetryableTranscriptionError,
     SourceUnavailableError,
     TranscriptionError,
     TranscriptionUnavailableError,
@@ -987,52 +991,79 @@ async def test_social_sources_serialize_unchanged_response_schema(
 
 
 @pytest.mark.parametrize(
-    ("exception", "expected_status", "expected_code"),
+    ("exception", "expected_status", "expected_code", "expected_retryable"),
     [
-        (InvalidSourceError("invalid source"), 400, "invalid_source"),
+        (InvalidSourceError("invalid source"), 400, "invalid_source", False),
         (
             UnsupportedPlatformError("unsupported platform"),
             400,
             "unsupported_platform",
+            False,
         ),
-        (SourceUnavailableError("source unavailable"), 404, "source_unavailable"),
+        (SourceUnavailableError("source unavailable"), 404, "source_unavailable", False),
         (
             DurationLimitExceededError("duration limit exceeded"),
             413,
             "duration_limit_exceeded",
+            False,
         ),
         (
             InterpretationInputTooLargeError("interpretation input too large"),
             413,
             "interpretation_input_too_large",
+            False,
         ),
         (
             MetadataProviderError("Unable to retrieve YouTube metadata."),
             502,
             "metadata_provider_failed",
+            False,
         ),
-        (TranscriptionError("transcription failed"), 502, "transcription_failed"),
+        (TranscriptionError("transcription failed"), 502, "transcription_failed", False),
+        (
+            RetryableTranscriptionError("transcription failed"),
+            502,
+            "transcription_failed",
+            True,
+        ),
         (
             MentionInterpretationError("mention interpretation failed"),
             502,
             "mention_interpretation_failed",
+            False,
+        ),
+        (
+            RetryableMentionInterpretationError("mention interpretation failed"),
+            502,
+            "mention_interpretation_failed",
+            True,
         ),
         (
             InvalidLLMResponseError("invalid provider response"),
             502,
             "invalid_llm_response",
+            False,
         ),
-        (EnrichmentError("enrichment failed"), 502, "enrichment_failed"),
+        (EnrichmentError("enrichment failed"), 502, "enrichment_failed", False),
+        (RetryableEnrichmentError("enrichment failed"), 502, "enrichment_failed", True),
         (
             CatalogProviderError("Spotify catalog request failed."),
             502,
             "catalog_provider_failed",
+            False,
         ),
-        (PipelineTimeoutError("pipeline timed out"), 504, "pipeline_timeout"),
+        (
+            RetryableCatalogProviderError("Spotify catalog request failed."),
+            502,
+            "catalog_provider_failed",
+            True,
+        ),
+        (PipelineTimeoutError("pipeline timed out"), 504, "pipeline_timeout", True),
         (
             TranscriptionUnavailableError("Transcription is temporarily unavailable."),
             503,
             "transcription_unavailable",
+            True,
         ),
     ],
 )
@@ -1041,6 +1072,7 @@ async def test_extraction_errors_map_to_contract(
     exception: ExtractionError,
     expected_status: int,
     expected_code: str,
+    expected_retryable: bool,
 ) -> None:
     """Map every extraction domain error to its stable HTTP contract."""
     _install_pipeline(app, _RaisingPipeline(exception))
@@ -1052,6 +1084,7 @@ async def test_extraction_errors_map_to_contract(
 
     assert response.status_code == expected_status
     assert response.json() == {"error": {"code": expected_code, "message": str(exception)}}
+    assert exception.retryable is expected_retryable
 
 
 async def test_temporary_transcription_unavailability_includes_retry_after(

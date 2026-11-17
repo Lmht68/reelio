@@ -3,12 +3,14 @@
 from collections.abc import Sequence
 from typing import cast
 
-from openai import APIError, APITimeoutError, AsyncOpenAI
+from openai import APIError, APIStatusError, APITimeoutError, AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
 from reelio.extraction.exceptions import (
     MentionInterpretationError,
     PipelineTimeoutError,
+    RetryableMentionInterpretationError,
+    is_retryable_provider_status,
 )
 from reelio.extraction.services.interpretation.config import (
     DeepSeekConfig,
@@ -73,6 +75,8 @@ class DeepSeekProvider:
         except APITimeoutError as exc:
             raise PipelineTimeoutError(PROVIDER_TIMEOUT_MESSAGE) from exc
         except APIError as exc:
+            if not isinstance(exc, APIStatusError) or is_retryable_provider_status(exc.status_code):
+                raise RetryableMentionInterpretationError(PROVIDER_ERROR_MESSAGE) from exc
             raise MentionInterpretationError(PROVIDER_ERROR_MESSAGE) from exc
 
         if not response.choices:

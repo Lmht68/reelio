@@ -9,7 +9,11 @@ import httpx
 import pytest
 
 from reelio.cache import AsyncCache, DisabledCache, RedisCache
-from reelio.extraction.exceptions import EnrichmentError, PipelineTimeoutError
+from reelio.extraction.exceptions import (
+    EnrichmentError,
+    PipelineTimeoutError,
+    RetryableEnrichmentError,
+)
 from reelio.extraction.services.enrichment.config import TMDBConfig
 from reelio.extraction.services.enrichment.tmdb import (
     TMDBScreenWorkResolver,
@@ -3228,8 +3232,8 @@ async def test_resolver_fails_open_when_tmdb_cache_commands_fail(
 @pytest.mark.parametrize(
     ("failure_kind", "expected_exception"),
     [
-        ("http_429", EnrichmentError),
-        ("http_5xx", EnrichmentError),
+        ("http_429", RetryableEnrichmentError),
+        ("http_5xx", RetryableEnrichmentError),
         ("timeout", PipelineTimeoutError),
         ("malformed_json", EnrichmentError),
         ("provider_validation", EnrichmentError),

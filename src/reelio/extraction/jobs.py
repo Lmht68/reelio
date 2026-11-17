@@ -1,7 +1,7 @@
 """Application-owned Source Extraction job state and storage protocol."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
@@ -42,11 +42,14 @@ class _SourceExtractionJobSnapshot:
     market: SpotifyMarket | None
     submitted_at: datetime
     updated_at: datetime
+    attempt_count: int
 
 
 @dataclass(frozen=True, slots=True)
 class QueuedSourceJob(_SourceExtractionJobSnapshot):
     """Represent a committed Source Extraction job awaiting a worker claim."""
+
+    eligible_at: datetime
 
     status: ExtractionJobStatus = field(
         init=False,
@@ -212,6 +215,28 @@ class ExtractionJobStore(Protocol):
 
         Raises:
             ExtractionJobStateError: If the attempt is absent, expired, or replaced.
+            ExtractionJobStoreUnavailableError: If storage cannot complete the update.
+        """
+        ...
+
+    async def retry_source_attempt(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        retry_delay: timedelta,
+    ) -> bool:
+        """Reschedule one owned running attempt after a positive delay.
+
+        Args:
+            job_id: Claimed Source Extraction job identity.
+            lease_token: Opaque token issued with the claimed attempt.
+            retry_delay: Positive wait before another worker can claim the job.
+
+        Returns:
+            True after rescheduling the owned attempt, or False when ownership was lost.
+
+        Raises:
+            ValueError: If retry_delay is not positive.
             ExtractionJobStoreUnavailableError: If storage cannot complete the update.
         """
         ...

@@ -5,7 +5,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from reelio.extraction.schemas import ExtractResponse
+from reelio.extraction.schemas import ErrorDetail, ExtractResponse
 
 
 class AcceptedSourceExtractionJob(BaseModel):
@@ -37,7 +37,18 @@ class SucceededSourceExtractionJob(BaseModel):
     result: ExtractResponse
 
 
+class FailedSourceExtractionJob(BaseModel):
+    """Represent one terminal Source Extraction job failure safely."""
+
+    job_id: UUID
+    status: Literal["failed"]
+    error: ErrorDetail
+
+
 type SourceExtractionJobStatusResponse = Annotated[
-    QueuedSourceExtractionJob | RunningSourceExtractionJob | SucceededSourceExtractionJob,
+    QueuedSourceExtractionJob
+    | RunningSourceExtractionJob
+    | SucceededSourceExtractionJob
+    | FailedSourceExtractionJob,
     Field(discriminator="status"),
 ]

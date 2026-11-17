@@ -8,6 +8,9 @@ from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
+INTERNAL_ERROR_CODE = "internal_error"
+INTERNAL_ERROR_MESSAGE = "An unexpected error occurred."
+
 
 class ExtractionError(Exception):
     """Base class for errors raised by the extraction pipeline.
@@ -21,6 +24,19 @@ class ExtractionError(Exception):
     code: ClassVar[str]
     status_code: ClassVar[int]
     retry_after_seconds: ClassVar[int | None] = None
+    retryable: ClassVar[bool] = False
+
+
+def is_retryable_provider_status(status_code: int) -> bool:
+    """Return whether one provider response status denotes a transient failure.
+
+    Args:
+        status_code: HTTP status returned by an external provider.
+
+    Returns:
+        True for rate limiting and server failures, otherwise False.
+    """
+    return status_code == 429 or 500 <= status_code <= 599
 
 
 class InvalidSourceError(ExtractionError):
@@ -28,6 +44,7 @@ class InvalidSourceError(ExtractionError):
 
     code = "invalid_source"
     status_code = 400
+    retryable: ClassVar[bool] = False
 
 
 class UnsupportedPlatformError(ExtractionError):
@@ -35,6 +52,7 @@ class UnsupportedPlatformError(ExtractionError):
 
     code = "unsupported_platform"
     status_code = 400
+    retryable: ClassVar[bool] = False
 
 
 class SourceUnavailableError(ExtractionError):
@@ -42,6 +60,7 @@ class SourceUnavailableError(ExtractionError):
 
     code = "source_unavailable"
     status_code = 404
+    retryable: ClassVar[bool] = False
 
 
 class DurationLimitExceededError(ExtractionError):
@@ -49,6 +68,7 @@ class DurationLimitExceededError(ExtractionError):
 
     code = "duration_limit_exceeded"
     status_code = 413
+    retryable: ClassVar[bool] = False
 
 
 class InterpretationInputTooLargeError(ExtractionError):
@@ -56,6 +76,7 @@ class InterpretationInputTooLargeError(ExtractionError):
 
     code = "interpretation_input_too_large"
     status_code = 413
+    retryable: ClassVar[bool] = False
 
 
 class MetadataProviderError(ExtractionError):
@@ -63,6 +84,7 @@ class MetadataProviderError(ExtractionError):
 
     code = "metadata_provider_failed"
     status_code = 502
+    retryable: ClassVar[bool] = False
 
 
 class TranscriptionError(ExtractionError):
@@ -70,6 +92,13 @@ class TranscriptionError(ExtractionError):
 
     code = "transcription_failed"
     status_code = 502
+    retryable: ClassVar[bool] = False
+
+
+class RetryableTranscriptionError(TranscriptionError):
+    """Indicate a transient Transcript acquisition failure."""
+
+    retryable: ClassVar[bool] = True
 
 
 class TranscriptionUnavailableError(ExtractionError):
@@ -78,6 +107,7 @@ class TranscriptionUnavailableError(ExtractionError):
     code = "transcription_unavailable"
     status_code = 503
     retry_after_seconds = 2
+    retryable: ClassVar[bool] = True
 
 
 class MentionInterpretationError(ExtractionError):
@@ -85,12 +115,20 @@ class MentionInterpretationError(ExtractionError):
 
     code = "mention_interpretation_failed"
     status_code = 502
+    retryable: ClassVar[bool] = False
+
+
+class RetryableMentionInterpretationError(MentionInterpretationError):
+    """Indicate a transient Mention Interpretation provider failure."""
+
+    retryable: ClassVar[bool] = True
 
 
 class InvalidLLMResponseError(MentionInterpretationError):
     """Indicate that the LLM returned malformed or invalid structured output."""
 
     code = "invalid_llm_response"
+    retryable: ClassVar[bool] = False
 
 
 class EnrichmentError(ExtractionError):
@@ -98,6 +136,13 @@ class EnrichmentError(ExtractionError):
 
     code = "enrichment_failed"
     status_code = 502
+    retryable: ClassVar[bool] = False
+
+
+class RetryableEnrichmentError(EnrichmentError):
+    """Indicate a transient enrichment provider failure."""
+
+    retryable: ClassVar[bool] = True
 
 
 class CatalogProviderError(ExtractionError):
@@ -105,6 +150,13 @@ class CatalogProviderError(ExtractionError):
 
     code = "catalog_provider_failed"
     status_code = 502
+    retryable: ClassVar[bool] = False
+
+
+class RetryableCatalogProviderError(CatalogProviderError):
+    """Indicate a transient catalog provider failure."""
+
+    retryable: ClassVar[bool] = True
 
 
 class PipelineTimeoutError(ExtractionError):
@@ -112,6 +164,7 @@ class PipelineTimeoutError(ExtractionError):
 
     code = "pipeline_timeout"
     status_code = 504
+    retryable: ClassVar[bool] = True
 
 
 async def extraction_error_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -152,8 +205,8 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
         status_code=500,
         content={
             "error": {
-                "code": "internal_error",
-                "message": "An unexpected error occurred.",
+                "code": INTERNAL_ERROR_CODE,
+                "message": INTERNAL_ERROR_MESSAGE,
             }
         },
     )

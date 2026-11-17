@@ -18,7 +18,7 @@ _REVISION = CURRENT_SCHEMA_REVISION
 _COORDINATION_TABLE_NAME = "textify_coordination"
 _EXTRACTION_JOB_TABLE_NAME = "extraction_job"
 _EXPIRATION_INDEX = "textify_coordination_expires_at_id_idx"
-_QUEUED_INDEX = "extraction_job_queued_submitted_at_job_id_idx"
+_QUEUED_INDEX = "extraction_job_queued_eligible_at_submitted_at_job_id_idx"
 _OWNER_DIGEST_LENGTH_CONSTRAINT = "extraction_job_owner_digest_length_check"
 _OWNER_IDEMPOTENCY_UNIQUE = "extraction_job_owner_idempotency_key_key"
 _CAPABILITY_PATH_PREFIX = "/api/v1/transcription-jobs/"
@@ -171,6 +171,8 @@ async def test_coordination_migration_upgrades_downgrades_and_reupgrades(
             ("status", "text", "NO", None),
             ("submitted_at", "timestamp with time zone", "NO", None),
             ("updated_at", "timestamp with time zone", "NO", None),
+            ("attempt_count", "integer", "NO", None),
+            ("eligible_at", "timestamp with time zone", "YES", None),
             ("started_at", "timestamp with time zone", "YES", None),
             ("finished_at", "timestamp with time zone", "YES", None),
             ("result_version", "text", "YES", None),
@@ -524,5 +526,163 @@ async def test_extraction_job_lease_migration_normalizes_active_work_for_rollbac
             ).one()
 
         assert reupgraded == ("queued", None, submitted_at, None, None)
+    finally:
+        await engine.dispose()
+
+
+async def test_extraction_job_retry_migration_backfills_enforces_and_reupgrades(
+    coordination_database: str,
+) -> None:
+    """Persist valid retry state while rejecting invalid attempt and eligibility combinations."""
+    await asyncio.to_thread(command.upgrade, _alembic_config(), "0005_extraction_job_leases")
+    engine = create_async_engine(coordination_database)
+    submitted_at = datetime(2026, 10, 15, tzinfo=UTC)
+    started_at = submitted_at + timedelta(seconds=1)
+    lease_expires_at = started_at + timedelta(seconds=60)
+    queued_job_id = uuid4()
+    running_job_id = uuid4()
+    owner_digest = bytes(range(32))
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO extraction_job "
+                    "(job_id, source_url, status, submitted_at, updated_at, owner_digest, "
+                    "idempotency_key) "
+                    "VALUES (:job_id, :source_url, 'queued', :submitted_at, :updated_at, "
+                    ":owner_digest, :idempotency_key)"
+                ),
+                {
+                    "job_id": queued_job_id,
+                    "source_url": "https://www.youtube.com/watch?v=queued",
+                    "submitted_at": submitted_at,
+                    "updated_at": submitted_at,
+                    "owner_digest": owner_digest,
+                    "idempotency_key": uuid4(),
+                },
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO extraction_job "
+                    "(job_id, source_url, status, submitted_at, updated_at, started_at, "
+                    "owner_digest, idempotency_key, lease_token, lease_expires_at) "
+                    "VALUES (:job_id, :source_url, 'running', :submitted_at, :updated_at, "
+                    ":started_at, :owner_digest, :idempotency_key, :lease_token, "
+                    ":lease_expires_at)"
+                ),
+                {
+                    "job_id": running_job_id,
+                    "source_url": "https://www.youtube.com/watch?v=running",
+                    "submitted_at": submitted_at,
+                    "updated_at": started_at,
+                    "started_at": started_at,
+                    "owner_digest": owner_digest,
+                    "idempotency_key": uuid4(),
+                    "lease_token": uuid4(),
+                    "lease_expires_at": lease_expires_at,
+                },
+            )
+
+        await asyncio.to_thread(_upgrade_head)
+
+        async with engine.connect() as connection:
+            queued_state = (
+                await connection.execute(
+                    text(
+                        "SELECT attempt_count, eligible_at FROM extraction_job "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {"job_id": queued_job_id},
+                )
+            ).one()
+            running_state = (
+                await connection.execute(
+                    text(
+                        "SELECT attempt_count, eligible_at FROM extraction_job "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {"job_id": running_job_id},
+                )
+            ).one()
+            queued_index = await connection.scalar(
+                text(f"SELECT to_regclass('public.{_QUEUED_INDEX}')")
+            )
+
+        assert queued_state == (0, submitted_at)
+        assert running_state == (1, None)
+        assert queued_index == _QUEUED_INDEX
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO extraction_job "
+                        "(job_id, source_url, status, submitted_at, updated_at, owner_digest, "
+                        "idempotency_key, attempt_count) "
+                        "VALUES (:job_id, :source_url, 'queued', :submitted_at, :updated_at, "
+                        ":owner_digest, :idempotency_key, 0)"
+                    ),
+                    {
+                        "job_id": uuid4(),
+                        "source_url": "https://www.youtube.com/watch?v=missing-eligibility",
+                        "submitted_at": submitted_at,
+                        "updated_at": submitted_at,
+                        "owner_digest": owner_digest,
+                        "idempotency_key": uuid4(),
+                    },
+                )
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO extraction_job "
+                        "(job_id, source_url, status, submitted_at, updated_at, owner_digest, "
+                        "idempotency_key, attempt_count, eligible_at) "
+                        "VALUES (:job_id, :source_url, 'queued', :submitted_at, :updated_at, "
+                        ":owner_digest, :idempotency_key, 4, :eligible_at)"
+                    ),
+                    {
+                        "job_id": uuid4(),
+                        "source_url": "https://www.youtube.com/watch?v=invalid-attempt",
+                        "submitted_at": submitted_at,
+                        "updated_at": submitted_at,
+                        "owner_digest": owner_digest,
+                        "idempotency_key": uuid4(),
+                        "eligible_at": submitted_at,
+                    },
+                )
+
+        await asyncio.to_thread(
+            command.downgrade,
+            _alembic_config(),
+            "0005_extraction_job_leases",
+        )
+
+        async with engine.connect() as connection:
+            retry_columns = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'extraction_job' "
+                    "AND column_name IN ('attempt_count', 'eligible_at')"
+                )
+            )
+
+        assert retry_columns == 0
+
+        await asyncio.to_thread(_upgrade_head)
+
+        async with engine.connect() as connection:
+            reupgraded_queued_state = (
+                await connection.execute(
+                    text(
+                        "SELECT attempt_count, eligible_at FROM extraction_job "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {"job_id": queued_job_id},
+                )
+            ).one()
+
+        assert reupgraded_queued_state == (0, submitted_at)
     finally:
         await engine.dispose()

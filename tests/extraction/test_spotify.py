@@ -8,7 +8,11 @@ import pytest
 from pydantic import ValidationError
 
 from reelio.cache import DisabledCache, RedisCache
-from reelio.extraction.exceptions import CatalogProviderError, PipelineTimeoutError
+from reelio.extraction.exceptions import (
+    CatalogProviderError,
+    PipelineTimeoutError,
+    RetryableCatalogProviderError,
+)
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.services.catalog.config import SpotifyConfig
 from reelio.extraction.services.catalog.spotify import SpotifyCatalog
@@ -796,7 +800,7 @@ async def test_catalog_translates_network_failures_to_typed_errors(
     expected_error = (
         PipelineTimeoutError
         if isinstance(failure, httpx.TimeoutException)
-        else CatalogProviderError
+        else RetryableCatalogProviderError
     )
 
     with pytest.raises(expected_error):
@@ -824,9 +828,35 @@ async def test_catalog_rejects_http_and_malformed_search_responses() -> None:
 
     catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), DisabledCache())
 
-    for query in ("first", "second"):
-        with pytest.raises(CatalogProviderError, match="Spotify catalog request failed"):
-            await catalog.search_tracks(query, _MARKET)
+    with pytest.raises(RetryableCatalogProviderError, match="Spotify catalog request failed"):
+        await catalog.search_tracks("first", _MARKET)
+    with pytest.raises(CatalogProviderError, match="Spotify catalog request failed"):
+        await catalog.search_tracks("second", _MARKET)
+
+    await catalog.aclose()
+
+
+async def test_catalog_marks_exhausted_rate_limit_as_retryable() -> None:
+    """Preserve the retryable classification after Spotify repeats a 429 response."""
+    responses = iter(
+        [
+            httpx.Response(429, headers={"Retry-After": "0"}),
+            httpx.Response(429, headers={"Retry-After": "0"}),
+        ]
+    )
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "accounts.spotify.test":
+            return httpx.Response(
+                200,
+                json={"access_token": "access-token", "expires_in": 3600},
+            )
+        return next(responses)
+
+    catalog = SpotifyCatalog(_client(httpx.MockTransport(handle)), _settings(), DisabledCache())
+
+    with pytest.raises(RetryableCatalogProviderError, match="Spotify catalog request failed"):
+        await catalog.search_tracks("Kiki", _MARKET)
 
     await catalog.aclose()
 

@@ -6,12 +6,13 @@ from typing import cast
 
 import httpx
 import pytest
-from openai import APIError, APITimeoutError, AsyncOpenAI
+from openai import APIError, APIStatusError, APITimeoutError, AsyncOpenAI
 
 import reelio.extraction.services.interpretation.openai as openai_adapter
 from reelio.extraction.exceptions import (
     MentionInterpretationError,
     PipelineTimeoutError,
+    RetryableMentionInterpretationError,
 )
 from reelio.extraction.services.interpretation.config import LLMProvider, OpenAIConfig
 from reelio.extraction.services.interpretation.openai import (
@@ -61,6 +62,18 @@ def _settings(**values: object) -> OpenAIConfig:
         "max_retries": 2,
     }
     return settings_type(_env_file=None, **(defaults | values))
+
+
+def _status_error(status_code: int) -> APIStatusError:
+    """Build one OpenAI SDK response failure with a known provider status."""
+    return APIStatusError(
+        "provider error",
+        response=httpx.Response(
+            status_code,
+            request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        ),
+        body=None,
+    )
 
 
 def test_openai_provider_constructor_uses_configured_client_options(
@@ -211,7 +224,22 @@ async def test_openai_adapter_maps_missing_output() -> None:
                 httpx.Request("POST", "https://api.openai.com/v1/responses"),
                 body=None,
             ),
+            RetryableMentionInterpretationError,
+            "Mention interpretation provider failed.",
+        ),
+        (
+            _status_error(400),
             MentionInterpretationError,
+            "Mention interpretation provider failed.",
+        ),
+        (
+            _status_error(429),
+            RetryableMentionInterpretationError,
+            "Mention interpretation provider failed.",
+        ),
+        (
+            _status_error(503),
+            RetryableMentionInterpretationError,
             "Mention interpretation provider failed.",
         ),
     ],
