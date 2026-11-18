@@ -6,6 +6,8 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
+from pydantic import ValidationError
+
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.schemas import ExtractResponse
 
@@ -33,24 +35,56 @@ class ExtractionJobStateError(RuntimeError):
     """Indicate that a Source Extraction job cannot make the requested transition."""
 
 
+
+def decode_stored_extraction_response(
+    result_version: str,
+    stored_result: object,
+) -> ExtractResponse:
+    """Decode one stored successful response through its recorded contract version.
+
+    Args:
+        result_version: Version recorded with the durable successful result.
+        stored_result: JSON object returned from durable storage.
+
+    Returns:
+        Validated public Extraction response.
+
+    Raises:
+        ExtractionJobStateError: If the stored version is unsupported or the payload is
+            malformed.
+    """
+    if result_version != EXTRACTION_RESPONSE_VERSION:
+        raise ExtractionJobStateError("Source Extraction job has an unsupported stored result version")
+    try:
+        return ExtractResponse.model_validate(stored_result)
+    except ValidationError as exc:
+        raise ExtractionJobStateError("Source Extraction job has a malformed stored result") from exc
+
+
 @dataclass(frozen=True, slots=True)
-class _SourceExtractionJobSnapshot:
-    """Contain immutable Source input shared by every lifecycle snapshot."""
+class AdmittedSourceJob:
+    """Contain only the public identity returned by Source job admission."""
 
     job_id: UUID
-    source_url: str
-    market: SpotifyMarket | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExtractionJobSnapshot:
+    """Contain lifecycle state shared by active and terminal job snapshots."""
+
+    job_id: UUID
     submitted_at: datetime
     updated_at: datetime
     attempt_count: int
 
 
 @dataclass(frozen=True, slots=True)
-class QueuedSourceJob(_SourceExtractionJobSnapshot):
+class QueuedSourceJob(_ExtractionJobSnapshot):
     """Represent a committed Source Extraction job awaiting a worker claim."""
 
+    source_url: str
+    market: SpotifyMarket | None
     eligible_at: datetime
-
     status: ExtractionJobStatus = field(
         init=False,
         default=ExtractionJobStatus.QUEUED,
@@ -58,9 +92,11 @@ class QueuedSourceJob(_SourceExtractionJobSnapshot):
 
 
 @dataclass(frozen=True, slots=True)
-class RunningSourceJob(_SourceExtractionJobSnapshot):
+class RunningSourceJob(_ExtractionJobSnapshot):
     """Represent one Source Extraction job exclusively claimed by a worker."""
 
+    source_url: str
+    market: SpotifyMarket | None
     started_at: datetime
     lease_token: UUID
     lease_expires_at: datetime
@@ -71,11 +107,12 @@ class RunningSourceJob(_SourceExtractionJobSnapshot):
 
 
 @dataclass(frozen=True, slots=True)
-class SucceededSourceJob(_SourceExtractionJobSnapshot):
+class SucceededSourceJob(_ExtractionJobSnapshot):
     """Represent a Source Extraction job with its versioned public response."""
 
     started_at: datetime
     finished_at: datetime
+    expires_at: datetime
     result_version: str
     result: ExtractResponse
     status: ExtractionJobStatus = field(
@@ -85,11 +122,12 @@ class SucceededSourceJob(_SourceExtractionJobSnapshot):
 
 
 @dataclass(frozen=True, slots=True)
-class FailedSourceJob(_SourceExtractionJobSnapshot):
+class FailedSourceJob(_ExtractionJobSnapshot):
     """Represent a terminal Source Extraction failure retained for later projection."""
 
     started_at: datetime | None
     finished_at: datetime
+    expires_at: datetime
     error_code: str
     error_message: str
     status: ExtractionJobStatus = field(
@@ -110,8 +148,8 @@ class ExtractionJobStore(Protocol):
         market: SpotifyMarket | None,
         owner_digest: bytes,
         idempotency_key: UUID,
-    ) -> QueuedSourceJob:
-        """Commit or replay one owner-scoped queued Source Extraction job.
+    ) -> AdmittedSourceJob:
+        """Commit or replay one owner-scoped Source job admission.
 
         Args:
             source_url: Validated public Source URL submitted by the caller.
@@ -120,7 +158,7 @@ class ExtractionJobStore(Protocol):
             idempotency_key: Caller-supplied owner-scoped replay identity.
 
         Returns:
-            The original queued job snapshot for this owner and idempotency key.
+            The committed or replayed job identity.
 
         Raises:
             ExtractionJobCapacityExceededError: If active admission capacity is full.

@@ -168,6 +168,8 @@ async def test_run_once_persists_the_existing_mapper_response() -> None:
     stored = await store.get_for_owner(job_id, _OWNER_DIGEST)
 
     assert isinstance(stored, SucceededSourceJob)
+    assert not hasattr(stored, "source_url")
+    assert not hasattr(stored, "market")
     assert stored.result.model_dump(mode="json") == {
         "market": "US",
         "source": {
@@ -588,6 +590,8 @@ async def test_terminal_pipeline_failure_commits_without_retrying() -> None:
     assert stored.error_code == "invalid_source"
     assert stored.error_message == "Invalid source URL."
     assert await store.claim_next_source() is None
+    assert not hasattr(stored, "source_url")
+    assert not hasattr(stored, "market")
 
 
 async def test_transient_pipeline_failure_retries_then_commits_success() -> None:
@@ -616,6 +620,9 @@ async def test_transient_pipeline_failure_retries_then_commits_success() -> None
     stored = await store.get_for_owner(job_id, _OWNER_DIGEST)
     assert isinstance(stored, SucceededSourceJob)
     assert stored.attempt_count == 2
+
+    assert not hasattr(stored, "source_url")
+    assert not hasattr(stored, "market")
 
 
 async def test_third_transient_pipeline_failure_commits_its_safe_error() -> None:
@@ -647,6 +654,8 @@ async def test_third_transient_pipeline_failure_commits_its_safe_error() -> None
     assert stored.attempt_count == 3
     assert stored.error_code == "pipeline_timeout"
     assert stored.error_message == "Pipeline request timed out."
+    assert not hasattr(stored, "source_url")
+    assert not hasattr(stored, "market")
 
 
 async def test_unexpected_pipeline_failure_commits_generic_safe_error() -> None:

@@ -4,7 +4,7 @@ from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 
-CURRENT_SCHEMA_REVISION = "0006_extraction_job_retries"
+CURRENT_SCHEMA_REVISION = "0007_extraction_job_expiration"
 
 
 class DatabaseConfig(BaseSettings):

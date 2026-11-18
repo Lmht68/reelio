@@ -24,6 +24,7 @@ _OWNER_IDEMPOTENCY_UNIQUE = "extraction_job_owner_idempotency_key_key"
 _CAPABILITY_PATH_PREFIX = "/api/v1/transcription-jobs/"
 _LEASE_TOKEN_CONSTRAINT = "extraction_job_lease_token_uuid4_check"
 _RUNNING_LEASE_INDEX = "extraction_job_running_lease_expires_at_idx"
+_EXTRACTION_EXPIRATION_INDEX = "extraction_job_expires_at_job_id_idx"
 
 
 def _alembic_config() -> Config:
@@ -684,5 +685,233 @@ async def test_extraction_job_retry_migration_backfills_enforces_and_reupgrades(
             ).one()
 
         assert reupgraded_queued_state == (0, submitted_at)
+    finally:
+        await engine.dispose()
+
+
+async def test_extraction_job_expiration_migration_backfills_enforces_and_reupgrades(
+    coordination_database: str,
+) -> None:
+    """Clear terminal input while retaining results for exactly seven days."""
+    await asyncio.to_thread(command.upgrade, _alembic_config(), "0006_extraction_job_retries")
+    engine = create_async_engine(coordination_database)
+    submitted_at = datetime(2026, 10, 15, tzinfo=UTC)
+    started_at = submitted_at + timedelta(seconds=1)
+    succeeded_at = started_at + timedelta(seconds=1)
+    failed_at = started_at + timedelta(seconds=2)
+    owner_digest = bytes(range(32))
+    queued_job_id = uuid4()
+    succeeded_job_id = uuid4()
+    failed_job_id = uuid4()
+    transcript_job_id = uuid4()
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO extraction_job "
+                    "(job_id, source_url, market, status, submitted_at, updated_at, "
+                    "owner_digest, idempotency_key, attempt_count, eligible_at) "
+                    "VALUES (:job_id, :source_url, 'JP', 'queued', :submitted_at, "
+                    ":updated_at, :owner_digest, :idempotency_key, 0, :eligible_at)"
+                ),
+                {
+                    "job_id": queued_job_id,
+                    "source_url": "https://www.youtube.com/watch?v=queued",
+                    "submitted_at": submitted_at,
+                    "updated_at": submitted_at,
+                    "owner_digest": owner_digest,
+                    "idempotency_key": uuid4(),
+                    "eligible_at": submitted_at,
+                },
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO extraction_job "
+                    "(job_id, source_url, market, status, submitted_at, updated_at, started_at, "
+                    "finished_at, result_version, result, owner_digest, idempotency_key, "
+                    "attempt_count) "
+                    "VALUES (:job_id, :source_url, 'JP', 'succeeded', :submitted_at, "
+                    ":finished_at, :started_at, :finished_at, 'extraction-response-v1', "
+                    "'{}'::jsonb, :owner_digest, :idempotency_key, 1)"
+                ),
+                {
+                    "job_id": succeeded_job_id,
+                    "source_url": "https://www.youtube.com/watch?v=succeeded",
+                    "submitted_at": submitted_at,
+                    "started_at": started_at,
+                    "finished_at": succeeded_at,
+                    "owner_digest": owner_digest,
+                    "idempotency_key": uuid4(),
+                },
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO extraction_job "
+                    "(job_id, source_url, market, status, submitted_at, updated_at, finished_at, "
+                    "error_code, error_message, owner_digest, idempotency_key, attempt_count) "
+                    "VALUES (:job_id, :source_url, 'JP', 'failed', :submitted_at, "
+                    ":finished_at, :finished_at, 'internal_error', 'An unexpected error occurred.', "
+                    ":owner_digest, :idempotency_key, 1)"
+                ),
+                {
+                    "job_id": failed_job_id,
+                    "source_url": "https://www.youtube.com/watch?v=failed",
+                    "submitted_at": submitted_at,
+                    "finished_at": failed_at,
+                    "owner_digest": owner_digest,
+                    "idempotency_key": uuid4(),
+                },
+            )
+
+        await asyncio.to_thread(_upgrade_head)
+
+        async with engine.connect() as connection:
+            terminal_rows = (
+                await connection.execute(
+                    text(
+                        "SELECT job_id, source_url, transcript, market, finished_at, expires_at "
+                        "FROM extraction_job WHERE job_id IN (:succeeded_job_id, :failed_job_id) "
+                        "ORDER BY finished_at"
+                    ),
+                    {
+                        "succeeded_job_id": succeeded_job_id,
+                        "failed_job_id": failed_job_id,
+                    },
+                )
+            ).all()
+            queued_input = (
+                await connection.execute(
+                    text(
+                        "SELECT source_url, transcript, market, expires_at FROM extraction_job "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {"job_id": queued_job_id},
+                )
+            ).one()
+            expiration_index = await connection.scalar(
+                text(f"SELECT to_regclass('public.{_EXTRACTION_EXPIRATION_INDEX}')")
+            )
+
+        assert terminal_rows == [
+            (succeeded_job_id, None, None, None, succeeded_at, succeeded_at + timedelta(days=7)),
+            (failed_job_id, None, None, None, failed_at, failed_at + timedelta(days=7)),
+        ]
+        assert queued_input == ("https://www.youtube.com/watch?v=queued", None, "JP", None)
+        assert expiration_index == _EXTRACTION_EXPIRATION_INDEX
+
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO extraction_job "
+                    "(job_id, transcript, status, submitted_at, updated_at, owner_digest, "
+                    "idempotency_key, attempt_count, eligible_at) "
+                    "VALUES (:job_id, 'A submitted transcript.', 'queued', :submitted_at, "
+                    ":updated_at, :owner_digest, :idempotency_key, 0, :eligible_at)"
+                ),
+                {
+                    "job_id": transcript_job_id,
+                    "submitted_at": submitted_at,
+                    "updated_at": submitted_at,
+                    "owner_digest": owner_digest,
+                    "idempotency_key": uuid4(),
+                    "eligible_at": submitted_at,
+                },
+            )
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO extraction_job "
+                        "(job_id, source_url, transcript, status, submitted_at, updated_at, "
+                        "owner_digest, idempotency_key, attempt_count, eligible_at) "
+                        "VALUES (:job_id, 'https://www.youtube.com/watch?v=both', 'Both inputs.', "
+                        "'queued', :submitted_at, :updated_at, :owner_digest, :idempotency_key, "
+                        "0, :eligible_at)"
+                    ),
+                    {
+                        "job_id": uuid4(),
+                        "submitted_at": submitted_at,
+                        "updated_at": submitted_at,
+                        "owner_digest": owner_digest,
+                        "idempotency_key": uuid4(),
+                        "eligible_at": submitted_at,
+                    },
+                )
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO extraction_job "
+                        "(job_id, source_url, status, submitted_at, updated_at, finished_at, "
+                        "error_code, error_message, expires_at, owner_digest, idempotency_key, "
+                        "attempt_count) "
+                        "VALUES (:job_id, 'https://www.youtube.com/watch?v=retained', 'failed', "
+                        ":submitted_at, :finished_at, :finished_at, 'internal_error', "
+                        "'An unexpected error occurred.', :expires_at, :owner_digest, "
+                        ":idempotency_key, 1)"
+                    ),
+                    {
+                        "job_id": uuid4(),
+                        "submitted_at": submitted_at,
+                        "finished_at": failed_at,
+                        "expires_at": failed_at + timedelta(days=7),
+                        "owner_digest": owner_digest,
+                        "idempotency_key": uuid4(),
+                    },
+                )
+
+        await asyncio.to_thread(
+            command.downgrade,
+            _alembic_config(),
+            "0006_extraction_job_retries",
+        )
+
+        async with engine.connect() as connection:
+            downgraded_terminal = (
+                await connection.execute(
+                    text(
+                        "SELECT source_url, market FROM extraction_job "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {"job_id": succeeded_job_id},
+                )
+            ).one()
+            expiration_columns = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'extraction_job' "
+                    "AND column_name IN ('transcript', 'expires_at')"
+                )
+            )
+
+        assert downgraded_terminal == ("redacted", None)
+        assert expiration_columns == 0
+
+        await asyncio.to_thread(_upgrade_head)
+
+        async with engine.connect() as connection:
+            reupgraded_terminal = (
+                await connection.execute(
+                    text(
+                        "SELECT source_url, transcript, market, expires_at FROM extraction_job "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {"job_id": succeeded_job_id},
+                )
+            ).one()
+            reupgraded_transcript_job = (
+                await connection.execute(
+                    text(
+                        "SELECT source_url, transcript FROM extraction_job "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {"job_id": transcript_job_id},
+                )
+            ).one()
+
+        assert reupgraded_terminal == (None, None, None, succeeded_at + timedelta(days=7))
+        assert reupgraded_transcript_job == ("redacted", None)
     finally:
         await engine.dispose()

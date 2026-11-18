@@ -10,12 +10,15 @@ import pytest
 from reelio.extraction.job_store import InMemoryExtractionJobStore
 from reelio.extraction.jobs import (
     EXTRACTION_RESPONSE_VERSION,
+    AdmittedSourceJob,
     ExtractionJobCapacityExceededError,
     ExtractionJobStateError,
     ExtractionJobStatus,
     FailedSourceJob,
     QueuedSourceJob,
     RunningSourceJob,
+    SucceededSourceJob,
+    decode_stored_extraction_response,
 )
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.schemas import ExtractResponse
@@ -76,6 +79,22 @@ def _response() -> ExtractResponse:
     )
 
 
+def test_stored_result_decoder_accepts_only_the_current_response_contract() -> None:
+    """Reject unsupported versions and malformed durable successful responses."""
+    stored_response = _response().model_dump(mode="json")
+
+    decoded_response = decode_stored_extraction_response(
+        EXTRACTION_RESPONSE_VERSION,
+        stored_response,
+    )
+
+    assert decoded_response.model_dump(mode="json") == stored_response
+    with pytest.raises(ExtractionJobStateError, match="unsupported stored result version"):
+        decode_stored_extraction_response("extraction-response-v2", stored_response)
+    with pytest.raises(ExtractionJobStateError, match="malformed stored result"):
+        decode_stored_extraction_response(EXTRACTION_RESPONSE_VERSION, {})
+
+
 def _uuid_factory(*job_ids: UUID) -> Callable[[], UUID]:
     """Return deterministic UUIDs in the supplied order."""
     remaining_job_ids = iter(job_ids)
@@ -118,7 +137,7 @@ async def _admit(
     market: SpotifyMarket | None = None,
     owner_digest: bytes = _OWNER_A,
     idempotency_key: UUID = _DEFAULT_IDEMPOTENCY_KEY,
-) -> QueuedSourceJob:
+) -> AdmittedSourceJob:
     """Admit one Source job with a deterministic anonymous owner."""
     return await store.admit_source(
         source_url,
@@ -152,7 +171,7 @@ async def test_concurrent_admission_caps_active_jobs_and_releases_rejected_keys(
     admitted = [
         (idempotency_key, outcome)
         for idempotency_key, outcome in zip(idempotency_keys, outcomes, strict=True)
-        if isinstance(outcome, QueuedSourceJob)
+        if isinstance(outcome, AdmittedSourceJob)
     ]
     rejected_keys = [
         idempotency_key
@@ -161,7 +180,6 @@ async def test_concurrent_admission_caps_active_jobs_and_releases_rejected_keys(
     ]
 
     assert len(admitted) == 10
-    assert all(job.status is ExtractionJobStatus.QUEUED for _, job in admitted)
     assert len(rejected_keys) == 1
 
     replayed = await _admit(store, idempotency_key=admitted[0][0])
@@ -175,8 +193,8 @@ async def test_concurrent_admission_caps_active_jobs_and_releases_rejected_keys(
     assert admitted_after_completion.job_id == job_ids[10]
 
 
-async def test_capacity_rejection_does_not_read_clock_or_identity() -> None:
-    """Reject a full admission before consuming time or a Source job identifier."""
+async def test_capacity_rejection_cleans_expired_jobs_before_consuming_identity() -> None:
+    """Read the clock for bounded expiration cleanup before checking active capacity."""
     clock_calls = 0
     identity_calls = 0
 
@@ -200,26 +218,27 @@ async def test_capacity_rejection_does_not_read_clock_or_identity() -> None:
     with pytest.raises(ExtractionJobCapacityExceededError):
         await _admit(store, idempotency_key=_idempotency_key(2))
 
-    assert clock_calls == 1
+    assert clock_calls == 2
     assert identity_calls == 1
 
 
-async def test_admission_returns_one_deterministic_queued_snapshot() -> None:
-    """Admit the exact Source input as a committed queued job."""
+async def test_admission_returns_one_deterministic_job_identity() -> None:
+    """Return only the committed identity while queued input remains internal."""
     job_id = UUID("00000000-0000-4000-8000-000000000002")
     store = _store(job_id)
 
     admitted = await _admit(store)
+    stored = await store.get_for_owner(job_id, _OWNER_A)
 
-    assert admitted.job_id == job_id
-    assert admitted.source_url == _SUBMITTED_URL
-    assert admitted.market is None
-    assert admitted.status is ExtractionJobStatus.QUEUED
-    assert admitted.attempt_count == 0
-    assert admitted.eligible_at == _SUBMITTED_AT
-    assert admitted.submitted_at == _SUBMITTED_AT
-    assert admitted.updated_at == _SUBMITTED_AT
-    assert await store.get_for_owner(job_id, _OWNER_A) == admitted
+    assert admitted == AdmittedSourceJob(job_id=job_id)
+    assert isinstance(stored, QueuedSourceJob)
+    assert stored.source_url == _SUBMITTED_URL
+    assert stored.market is None
+    assert stored.status is ExtractionJobStatus.QUEUED
+    assert stored.attempt_count == 0
+    assert stored.eligible_at == _SUBMITTED_AT
+    assert stored.submitted_at == _SUBMITTED_AT
+    assert stored.updated_at == _SUBMITTED_AT
 
 
 async def test_claims_oldest_queued_job_by_submission_time_then_identifier() -> None:
@@ -330,6 +349,9 @@ async def test_final_requeued_attempt_becomes_a_terminal_internal_failure() -> N
     assert isinstance(stored, FailedSourceJob)
     assert stored.error_code == "internal_error"
     assert stored.error_message == "An unexpected error occurred."
+    assert stored.expires_at == clock.now + timedelta(days=7)
+    assert not hasattr(stored, "source_url")
+    assert not hasattr(stored, "market")
 
 
 async def test_expired_final_attempt_becomes_a_terminal_internal_failure() -> None:
@@ -371,6 +393,9 @@ async def test_expired_final_attempt_becomes_a_terminal_internal_failure() -> No
     assert isinstance(stored, FailedSourceJob)
     assert stored.error_code == "internal_error"
     assert stored.error_message == "An unexpected error occurred."
+    assert stored.expires_at == clock.now + timedelta(days=7)
+    assert not hasattr(stored, "source_url")
+    assert not hasattr(stored, "market")
 
 
 async def test_running_job_transitions_to_versioned_succeeded_response() -> None:
@@ -386,7 +411,10 @@ async def test_running_job_transitions_to_versioned_succeeded_response() -> None
     assert completed.job_id == job_id
     assert completed.status is ExtractionJobStatus.SUCCEEDED
     assert completed.result_version == EXTRACTION_RESPONSE_VERSION
+    assert completed.expires_at == _SUBMITTED_AT + timedelta(days=7)
     assert completed.result.model_dump(mode="json") == _response().model_dump(mode="json")
+    assert not hasattr(completed, "source_url")
+    assert not hasattr(completed, "market")
     stored = await store.get_for_owner(job_id, _OWNER_A)
     assert stored == completed
 
@@ -437,7 +465,10 @@ async def test_read_returns_a_job_only_for_its_anonymous_owner() -> None:
     store = _store(job_id)
     admitted = await _admit(store)
 
-    assert await store.get_for_owner(job_id, _OWNER_A) == admitted
+    owned_job = await store.get_for_owner(job_id, _OWNER_A)
+
+    assert isinstance(owned_job, QueuedSourceJob)
+    assert owned_job.job_id == admitted.job_id
     assert await store.get_for_owner(job_id, _OWNER_B) is None
 
 
@@ -533,3 +564,119 @@ async def test_reclaimed_attempt_rejects_stale_terminal_and_requeue_writes() -> 
 
     stored = await store.get_for_owner(job_id, _OWNER_A)
     assert stored == reclaimed
+
+
+async def test_running_job_transitions_to_expiring_failed_response_without_input() -> None:
+    """Retain only one safe failure and its seven-day availability window."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=lambda: job_id,
+        lease_token_factory=lambda: _lease_token(1),
+    )
+    await _admit(store, market=SpotifyMarket("JP"))
+    running = await store.claim_next_source()
+
+    assert running is not None
+    completed = await store.complete_failure(
+        job_id,
+        running.lease_token,
+        "catalog_provider_failed",
+        "Catalog provider request failed.",
+    )
+    stored = await store.get_for_owner(job_id, _OWNER_A)
+
+    assert completed.expires_at == _SUBMITTED_AT + timedelta(days=7)
+    assert not hasattr(completed, "source_url")
+    assert not hasattr(completed, "market")
+    assert stored == completed
+
+
+async def test_terminal_jobs_are_hidden_at_the_exact_expiration_boundary() -> None:
+    """Keep successful and failed jobs visible through day seven minus one microsecond."""
+    succeeded_job_id = UUID("00000000-0000-4000-8000-000000000001")
+    failed_job_id = UUID("00000000-0000-4000-8000-000000000002")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=_uuid_factory(succeeded_job_id, failed_job_id),
+        lease_token_factory=iter((_lease_token(1), _lease_token(2))).__next__,
+    )
+    await _admit(store, idempotency_key=_idempotency_key(1))
+    await _admit(store, idempotency_key=_idempotency_key(2))
+    successful_attempt = await store.claim_next_source()
+    assert successful_attempt is not None
+    await store.complete_success(
+        successful_attempt.job_id,
+        successful_attempt.lease_token,
+        _response(),
+    )
+    failed_attempt = await store.claim_next_source()
+    assert failed_attempt is not None
+    await store.complete_failure(
+        failed_attempt.job_id,
+        failed_attempt.lease_token,
+        "catalog_provider_failed",
+        "Catalog provider request failed.",
+    )
+
+    clock.now += timedelta(days=7) - timedelta(microseconds=1)
+
+    assert isinstance(
+        await store.get_for_owner(succeeded_job_id, _OWNER_A),
+        SucceededSourceJob,
+    )
+    assert isinstance(
+        await store.get_for_owner(failed_job_id, _OWNER_A),
+        FailedSourceJob,
+    )
+
+    clock.now += timedelta(microseconds=1)
+
+    assert await store.get_for_owner(succeeded_job_id, _OWNER_A) is None
+    assert await store.get_for_owner(failed_job_id, _OWNER_A) is None
+
+
+async def test_admission_cleanup_deletes_one_ordered_batch_without_touching_active_work() -> None:
+    """Delete 100 expired terminals and retire their replay metadata in one admission path."""
+    terminal_job_ids = tuple(
+        UUID(f"00000000-0000-4000-8000-{number:012d}") for number in range(1, 102)
+    )
+    active_job_id = UUID("00000000-0000-4000-8000-000000000102")
+    replacement_job_id = UUID("00000000-0000-4000-8000-000000000103")
+    clock = _MutableClock()
+    store = InMemoryExtractionJobStore(
+        clock=clock,
+        uuid_factory=_uuid_factory(*terminal_job_ids, active_job_id, replacement_job_id),
+        lease_token_factory=lambda: _lease_token(1),
+    )
+    for number, job_id in enumerate(terminal_job_ids, start=1):
+        await _admit(store, idempotency_key=_idempotency_key(number))
+        attempt = await store.claim_next_source()
+        assert attempt is not None
+        assert attempt.job_id == job_id
+        await store.complete_success(job_id, attempt.lease_token, _response())
+    await _admit(store, idempotency_key=_idempotency_key(102))
+
+    clock.now += timedelta(days=7)
+
+    active_attempt = await store.claim_next_source()
+
+    assert active_attempt is not None
+    assert active_attempt.job_id == active_job_id
+    remaining_terminal_ids = {
+        job_id
+        for job_id, job in store._jobs.items()
+        if isinstance(job, SucceededSourceJob | FailedSourceJob)
+    }
+    assert remaining_terminal_ids == {terminal_job_ids[-1]}
+    assert _idempotency_key(1) not in {
+        key for owner, key in store._admissions if owner == _OWNER_A
+    }
+    assert store._admissions[(_OWNER_A, _idempotency_key(101))] == terminal_job_ids[-1]
+
+    replacement = await _admit(store, idempotency_key=_idempotency_key(1))
+
+    assert replacement.job_id == replacement_job_id
+    assert isinstance(store._jobs[active_job_id], RunningSourceJob)

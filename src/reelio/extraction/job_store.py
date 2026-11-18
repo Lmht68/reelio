@@ -15,6 +15,7 @@ from sqlalchemy import (
     Table,
     Text,
     and_,
+    delete,
     func,
     or_,
     select,
@@ -32,6 +33,7 @@ from reelio.extraction.exceptions import INTERNAL_ERROR_CODE, INTERNAL_ERROR_MES
 from reelio.extraction.job_config import ExtractionJobConfig
 from reelio.extraction.jobs import (
     EXTRACTION_RESPONSE_VERSION,
+    AdmittedSourceJob,
     ExtractionJobCapacityExceededError,
     ExtractionJobStateError,
     ExtractionJobStatus,
@@ -41,11 +43,14 @@ from reelio.extraction.jobs import (
     RunningSourceJob,
     SourceExtractionJob,
     SucceededSourceJob,
+    decode_stored_extraction_response,
 )
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.schemas import ExtractResponse
 
 _DEFAULT_LEASE_LIFETIME = timedelta(seconds=60)
+_TERMINAL_RETENTION = timedelta(days=7)
+_EXPIRATION_CLEANUP_BATCH_SIZE = 100
 
 
 class InMemoryExtractionJobStore:
@@ -84,7 +89,8 @@ class InMemoryExtractionJobStore:
         self._lease_lifetime = lease_lifetime
         self._jobs: dict[UUID, SourceExtractionJob] = {}
         self._owners: dict[UUID, bytes] = {}
-        self._admissions: dict[tuple[bytes, UUID], QueuedSourceJob] = {}
+        self._admissions: dict[tuple[bytes, UUID], UUID] = {}
+        self._admission_keys: dict[UUID, tuple[bytes, UUID]] = {}
         self._lock = asyncio.Lock()
 
     async def admit_source(
@@ -93,26 +99,15 @@ class InMemoryExtractionJobStore:
         market: SpotifyMarket | None,
         owner_digest: bytes,
         idempotency_key: UUID,
-    ) -> QueuedSourceJob:
-        """Commit or replay one owner-scoped queued Source Extraction job.
-
-        Args:
-            source_url: Validated public Source URL submitted by the caller.
-            market: Optional requested Effective Market.
-            owner_digest: HMAC-derived anonymous owner identity.
-            idempotency_key: Caller-supplied owner-scoped replay identity.
-
-        Returns:
-            The original queued job snapshot for this owner and idempotency key.
-
-        Raises:
-            ExtractionJobCapacityExceededError: If active job capacity is full.
-        """
+    ) -> AdmittedSourceJob:
+        """Commit or replay one owner-scoped Source job admission."""
         async with self._lock:
+            now = self._clock()
+            self._cleanup_expired(now)
             admission_key = (owner_digest, idempotency_key)
-            admitted_job = self._admissions.get(admission_key)
-            if admitted_job is not None:
-                return _copy_queued_job(admitted_job)
+            admitted_job_id = self._admissions.get(admission_key)
+            if admitted_job_id is not None:
+                return AdmittedSourceJob(job_id=admitted_job_id)
 
             active_job_count = sum(
                 isinstance(job, QueuedSourceJob | RunningSourceJob) for job in self._jobs.values()
@@ -122,49 +117,45 @@ class InMemoryExtractionJobStore:
                     "Source Extraction job capacity is temporarily full"
                 )
 
-            submitted_at = self._clock()
             job = QueuedSourceJob(
                 job_id=self._uuid_factory(),
                 source_url=source_url,
                 market=market,
-                submitted_at=submitted_at,
-                updated_at=submitted_at,
+                submitted_at=now,
+                updated_at=now,
                 attempt_count=0,
-                eligible_at=submitted_at,
+                eligible_at=now,
             )
             self._jobs[job.job_id] = job
             self._owners[job.job_id] = owner_digest
-            self._admissions[admission_key] = job
-            return _copy_queued_job(job)
+            self._admissions[admission_key] = job.job_id
+            self._admission_keys[job.job_id] = admission_key
+            return AdmittedSourceJob(job_id=job.job_id)
 
     async def get_for_owner(
         self,
         job_id: UUID,
         owner_digest: bytes,
     ) -> SourceExtractionJob | None:
-        """Return one immutable Source Extraction job snapshot for its owner.
-
-        Args:
-            job_id: Opaque Source Extraction job identity.
-            owner_digest: HMAC-derived anonymous owner identity.
-
-        Returns:
-            The current snapshot, or None when the job is absent or has another owner.
-        """
+        """Return one immutable Source Extraction job snapshot for its owner."""
         async with self._lock:
             if self._owners.get(job_id) != owner_digest:
                 return None
             job = self._jobs.get(job_id)
-            return _copy_job(job) if job is not None else None
+            if job is None:
+                return None
+            if (
+                isinstance(job, SucceededSourceJob | FailedSourceJob)
+                and job.expires_at <= self._clock()
+            ):
+                return None
+            return _copy_job(job)
 
     async def claim_next_source(self) -> RunningSourceJob | None:
-        """Atomically claim the oldest queued or expired Source Extraction job.
-
-        Returns:
-            The committed running snapshot, or None when no job is eligible to run.
-        """
+        """Atomically claim the oldest queued or expired Source Extraction job."""
         async with self._lock:
             now = self._clock()
+            self._cleanup_expired(now)
             for job_id, job in self._jobs.items():
                 if (isinstance(job, QueuedSourceJob) and job.attempt_count == 3) or (
                     isinstance(job, RunningSourceJob)
@@ -247,29 +238,17 @@ class InMemoryExtractionJobStore:
 
             succeeded_job = SucceededSourceJob(
                 job_id=job.job_id,
-                source_url=job.source_url,
-                market=job.market,
                 submitted_at=job.submitted_at,
                 updated_at=finished_at,
                 attempt_count=job.attempt_count,
                 started_at=job.started_at,
                 finished_at=finished_at,
+                expires_at=finished_at + _TERMINAL_RETENTION,
                 result_version=EXTRACTION_RESPONSE_VERSION,
                 result=result.model_copy(deep=True),
             )
             self._jobs[job_id] = succeeded_job
-            return SucceededSourceJob(
-                job_id=succeeded_job.job_id,
-                source_url=succeeded_job.source_url,
-                market=succeeded_job.market,
-                submitted_at=succeeded_job.submitted_at,
-                updated_at=succeeded_job.updated_at,
-                attempt_count=succeeded_job.attempt_count,
-                started_at=succeeded_job.started_at,
-                finished_at=succeeded_job.finished_at,
-                result_version=succeeded_job.result_version,
-                result=succeeded_job.result.model_copy(deep=True),
-            )
+            return _copy_succeeded_job(succeeded_job)
 
     async def complete_failure(
         self,
@@ -289,13 +268,12 @@ class InMemoryExtractionJobStore:
 
             failed_job = FailedSourceJob(
                 job_id=job.job_id,
-                source_url=job.source_url,
-                market=job.market,
                 submitted_at=job.submitted_at,
                 updated_at=finished_at,
                 attempt_count=job.attempt_count,
                 started_at=job.started_at,
                 finished_at=finished_at,
+                expires_at=finished_at + _TERMINAL_RETENTION,
                 error_code=error_code,
                 error_message=error_message,
             )
@@ -352,6 +330,33 @@ class InMemoryExtractionJobStore:
             )
             return True
 
+    def _cleanup_expired(self, now: datetime) -> None:
+        """Delete at most one ordered batch of expired terminal jobs."""
+        expired_job_ids = tuple(
+            job.job_id
+            for job in sorted(
+                (
+                    job
+                    for job in self._jobs.values()
+                    if isinstance(job, SucceededSourceJob | FailedSourceJob)
+                    and job.expires_at <= now
+                ),
+                key=lambda job: (job.expires_at, job.job_id.int),
+            )[:_EXPIRATION_CLEANUP_BATCH_SIZE]
+        )
+        for job_id in expired_job_ids:
+            job = self._jobs.get(job_id)
+            if not (
+                isinstance(job, SucceededSourceJob | FailedSourceJob)
+                and job.expires_at <= now
+            ):
+                continue
+            del self._jobs[job_id]
+            self._owners.pop(job_id, None)
+            admission_key = self._admission_keys.pop(job_id, None)
+            if admission_key is not None:
+                self._admissions.pop(admission_key, None)
+
     def _owned_running_job(
         self,
         job_id: UUID,
@@ -379,53 +384,39 @@ def _terminalize_exhausted_attempt(
     """Return the generic terminal failure for a job that exhausted its attempts."""
     return FailedSourceJob(
         job_id=job.job_id,
-        source_url=job.source_url,
-        market=job.market,
         submitted_at=job.submitted_at,
         updated_at=finished_at,
         attempt_count=job.attempt_count,
         started_at=job.started_at if isinstance(job, RunningSourceJob) else None,
         finished_at=finished_at,
+        expires_at=finished_at + _TERMINAL_RETENTION,
         error_code=INTERNAL_ERROR_CODE,
         error_message=INTERNAL_ERROR_MESSAGE,
     )
 
 
 def _copy_job(job: SourceExtractionJob) -> SourceExtractionJob:
-    """Return a caller-isolated immutable snapshot.
-
-    Args:
-        job: Stored lifecycle snapshot.
-
-    Returns:
-        A snapshot whose successful response cannot mutate stored state.
-    """
+    """Return a caller-isolated immutable snapshot."""
     if isinstance(job, SucceededSourceJob):
-        return SucceededSourceJob(
-            job_id=job.job_id,
-            source_url=job.source_url,
-            market=job.market,
-            submitted_at=job.submitted_at,
-            updated_at=job.updated_at,
-            attempt_count=job.attempt_count,
-            started_at=job.started_at,
-            finished_at=job.finished_at,
-            result_version=job.result_version,
-            result=job.result.model_copy(deep=True),
-        )
+        return _copy_succeeded_job(job)
     return job
 
 
-def _copy_queued_job(job: QueuedSourceJob) -> QueuedSourceJob:
-    """Return the immutable original admission snapshot."""
-    return QueuedSourceJob(
+def _copy_succeeded_job(job: SucceededSourceJob) -> SucceededSourceJob:
+    """Decode a caller-isolated successful result through its stored contract."""
+    return SucceededSourceJob(
         job_id=job.job_id,
-        source_url=job.source_url,
-        market=job.market,
         submitted_at=job.submitted_at,
         updated_at=job.updated_at,
         attempt_count=job.attempt_count,
-        eligible_at=job.eligible_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        expires_at=job.expires_at,
+        result_version=job.result_version,
+        result=decode_stored_extraction_response(
+            job.result_version,
+            job.result.model_dump(mode="json"),
+        ),
     )
 
 
@@ -433,7 +424,8 @@ _EXTRACTION_JOB_TABLE = Table(
     "extraction_job",
     MetaData(),
     Column("job_id", postgresql.UUID(as_uuid=True), primary_key=True),
-    Column("source_url", Text(), nullable=False),
+    Column("source_url", Text(), nullable=True),
+    Column("transcript", Text(), nullable=True),
     Column("market", String(length=2), nullable=True),
     Column("status", Text(), nullable=False),
     Column("submitted_at", DateTime(timezone=True), nullable=False),
@@ -442,6 +434,7 @@ _EXTRACTION_JOB_TABLE = Table(
     Column("eligible_at", DateTime(timezone=True), nullable=True),
     Column("started_at", DateTime(timezone=True), nullable=True),
     Column("finished_at", DateTime(timezone=True), nullable=True),
+    Column("expires_at", DateTime(timezone=True), nullable=True),
     Column("result_version", Text(), nullable=True),
     Column("result", postgresql.JSONB(), nullable=True),
     Column("error_code", Text(), nullable=True),
@@ -488,22 +481,8 @@ class PostgresExtractionJobStore:
         market: SpotifyMarket | None,
         owner_digest: bytes,
         idempotency_key: UUID,
-    ) -> QueuedSourceJob:
-        """Commit or replay one owner-scoped queued Source Extraction job.
-
-        Args:
-            source_url: Validated public Source URL submitted by the caller.
-            market: Optional requested Effective Market.
-            owner_digest: HMAC-derived anonymous owner identity.
-            idempotency_key: Caller-supplied owner-scoped replay identity.
-
-        Returns:
-            The original queued job snapshot for this owner and idempotency key.
-
-        Raises:
-            ExtractionJobCapacityExceededError: If active job capacity is full.
-            ExtractionJobStoreUnavailableError: If PostgreSQL cannot commit admission.
-        """
+    ) -> AdmittedSourceJob:
+        """Commit or replay one owner-scoped Source job admission."""
         try:
             async with self._engine.begin() as connection:
                 await connection.execute(
@@ -512,6 +491,8 @@ class PostgresExtractionJobStore:
                         "hashtextextended('reelio.extraction_job.admission', 0))"
                     )
                 )
+                submitted_at = await self._current_time(connection)
+                await self._cleanup_expired(connection, submitted_at)
                 replay = await connection.execute(
                     select(_EXTRACTION_JOB_TABLE).where(
                         _EXTRACTION_JOB_TABLE.c.owner_digest == owner_digest,
@@ -520,7 +501,7 @@ class PostgresExtractionJobStore:
                 )
                 replay_row = replay.mappings().one_or_none()
                 if replay_row is not None:
-                    return _to_queued_admission(replay_row)
+                    return _to_admitted_source_job(replay_row)
 
                 active_job_count = (
                     await connection.execute(
@@ -541,7 +522,6 @@ class PostgresExtractionJobStore:
                         "Source Extraction job capacity is temporarily full"
                     )
 
-                submitted_at = datetime.now(UTC)
                 inserted = await connection.execute(
                     postgresql.insert(_EXTRACTION_JOB_TABLE)
                     .values(
@@ -577,31 +557,25 @@ class PostgresExtractionJobStore:
             raise ExtractionJobStoreUnavailableError(
                 "Source Extraction job storage is temporarily unavailable"
             ) from exc
-        return _to_queued_admission(row)
+        return _to_admitted_source_job(row)
 
     async def get_for_owner(
         self,
         job_id: UUID,
         owner_digest: bytes,
     ) -> SourceExtractionJob | None:
-        """Return one current Source Extraction job snapshot for its owner.
-
-        Args:
-            job_id: Opaque Source Extraction job identity.
-            owner_digest: HMAC-derived anonymous owner identity.
-
-        Returns:
-            The current snapshot, or None when no matching job has that identity.
-
-        Raises:
-            ExtractionJobStoreUnavailableError: If PostgreSQL cannot complete the read.
-        """
+        """Return one current Source Extraction job snapshot for its owner."""
         try:
             async with self._engine.connect() as connection:
+                now = await self._current_time(connection)
                 result = await connection.execute(
                     select(_EXTRACTION_JOB_TABLE).where(
                         _EXTRACTION_JOB_TABLE.c.job_id == job_id,
                         _EXTRACTION_JOB_TABLE.c.owner_digest == owner_digest,
+                        or_(
+                            _EXTRACTION_JOB_TABLE.c.expires_at.is_(None),
+                            _EXTRACTION_JOB_TABLE.c.expires_at > now,
+                        ),
                     )
                 )
                 row = result.mappings().one_or_none()
@@ -623,6 +597,7 @@ class PostgresExtractionJobStore:
         try:
             async with self._engine.begin() as connection:
                 now = await self._current_time(connection)
+                await self._cleanup_expired(connection, now)
                 await connection.execute(
                     update(_EXTRACTION_JOB_TABLE)
                     .where(
@@ -637,8 +612,12 @@ class PostgresExtractionJobStore:
                     )
                     .values(
                         status=ExtractionJobStatus.FAILED.value,
+                        source_url=None,
+                        transcript=None,
+                        market=None,
                         updated_at=now,
                         finished_at=now,
+                        expires_at=now + _TERMINAL_RETENTION,
                         error_code=INTERNAL_ERROR_CODE,
                         error_message=INTERNAL_ERROR_MESSAGE,
                         eligible_at=None,
@@ -749,8 +728,12 @@ class PostgresExtractionJobStore:
                     .where(self._owned_attempt_predicate(job_id, lease_token, finished_at))
                     .values(
                         status=ExtractionJobStatus.SUCCEEDED.value,
+                        source_url=None,
+                        transcript=None,
+                        market=None,
                         updated_at=finished_at,
                         finished_at=finished_at,
+                        expires_at=finished_at + _TERMINAL_RETENTION,
                         result_version=EXTRACTION_RESPONSE_VERSION,
                         result=result.model_dump(mode="json"),
                         eligible_at=None,
@@ -791,8 +774,12 @@ class PostgresExtractionJobStore:
                     .where(self._owned_attempt_predicate(job_id, lease_token, finished_at))
                     .values(
                         status=ExtractionJobStatus.FAILED.value,
+                        source_url=None,
+                        transcript=None,
+                        market=None,
                         updated_at=finished_at,
                         finished_at=finished_at,
+                        expires_at=finished_at + _TERMINAL_RETENTION,
                         error_code=error_code,
                         error_message=error_message,
                         eligible_at=None,
@@ -877,6 +864,39 @@ class PostgresExtractionJobStore:
                 "Source Extraction job storage is temporarily unavailable"
             ) from exc
 
+    async def _cleanup_expired(self, connection: AsyncConnection, now: datetime) -> None:
+        """Delete one bounded ordered batch of still-expired terminal jobs."""
+        expired_job_ids = (
+            select(_EXTRACTION_JOB_TABLE.c.job_id)
+            .where(
+                _EXTRACTION_JOB_TABLE.c.status.in_(
+                    (
+                        ExtractionJobStatus.SUCCEEDED.value,
+                        ExtractionJobStatus.FAILED.value,
+                    )
+                ),
+                _EXTRACTION_JOB_TABLE.c.expires_at <= now,
+            )
+            .order_by(
+                _EXTRACTION_JOB_TABLE.c.expires_at,
+                _EXTRACTION_JOB_TABLE.c.job_id,
+            )
+            .limit(_EXPIRATION_CLEANUP_BATCH_SIZE)
+            .subquery()
+        )
+        await connection.execute(
+            delete(_EXTRACTION_JOB_TABLE).where(
+                _EXTRACTION_JOB_TABLE.c.job_id.in_(select(expired_job_ids.c.job_id)),
+                _EXTRACTION_JOB_TABLE.c.status.in_(
+                    (
+                        ExtractionJobStatus.SUCCEEDED.value,
+                        ExtractionJobStatus.FAILED.value,
+                    )
+                ),
+                _EXTRACTION_JOB_TABLE.c.expires_at <= now,
+            )
+        )
+
     async def _current_time(self, connection: AsyncConnection) -> datetime:
         """Read PostgreSQL's transaction authority time."""
         return cast(datetime, await connection.scalar(select(func.now())))
@@ -960,51 +980,38 @@ async def create_production_extraction_job_store() -> PostgresExtractionJobStore
     return store
 
 
-def _to_queued_admission(row: RowMapping) -> QueuedSourceJob:
-    """Project one stored admission as its immutable original queued snapshot."""
-    market_value = cast(str | None, row["market"])
-    return QueuedSourceJob(
-        job_id=cast(UUID, row["job_id"]),
-        source_url=cast(str, row["source_url"]),
-        market=SpotifyMarket(market_value) if market_value is not None else None,
-        submitted_at=cast(datetime, row["submitted_at"]),
-        updated_at=cast(datetime, row["submitted_at"]),
-        attempt_count=cast(int, row["attempt_count"]),
-        eligible_at=cast(datetime, row["eligible_at"]),
-    )
+def _to_admitted_source_job(row: RowMapping) -> AdmittedSourceJob:
+    """Project one stored admission to its opaque public job identity."""
+    return AdmittedSourceJob(job_id=cast(UUID, row["job_id"]))
 
 
 def _to_source_extraction_job(row: RowMapping) -> SourceExtractionJob:
     """Convert one durable database row into an application-owned job snapshot.
 
-    Args:
-        row: Source Extraction job row returned from PostgreSQL.
-
-    Returns:
-        The matching immutable lifecycle snapshot.
-
     Raises:
         ExtractionJobStateError: If the stored row violates lifecycle invariants.
     """
     status = ExtractionJobStatus(cast(str, row["status"]))
-    market_value = cast(str | None, row["market"])
     job_id = cast(UUID, row["job_id"])
-    source_url = cast(str, row["source_url"])
-    market = SpotifyMarket(market_value) if market_value is not None else None
     submitted_at = cast(datetime, row["submitted_at"])
     updated_at = cast(datetime, row["updated_at"])
     attempt_count = cast(int, row["attempt_count"])
-    if status is ExtractionJobStatus.QUEUED:
-        return QueuedSourceJob(
-            job_id=job_id,
-            source_url=source_url,
-            market=market,
-            submitted_at=submitted_at,
-            updated_at=updated_at,
-            attempt_count=attempt_count,
-            eligible_at=cast(datetime, row["eligible_at"]),
-        )
-    if status is ExtractionJobStatus.RUNNING:
+    if status is ExtractionJobStatus.QUEUED or status is ExtractionJobStatus.RUNNING:
+        source_url = row["source_url"]
+        if not isinstance(source_url, str):
+            raise ExtractionJobStateError("Source Extraction job has unsupported active input")
+        market_value = cast(str | None, row["market"])
+        market = SpotifyMarket(market_value) if market_value is not None else None
+        if status is ExtractionJobStatus.QUEUED:
+            return QueuedSourceJob(
+                job_id=job_id,
+                source_url=source_url,
+                market=market,
+                submitted_at=submitted_at,
+                updated_at=updated_at,
+                attempt_count=attempt_count,
+                eligible_at=cast(datetime, row["eligible_at"]),
+            )
         return RunningSourceJob(
             job_id=job_id,
             source_url=source_url,
@@ -1017,28 +1024,27 @@ def _to_source_extraction_job(row: RowMapping) -> SourceExtractionJob:
             lease_expires_at=cast(datetime, row["lease_expires_at"]),
         )
     if status is ExtractionJobStatus.SUCCEEDED:
+        result_version = cast(str, row["result_version"])
         return SucceededSourceJob(
             job_id=job_id,
-            source_url=source_url,
-            market=market,
             submitted_at=submitted_at,
             updated_at=updated_at,
             attempt_count=attempt_count,
             started_at=cast(datetime, row["started_at"]),
             finished_at=cast(datetime, row["finished_at"]),
-            result_version=cast(str, row["result_version"]),
-            result=ExtractResponse.model_validate(row["result"]),
+            expires_at=cast(datetime, row["expires_at"]),
+            result_version=result_version,
+            result=decode_stored_extraction_response(result_version, row["result"]),
         )
     if status is ExtractionJobStatus.FAILED:
         return FailedSourceJob(
             job_id=job_id,
-            source_url=source_url,
-            market=market,
             submitted_at=submitted_at,
             updated_at=updated_at,
             attempt_count=attempt_count,
             started_at=cast(datetime | None, row["started_at"]),
             finished_at=cast(datetime, row["finished_at"]),
+            expires_at=cast(datetime, row["expires_at"]),
             error_code=cast(str, row["error_code"]),
             error_message=cast(str, row["error_message"]),
         )

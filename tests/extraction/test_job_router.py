@@ -1,7 +1,7 @@
 """ASGI contracts for durable Source Extraction job admission and status."""
 
 import hmac
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from fastapi import FastAPI
@@ -15,7 +15,7 @@ from reelio.extraction.anonymous_owner import (
 )
 from reelio.extraction.job_router import router
 from reelio.extraction.job_store import InMemoryExtractionJobStore
-from reelio.extraction.jobs import ExtractionJobStoreUnavailableError, QueuedSourceJob
+from reelio.extraction.jobs import AdmittedSourceJob, ExtractionJobStoreUnavailableError
 from reelio.extraction.market import SpotifyMarket
 from reelio.extraction.schemas import ExtractResponse
 
@@ -291,6 +291,36 @@ async def test_missing_job_returns_the_no_store_error_envelope() -> None:
     assert "Retry-After" not in response.headers
 
 
+async def test_expired_missing_and_unauthorized_jobs_share_one_not_found_response() -> None:
+    """Keep terminal expiration indistinguishable from missing and unauthorized jobs."""
+    job_id = UUID("00000000-0000-4000-8000-000000000001")
+    now = datetime(2026, 10, 15, tzinfo=UTC)
+    store = InMemoryExtractionJobStore(clock=lambda: now, uuid_factory=lambda: job_id)
+    application = _application(store)
+    transport = ASGITransport(app=application)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as owner:
+        await owner.post(
+            "/api/extraction-jobs",
+            json={"url": _SUBMITTED_URL},
+            headers=_headers(),
+        )
+        running = await store.claim_next_source()
+        assert running is not None
+        await store.complete_success(job_id, running.lease_token, _response())
+        now += timedelta(days=7)
+
+        expired = await owner.get(f"/api/extraction-jobs/{job_id}")
+        missing = await owner.get("/api/extraction-jobs/00000000-0000-4000-8000-000000000002")
+
+    async with AsyncClient(transport=transport, base_url="http://test") as unauthorized:
+        unauthorized_response = await unauthorized.get(f"/api/extraction-jobs/{job_id}")
+
+    assert expired.status_code == 404
+    assert expired.headers["Cache-Control"] == "no-store"
+    assert expired.content == missing.content == unauthorized_response.content
+
+
 class _UnavailableStore:
     """Model one durable store outage at the public HTTP seam."""
 
@@ -353,20 +383,12 @@ class _RecordingStore:
         market: SpotifyMarket | None,
         owner_digest: bytes,
         idempotency_key: UUID,
-    ) -> QueuedSourceJob:
-        """Record one admission and return a committed queued snapshot."""
+    ) -> AdmittedSourceJob:
+        """Record one admission and return its committed identity."""
+        del source_url, market
         self.owner_digests.append(owner_digest)
         self.idempotency_keys.append(idempotency_key)
-        submitted_at = datetime(2026, 10, 15, tzinfo=UTC)
-        return QueuedSourceJob(
-            job_id=UUID("00000000-0000-4000-8000-000000000001"),
-            source_url=source_url,
-            market=market,
-            submitted_at=submitted_at,
-            updated_at=submitted_at,
-            attempt_count=0,
-            eligible_at=submitted_at,
-        )
+        return AdmittedSourceJob(job_id=UUID("00000000-0000-4000-8000-000000000001"))
 
 
 async def test_submission_requires_a_uuid_idempotency_header() -> None:
