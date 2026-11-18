@@ -25,6 +25,7 @@ dependencies = [
 
 [project.scripts]
 reelio-cache-purge = "reelio.cache.cli:main"
+reelio-worker = "reelio.extraction.worker_cli:main"
 
 [dependency-groups]
 dev = [

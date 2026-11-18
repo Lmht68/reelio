@@ -17,6 +17,7 @@ class ExtractionJobConfig(BaseSettings):
     active_job_cap: int = Field(default=10, gt=0)
     lease_lifetime_seconds: float = Field(default=60.0, gt=0, allow_inf_nan=False)
     heartbeat_interval_seconds: float = Field(default=15.0, gt=0, allow_inf_nan=False)
+    worker_poll_interval_seconds: float = Field(default=1.0, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _validate_heartbeat_interval(self) -> "ExtractionJobConfig":

@@ -5,11 +5,11 @@ Submit a video URL and receive the source details, its transcript, and catalog-e
 
 ## How it works
 
-1. Textify inspects the public Source and acquires its Transcript.
-2. Reelio keeps `POST /api/extractions` synchronous and returns Reelio-owned Source, Transcript, result, and error contracts.
-3. Reelio coordinates active Textify work in dedicated PostgreSQL and represents exact submitted-URL identities with its environment-scoped HMAC.
-4. An optional shared Redis cache stores successful Textify results and Mention interpretation results without becoming an availability dependency.
-5. The selected LLM identifies structured media mentions, then Reelio resolves movies and TV series through TMDB, music through Spotify, and books through Open Library.
+1. FastAPI durably admits an Extraction Job to PostgreSQL and returns its opaque identifier.
+2. A separate Reelio worker claims queued work and asks Textify to inspect the public Source and acquire its Transcript.
+3. The worker runs the selected LLM and catalog providers, then stores the complete Extraction result for frontend polling.
+4. Reelio coordinates active Textify work in dedicated PostgreSQL and represents exact submitted-URL identities with its environment-scoped HMAC.
+5. An optional shared Redis cache stores successful Textify results and Mention interpretation results without becoming an availability dependency.
 
 Each category is returned independently.
 An item is `resolved` when catalog metadata is found or `unresolved` when the original mention could not be matched.
@@ -21,7 +21,7 @@ Requirements:
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
 - A reachable Textify service
-- Dedicated PostgreSQL 17 for Reelio's active-work coordination
+- Dedicated PostgreSQL 17 for durable Extraction Jobs and active Textify coordination
 - An optional Redis-compatible cache for successful results and Mention interpretation reuse
 - An OpenAI or DeepSeek API key
 - A TMDB v4 read access token
@@ -71,6 +71,9 @@ Every real secret in `.env.example` is blank.
 Set only the selected provider's key: `REELIO_OPENAI_API_KEY` for `REELIO_LLM_PROVIDER=openai`, or `REELIO_DEEPSEEK_API_KEY` for `REELIO_LLM_PROVIDER=deepseek`.
 
 Compose fixes `REELIO_CACHE_REDIS_URL` to `redis://redis:6379/0` and defaults `REELIO_TEXTIFY_ORIGIN` to `http://textify:8182`.
+Compose runs one API process and one `reelio-worker` process from the same image.
+The worker continuously claims PostgreSQL-backed Extraction Jobs with configurable concurrency and polling intervals.
+
 Source execution outside containers must instead use host-reachable endpoints, such as `http://127.0.0.1:8182` for Textify and a loopback Redis URL when caching is enabled.
 
 Start Textify first from its checkout with the `textify` project name and the GPU profile.

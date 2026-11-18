@@ -198,14 +198,15 @@ def test_compose_renders_local_deployment_contract() -> None:
 
     services = rendered["services"]
     assert isinstance(services, dict)
-    assert set(services) == {"api", "migrate", "postgres", "redis"}
+    assert set(services) == {"api", "migrate", "postgres", "redis", "worker"}
 
     api = _service(rendered, "api")
     migrate = _service(rendered, "migrate")
     postgres = _service(rendered, "postgres")
     redis = _service(rendered, "redis")
+    worker = _service(rendered, "worker")
 
-    for service in (api, migrate):
+    for service in (api, migrate, worker):
         build = service["build"]
         assert isinstance(build, dict)
         assert Path(cast(str, build["context"])).resolve() == _REPOSITORY_ROOT
@@ -239,6 +240,19 @@ def test_compose_renders_local_deployment_contract() -> None:
     assert api_environment["REELIO_CACHE_ENABLED"] == "true"
     assert api_environment["REELIO_CACHE_REDIS_URL"] == "redis://redis:6379/0"
     assert api_environment["REELIO_TEXTIFY_ORIGIN"] == "http://textify:8182"
+
+    assert worker["command"] == ["reelio-worker"]
+    assert worker["restart"] == "unless-stopped"
+    _depends_on(worker, "postgres", "service_healthy")
+    _depends_on(worker, "redis", "service_healthy")
+    _depends_on(worker, "migrate", "service_completed_successfully")
+    worker_networks = worker["networks"]
+    assert isinstance(worker_networks, dict)
+    assert set(worker_networks) == {"default", "reelio-textify"}
+    assert not worker.get("ports")
+    worker_healthcheck = _healthcheck(worker)
+    assert worker_healthcheck["test"][0:2] == ["CMD", "python"]
+    assert any("reelio-worker" in argument for argument in worker_healthcheck["test"])
 
     assert (
         postgres["image"]
@@ -319,6 +333,7 @@ def test_compose_renders_api_host_port_and_image_tag_overrides() -> None:
     _assert_loopback_api_port(_service(rendered, "api"), 18181)
     assert _service(rendered, "api")["image"] == "reelio:previous-release"
     assert _service(rendered, "migrate")["image"] == "reelio:previous-release"
+    assert _service(rendered, "worker")["image"] == "reelio:previous-release"
 
 
 @pytest.mark.parametrize("missing_name", _REQUIRED_ENVIRONMENT)

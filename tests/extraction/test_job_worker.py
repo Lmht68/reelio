@@ -1,6 +1,7 @@
 """Behavioral tests for bounded Source Extraction job execution."""
 
 import asyncio
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -413,6 +414,45 @@ async def test_run_until_idle_uses_two_slots_then_claims_the_third_job() -> None
         completed_job = await store.get_for_owner(job_id, _OWNER_DIGEST)
         assert isinstance(completed_job, SucceededSourceJob)
 
+
+async def test_run_forever_claims_work_admitted_after_the_worker_becomes_idle() -> None:
+    """Keep polling after an empty claim so later durable work is not stranded."""
+    store = InMemoryExtractionJobStore()
+    pipeline = _RecordingPipeline(_pipeline_result(SpotifyMarket("US")))
+    idle_started = asyncio.Event()
+    resume_polling = asyncio.Event()
+
+    async def idle_sleep(_: float) -> None:
+        idle_started.set()
+        await resume_polling.wait()
+
+    worker = ExtractionJobWorker(store, pipeline)
+    worker_task = asyncio.create_task(
+        worker.run_forever(poll_interval_seconds=1.0, idle_sleep=idle_sleep)
+    )
+    try:
+        await asyncio.wait_for(idle_started.wait(), timeout=1)
+        admitted = await store.admit_source(
+            _SUBMITTED_URL,
+            SpotifyMarket("US"),
+            _OWNER_DIGEST,
+            _IDEMPOTENCY_KEY,
+        )
+        resume_polling.set()
+
+        for _ in range(20):
+            stored = await store.get_for_owner(admitted.job_id, _OWNER_DIGEST)
+            if isinstance(stored, SucceededSourceJob):
+                break
+            await asyncio.sleep(0)
+
+        assert isinstance(stored, SucceededSourceJob)
+        assert pipeline.calls == [(_SUBMITTED_URL, SpotifyMarket("US"))]
+    finally:
+        await worker.shutdown()
+        worker_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker_task
 
 async def test_public_job_lifecycle_runs_the_real_pipeline_and_mapper() -> None:
     """Expose queued, running, then the mapped successful Extraction response."""

@@ -103,6 +103,30 @@ class ExtractionJobWorker:
             )
         return sum(completed_job_counts)
 
+    async def run_forever(
+        self,
+        poll_interval_seconds: float = 1.0,
+        *,
+        idle_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        """Poll durable storage continuously until shutdown is requested.
+
+        Args:
+            poll_interval_seconds: Delay after each pass through currently eligible work.
+            idle_sleep: Awaitable delay seam used between durable-store polling passes.
+
+        Raises:
+            ValueError: If the polling interval is not finite and positive.
+        """
+        if not isfinite(poll_interval_seconds) or poll_interval_seconds <= 0:
+            raise ValueError("poll interval must be finite and positive")
+
+        while not self._shutdown_requested:
+            await self.run_until_idle()
+            if not self._shutdown_requested:
+                await idle_sleep(poll_interval_seconds)
+
+
     async def shutdown(self) -> None:
         """Stop future claims and gracefully requeue every still-owned attempt."""
         async with self._shutdown_lock:

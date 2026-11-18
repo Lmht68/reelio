@@ -64,7 +64,7 @@ services:
   api:
     <<: *reelio-image
     restart: unless-stopped
-    environment:
+    environment: &api-environment
       <<: *coordination-environment
       REELIO_ENVIRONMENT: "local"
       REELIO_LOG_LEVEL: "${REELIO_LOG_LEVEL:-INFO}"
@@ -113,6 +113,40 @@ services:
       REELIO_OPEN_LIBRARY_REQUESTS_PER_SECOND: "${REELIO_OPEN_LIBRARY_REQUESTS_PER_SECOND:-3}"
     ports:
       - "127.0.0.1:${REELIO_API_HOST_PORT:-8181}:8181"
+    networks:
+      default:
+      reelio-textify:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *reelio-image
+    command: ["reelio-worker"]
+    restart: unless-stopped
+    environment:
+      <<: *api-environment
+      REELIO_ANONYMOUS_OWNER_HMAC_SECRET: ""
+      REELIO_EXTRACTION_WORKER_CONCURRENCY: "${REELIO_EXTRACTION_WORKER_CONCURRENCY:-2}"
+      REELIO_EXTRACTION_LEASE_LIFETIME_SECONDS: "${REELIO_EXTRACTION_LEASE_LIFETIME_SECONDS:-60}"
+      REELIO_EXTRACTION_HEARTBEAT_INTERVAL_SECONDS: "${REELIO_EXTRACTION_HEARTBEAT_INTERVAL_SECONDS:-15}"
+      REELIO_EXTRACTION_WORKER_POLL_INTERVAL_SECONDS: "${REELIO_EXTRACTION_WORKER_POLL_INTERVAL_SECONDS:-1}"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from pathlib import Path; raise SystemExit(b'reelio-worker' not in Path('/proc/1/cmdline').read_bytes())",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     networks:
       default:
       reelio-textify:
